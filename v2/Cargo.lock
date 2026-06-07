@@ -1004,7 +1004,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wifi-densepose-hardware",
- "wifi-densepose-sensing-server",
+ "ruvsense-master",
 ]
 
 [[package]]
@@ -11051,9 +11051,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "wifi-densepose-sensing-server"
+name = "ruvsense-master"
 version = "0.3.1"
 dependencies = [
+ "anyhow",
  "axum",
  "chrono",
  "clap",
@@ -11067,6 +11068,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

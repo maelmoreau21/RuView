@@ -8,7 +8,7 @@
 //!
 //! In CI, the `.github/workflows/mqtt-integration.yml` workflow spins
 //! up a Mosquitto sidecar container, sets `RUVIEW_RUN_INTEGRATION=1`,
-//! and runs `cargo test -p wifi-densepose-sensing-server --features mqtt
+//! and runs `cargo test -p ruvsense-master --features mqtt
 //! --test mqtt_integration`.
 //!
 //! ## What these tests prove

@@ -1,9 +1,10 @@
 # Codex Configuration — WiFi-DensePose + Codex Flow V3
 
-## Project: wifi-densepose
+## Project: ruvsense-edge
 
-WiFi-based human pose estimation using Channel State Information (CSI).
-Dual codebase: Python v1 (`v1/`) and Rust port (`v2/`).
+RuvSense Edge is the professional RuView fork for WiFi/CSI sensing fleets:
+one Raspberry Pi `ruvsense-master` plus at least three ESP32-C6 nodes.
+Legacy Python v1 lives under `archive/v1/`; the Rust workspace lives in `v2/`.
 ### Key Rust Crates
 | Crate | Description |
 |-------|-------------|
@@ -16,7 +17,7 @@ Dual codebase: Python v1 (`v1/`) and Rust port (`v2/`).
 | `wifi-densepose-ruvector` | RuVector v2.0.4 integration + cross-viewpoint fusion (5 modules) |
 | `wifi-densepose-wasm` | WebAssembly bindings for browser deployment |
 | `wifi-densepose-cli` | CLI tool (`wifi-densepose` binary) |
-| `wifi-densepose-sensing-server` | Lightweight Axum server for WiFi sensing UI |
+| `ruvsense-master` | RuvSense Edge master: UDP CSI ingest, HTTP/WS APIs, SQLite state, Pi Docker runtime |
 | `wifi-densepose-wifiscan` | Multi-BSSID WiFi scanning (ADR-022) |
 | `wifi-densepose-vitals` | ESP32 CSI-grade vital sign extraction (ADR-021) |
 | `nvsim` | Deterministic NV-diamond magnetometer pipeline simulator (ADR-089) — standalone leaf, WASM-ready |
@@ -93,6 +94,9 @@ cargo test --workspace --no-default-features
 # Rust — single crate check (no GPU needed)
 cargo check -p wifi-densepose-train --no-default-features
 
+# RuvSense Edge master check
+cargo check -p ruvsense-master --no-default-features --features mqtt
+
 # Python — deterministic proof verification (SHA-256)
 python archive/v1/data/proof/verify.py
 
@@ -102,19 +106,15 @@ cd archive/v1 && python -m pytest tests/ -x -q
 
 ### ESP32 Firmware Build (Windows — Python subprocess required)
 ```bash
-# Build 8MB firmware (real WiFi CSI mode, no mocks)
-# See Codex.local.md for the full Python subprocess command
-# Key: must strip MSYSTEM env vars for ESP-IDF v5.4 on Git Bash
+# Build ESP32-C6 firmware (official RuvSense Edge v1 target, no mocks)
+cd firmware/esp32-csi-node
+./build_firmware.ps1 -Target esp32c6
 
-# Build 4MB firmware
-cp sdkconfig.defaults.4mb sdkconfig.defaults
-# then same build process
-
-# Flash to COM7
-# [python, idf_py, '-p', 'COM7', 'flash']
+# Flash and provision at least three nodes
+# idf.py -p COM12 flash
 
 # Provision WiFi
-python firmware/esp32-csi-node/provision.py --port COM7 \
+python firmware/esp32-csi-node/provision_three_c6.py --ports COM12,COM13,COM14 \
   --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
 
 # Monitor serial
@@ -142,7 +142,7 @@ Crates must be published in dependency order:
 8. `wifi-densepose-train` (depends on signal, nn)
 9. `wifi-densepose-mat` (depends on core, signal, nn)
 10. `wifi-densepose-wasm` (depends on mat)
-11. `wifi-densepose-sensing-server` (depends on wifiscan)
+11. `ruvsense-master` (path `wifi-densepose-sensing-server`, depends on wifiscan)
 12. `wifi-densepose-cli` (depends on mat)
 
 ### Validation & Witness Verification (ADR-028)

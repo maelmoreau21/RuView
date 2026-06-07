@@ -1,20 +1,20 @@
-# wifi-densepose-sensing-server
+# ruvsense-master
 
-[![Crates.io](https://img.shields.io/crates/v/wifi-densepose-sensing-server.svg)](https://crates.io/crates/wifi-densepose-sensing-server)
-[![Documentation](https://docs.rs/wifi-densepose-sensing-server/badge.svg)](https://docs.rs/wifi-densepose-sensing-server)
-[![License](https://img.shields.io/crates/l/wifi-densepose-sensing-server.svg)](LICENSE)
+[![Documentation](https://docs.rs/ruvsense-master/badge.svg)](https://docs.rs/ruvsense-master)
+[![License](https://img.shields.io/crates/l/ruvsense-master.svg)](LICENSE)
 
-Lightweight Axum server for real-time WiFi sensing with RuVector signal processing.
+RuvSense Edge master for real-time WiFi/CSI sensing fleets with RuVector signal processing.
 
 ## Overview
 
-`wifi-densepose-sensing-server` is the operational backend for WiFi-DensePose. It receives raw CSI
-frames from ESP32 hardware over UDP, runs them through the RuVector-powered signal processing
-pipeline, and broadcasts processed sensing updates to browser clients via WebSocket. A built-in
-static file server hosts the sensing UI on the same port.
+`ruvsense-master` is the operational backend for RuvSense Edge. It receives raw CSI
+frames from ESP32-C6/S3 hardware over UDP, runs them through the RuVector-powered signal
+processing pipeline, persists lightweight runtime state, and broadcasts processed sensing
+updates to browser clients via WebSocket. A built-in static file server hosts the RuvSense
+Console on the same port.
 
 The crate ships both a library (`wifi_densepose_sensing_server`) exposing the training and inference
-modules, and a binary (`sensing-server`) that starts the full server stack.
+modules, and binaries (`ruvsense-master`, plus legacy alias `sensing-server`) that start the full server stack.
 
 Integrates [wifi-densepose-wifiscan](../wifi-densepose-wifiscan) for multi-BSSID WiFi scanning
 per ADR-022 Phase 3.
@@ -61,17 +61,17 @@ per ADR-022 Phase 3.
 ## Quick Start
 
 ```bash
-# Build the server
-cargo build -p wifi-densepose-sensing-server
+# Build the master
+cargo build -p ruvsense-master --bin ruvsense-master
 
 # Run with default settings (HTTP :8080, UDP :5005, WS :8765)
-cargo run -p wifi-densepose-sensing-server
+cargo run -p ruvsense-master --bin ruvsense-master
 
 # Run with custom ports
-cargo run -p wifi-densepose-sensing-server -- \
+cargo run -p ruvsense-master --bin ruvsense-master -- \
     --http-port 9000 \
     --udp-port 5005 \
-    --static-dir ./ui
+    --ui-path ./ui
 ```
 
 ### Using as a library

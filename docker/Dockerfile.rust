@@ -22,7 +22,7 @@ COPY vendor/ruvector/ /build/vendor/ruvector/
 #   - homecore-server, the ADRs-126-134 HOMECORE native Rust port of
 #     Home Assistant (HA-wire-compat REST + WebSocket on :8123,
 #     SQLite + ruvector recorder, automation, assist, plugins, HAP)
-RUN cargo build --release -p wifi-densepose-sensing-server --features mqtt 2>&1 \
+RUN cargo build --release -p ruvsense-master --features mqtt --bin sensing-server 2>&1 \
  && cargo build --release -p cog-ha-matter 2>&1 \
  && cargo build --release -p homecore-server 2>&1 \
  && strip target/release/sensing-server target/release/cog-ha-matter target/release/homecore-server

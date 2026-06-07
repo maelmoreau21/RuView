@@ -3,7 +3,8 @@
 
 .PHONY: verify verify-verbose verify-audit install install-verify install-python \
         install-rust install-browser install-docker install-field install-full \
-        check build-rust build-wasm test-rust bench run-api run-viz clean help
+        check build-rust build-wasm test-rust bench run-api run-viz \
+        run-master run-docker run-pi-docker clean help
 
 # ─── Installation ────────────────────────────────────────────
 # Guided interactive installer
@@ -51,19 +52,19 @@ verify-audit:
 
 # ─── Rust Builds ─────────────────────────────────────────────
 build-rust:
-	cd rust-port/wifi-densepose-rs && cargo build --release
+	cd v2 && cargo build --workspace --release --no-default-features
 
 build-wasm:
-	cd rust-port/wifi-densepose-rs && wasm-pack build crates/wifi-densepose-wasm --target web --release
+	cd v2 && wasm-pack build crates/wifi-densepose-wasm --target web --release
 
 build-wasm-mat:
-	cd rust-port/wifi-densepose-rs && wasm-pack build crates/wifi-densepose-wasm --target web --release -- --features mat
+	cd v2 && wasm-pack build crates/wifi-densepose-wasm --target web --release -- --features mat
 
 test-rust:
-	cd rust-port/wifi-densepose-rs && cargo test --workspace
+	cd v2 && cargo test --workspace --no-default-features
 
 bench:
-	cd rust-port/wifi-densepose-rs && cargo bench --package wifi-densepose-signal
+	cd v2 && cargo bench --package wifi-densepose-signal
 
 # ─── Run ─────────────────────────────────────────────────────
 run-api:
@@ -75,13 +76,19 @@ run-api-dev:
 run-viz:
 	python3 -m http.server 3000 --directory ui
 
+run-master:
+	cd v2 && cargo run -p ruvsense-master --bin ruvsense-master --features mqtt -- --source esp32 --http-port 3000 --ws-port 3001 --udp-port 5005 --min-nodes 3 --ui-path ../ui --data-dir ../data/ruvsense
+
 run-docker:
-	docker compose up
+	docker compose -f docker/compose.pi4.yml up
+
+run-pi-docker:
+	docker compose -f docker/compose.pi4.yml up -d
 
 # ─── Clean ───────────────────────────────────────────────────
 clean:
 	rm -f .install.log
-	cd rust-port/wifi-densepose-rs && cargo clean 2>/dev/null || true
+	cd v2 && cargo clean 2>/dev/null || true
 
 # ─── Help ────────────────────────────────────────────────────
 help:
@@ -115,7 +122,9 @@ help:
 	@echo "    make run-api          Start Python API server"
 	@echo "    make run-api-dev      Start API with hot-reload"
 	@echo "    make run-viz          Serve 3D visualization (port 3000)"
-	@echo "    make run-docker       Start Docker dev stack"
+	@echo "    make run-master       Start ruvsense-master for 3 ESP32-C6 nodes"
+	@echo "    make run-docker       Start RuvSense Edge compose stack"
+	@echo "    make run-pi-docker    Start Pi 4 stack in detached mode"
 	@echo ""
 	@echo "  Utility:"
 	@echo "    make clean            Remove build artifacts"

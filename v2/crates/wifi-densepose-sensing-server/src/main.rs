@@ -67,7 +67,7 @@ use wifi_densepose_signal::ruvsense::pose_tracker::PoseTracker;
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "sensing-server", about = "WiFi-DensePose sensing server")]
+#[command(name = "ruvsense-master", about = "RuvSense Edge master for WiFi/CSI sensing fleets")]
 struct Args {
     /// HTTP port for UI and REST API
     #[arg(long, default_value = "8080")]
@@ -80,6 +80,14 @@ struct Args {
     /// UDP port for ESP32 CSI frames
     #[arg(long, default_value = "5005")]
     udp_port: u16,
+
+    /// Minimum active ESP32 nodes required before readiness is green.
+    #[arg(long, default_value = "3", env = "RUVSENSE_MIN_NODES")]
+    min_nodes: usize,
+
+    /// Persistent data directory for runtime config, recordings, and SQLite state.
+    #[arg(long, default_value = "data", env = "RUVSENSE_DATA_DIR")]
+    data_dir: PathBuf,
 
     /// Path to UI static files (repo `ui/`; from `v2/` use `../ui` or rely on auto-detect)
     #[arg(long, default_value = "../ui")]
@@ -782,13 +790,66 @@ fn build_node_features(
                 },
                 rssi_dbm: ns.rssi_history.back().copied().unwrap_or(0.0),
                 last_seen_ms,
-                frame_rate_hz: 0.0, // Computed elsewhere; not yet plumbed here.
+                frame_rate_hz: ns.csi_fps_ema,
                 stale,
                 novelty_score: ns.last_novelty_score,
             }
         })
         .collect();
     Some(entries)
+}
+
+fn is_node_active(ns: &NodeState, now: std::time::Instant) -> bool {
+    ns.last_frame_time
+        .is_some_and(|t| now.saturating_duration_since(t) <= ESP32_OFFLINE_TIMEOUT)
+}
+
+fn active_node_count(s: &AppStateInner, now: std::time::Instant) -> usize {
+    s.node_states
+        .values()
+        .filter(|ns| is_node_active(ns, now))
+        .count()
+}
+
+fn fleet_ready(s: &AppStateInner, now: std::time::Instant) -> bool {
+    active_node_count(s, now) >= s.min_nodes
+}
+
+fn default_node_position(node_id: u8) -> [f64; 3] {
+    const POSITIONS: [[f64; 3]; 6] = [
+        [-2.6, 1.1, -1.8],
+        [2.6, 1.1, -1.8],
+        [0.0, 1.1, 2.4],
+        [-2.8, 1.1, 2.2],
+        [2.8, 1.1, 2.2],
+        [0.0, 1.8, 0.0],
+    ];
+    POSITIONS[(node_id as usize).saturating_sub(1) % POSITIONS.len()]
+}
+
+fn node_summary_json(id: u8, ns: &NodeState, now: std::time::Instant) -> serde_json::Value {
+    let last_seen_ms = ns
+        .last_frame_time
+        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+        .unwrap_or(u64::MAX);
+    let active = is_node_active(ns, now);
+    let sync = ns.sync_snapshot();
+    serde_json::json!({
+        "node_id": id,
+        "status": if active { "active" } else { "stale" },
+        "active": active,
+        "last_seen_ms": last_seen_ms,
+        "rssi_dbm": ns.rssi_history.back().copied().unwrap_or(-90.0),
+        "frame_rate_hz": ns.csi_fps_ema,
+        "frame_rate_samples": ns.csi_fps_samples,
+        "motion_level": &ns.current_motion_level,
+        "presence": !matches!(ns.current_motion_level.as_str(), "absent"),
+        "person_count": ns.prev_person_count,
+        "position": default_node_position(id),
+        "sync": sync,
+        "coherence": ns.coherence_score,
+        "novelty_score": ns.last_novelty_score,
+    })
 }
 
 // ── ADR-044 §5.2: Rolling P95 adaptive feature normalizer ────────────────────
@@ -881,6 +942,53 @@ pub(crate) fn save_runtime_config(data_dir: &std::path::Path, config: &RuntimeCo
             info!("Runtime config saved to {}", path.display());
         }
     }
+}
+
+async fn init_sqlite_store(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    std::fs::create_dir_all(data_dir)?;
+    let db_path = data_dir.join("ruvsense.sqlite");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let options = SqliteConnectOptions::from_str(&db_url)?.create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS runtime_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS nodes (
+            node_id INTEGER PRIMARY KEY,
+            zone TEXT,
+            last_seen_at TEXT,
+            status TEXT NOT NULL DEFAULT 'unknown'
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id INTEGER,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    Ok(())
 }
 
 /// Shared application state
@@ -1003,6 +1111,8 @@ struct AppStateInner {
     /// Configurable at runtime via `POST /api/v1/config/dedup-factor` and
     /// `POST /api/v1/config/ground-truth`. Persisted across restarts.
     pub(crate) dedup_factor: f64,
+    /// Minimum active ESP32 nodes required for the master to report ready.
+    pub(crate) min_nodes: usize,
     /// Data directory for persisting runtime config (parent of `firmware_dir`).
     pub(crate) data_dir: std::path::PathBuf,
 }
@@ -3734,12 +3844,22 @@ async fn health_live(State(state): State<SharedState>) -> Json<serde_json::Value
     }))
 }
 
-async fn health_ready(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn health_ready(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.read().await;
-    Json(serde_json::json!({
-        "status": "ready",
+    let now = std::time::Instant::now();
+    let active_nodes = active_node_count(&s, now);
+    let ready = fleet_ready(&s, now);
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(serde_json::json!({
+        "status": if ready { "ready" } else { "not_ready" },
         "source": s.effective_source(),
-    }))
+        "active_nodes": active_nodes,
+        "min_nodes": s.min_nodes,
+    })))
 }
 
 async fn health_system(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -3769,7 +3889,8 @@ async fn health_system(State(state): State<SharedState>) -> Json<serde_json::Val
 async fn health_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "name": "wifi-densepose-sensing-server",
+        "name": "ruvsense-master",
+        "product": "RuvSense Edge",
         "backend": "rust+axum+ruvector",
     }))
 }
@@ -4822,28 +4943,236 @@ async fn nodes_endpoint(State(state): State<SharedState>) -> Json<serde_json::Va
     let nodes: Vec<serde_json::Value> = s
         .node_states
         .iter()
-        .map(|(&id, ns)| {
-            let elapsed_ms = ns
-                .last_frame_time
-                .map(|t| now.duration_since(t).as_millis() as u64)
-                .unwrap_or(999999);
-            let stale = elapsed_ms > 5000;
-            let status = if stale { "stale" } else { "active" };
-            let rssi = ns.rssi_history.back().copied().unwrap_or(-90.0);
-            serde_json::json!({
-                "node_id": id,
-                "status": status,
-                "last_seen_ms": elapsed_ms,
-                "rssi_dbm": rssi,
-                "motion_level": &ns.current_motion_level,
-                "person_count": ns.prev_person_count,
-            })
-        })
+        .map(|(&id, ns)| node_summary_json(id, ns, now))
         .collect();
     Json(serde_json::json!({
         "nodes": nodes,
         "total": nodes.len(),
+        "active": active_node_count(&s, now),
+        "min_nodes": s.min_nodes,
+        "ready": fleet_ready(&s, now),
     }))
+}
+
+async fn fleet_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let active_nodes = active_node_count(&s, now);
+    let nodes: Vec<serde_json::Value> = s
+        .node_states
+        .iter()
+        .map(|(&id, ns)| node_summary_json(id, ns, now))
+        .collect();
+    Json(serde_json::json!({
+        "product": "RuvSense Edge",
+        "service": "ruvsense-master",
+        "version": env!("CARGO_PKG_VERSION"),
+        "source": s.effective_source(),
+        "ready": active_nodes >= s.min_nodes,
+        "active_nodes": active_nodes,
+        "known_nodes": s.node_states.len(),
+        "min_nodes": s.min_nodes,
+        "uptime_seconds": s.start_time.elapsed().as_secs(),
+        "tick": s.tick,
+        "clients": s.tx.receiver_count(),
+        "nodes": nodes,
+    }))
+}
+
+async fn environment_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let active_nodes = active_node_count(&s, now);
+    let latest = s.latest_update.as_ref();
+    let calibration = s
+        .field_model
+        .as_ref()
+        .map(|fm| format!("{:?}", fm.status()))
+        .unwrap_or_else(|| "not_started".to_string());
+    Json(serde_json::json!({
+        "room": {
+            "name": "primary",
+            "dimensions_m": [5.2, 2.6, 4.8],
+            "coordinate_system": "x_right_y_up_z_depth",
+        },
+        "fusion": {
+            "mode": if active_nodes >= 3 { "multistatic" } else if active_nodes > 0 { "single_or_partial" } else { "offline" },
+            "active_nodes": active_nodes,
+            "min_nodes": s.min_nodes,
+            "dedup_factor": s.dedup_factor,
+        },
+        "calibration": {
+            "status": calibration,
+            "empty_room_required": s.field_model.is_some(),
+        },
+        "occupancy": {
+            "estimated_persons": latest.and_then(|u| u.estimated_persons).unwrap_or(0),
+            "presence": latest.map(|u| u.classification.presence).unwrap_or(false),
+            "motion_level": latest.map(|u| u.classification.motion_level.clone()).unwrap_or_else(|| "unknown".to_string()),
+        },
+        "signal_field": latest.map(|u| serde_json::to_value(&u.signal_field).unwrap_or_default()),
+        "nodes": s.node_states.iter()
+            .map(|(&id, ns)| node_summary_json(id, ns, now))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn module_status(active_nodes: usize, required_nodes: usize) -> &'static str {
+    if active_nodes >= required_nodes {
+        "active"
+    } else if active_nodes > 0 {
+        "available"
+    } else {
+        "offline"
+    }
+}
+
+fn module_confidence(active_nodes: usize, required_nodes: usize) -> f64 {
+    if active_nodes >= required_nodes {
+        (0.62 + active_nodes as f64 * 0.08).min(0.95)
+    } else if active_nodes > 0 {
+        0.42
+    } else {
+        0.0
+    }
+}
+
+fn business_modules(active_nodes: usize) -> Vec<serde_json::Value> {
+    let modules: &[(&str, &str, &str, u16, usize, &[&str])] = &[
+        ("fall_detection", "Health & Vitals", "Fall detection", 8, 1, &["edge_vitals", "sensing_update"]),
+        ("sleep_apnea_screening", "Health & Vitals", "Sleep apnea screening", 12, 1, &["vital_signs", "edge_vitals"]),
+        ("cardiac_arrhythmia", "Health & Vitals", "Cardiac arrhythmia", 14, 1, &["vital_signs"]),
+        ("seizure_detection", "Health & Vitals", "Seizure detection", 10, 3, &["sensing_update", "introspection"]),
+        ("sleep_staging", "Health & Vitals", "Sleep staging", 18, 1, &["vital_signs", "sensing_update"]),
+        ("respiration_tracking", "Health & Vitals", "Respiration tracking", 6, 1, &["vital_signs"]),
+        ("intrusion_detection", "Safety & Security", "Intrusion detection", 9, 1, &["sensing_update"]),
+        ("loitering_alert", "Safety & Security", "Loitering alert", 7, 2, &["sensing_update", "environment"]),
+        ("panic_motion", "Safety & Security", "Panic motion", 5, 1, &["sensing_update"]),
+        ("confined_space_monitor", "Safety & Security", "Confined-space monitor", 11, 3, &["environment", "vital_signs"]),
+        ("exclusion_zone_breach", "Safety & Security", "Exclusion-zone breach", 8, 3, &["environment"]),
+        ("cobot_proximity", "Safety & Security", "Cobot proximity", 12, 3, &["environment", "pose"]),
+        ("hvac_zone_control", "Building Automation", "HVAC zone control", 10, 1, &["environment"]),
+        ("lighting_automation", "Building Automation", "Lighting automation", 6, 1, &["sensing_update"]),
+        ("occupancy_based_access", "Building Automation", "Occupancy-based access", 11, 2, &["fleet", "environment"]),
+        ("meeting_room_sensing", "Building Automation", "Meeting-room sensing", 8, 1, &["sensing_update"]),
+        ("desk_utilization", "Building Automation", "Desk utilization", 7, 2, &["environment"]),
+        ("door_open_detection", "Building Automation", "Door-open detection", 5, 1, &["introspection"]),
+        ("queue_length", "Analytics", "Queue length", 8, 3, &["environment"]),
+        ("dwell_heatmap", "Analytics", "Dwell heatmap", 14, 3, &["environment"]),
+        ("table_turnover", "Analytics", "Table turnover", 9, 2, &["environment"]),
+        ("people_counting", "Analytics", "People counting", 7, 3, &["sensing_update", "fleet"]),
+        ("path_analytics", "Analytics", "Path analytics", 16, 3, &["environment", "pose"]),
+        ("conversion_funnels", "Analytics", "Conversion funnels", 11, 3, &["environment"]),
+        ("gesture_recognition", "Interaction", "Gesture recognition", 22, 2, &["introspection", "pose"]),
+        ("pointing_swipe", "Interaction", "Pointing / swipe", 15, 3, &["pose"]),
+        ("emotion_inference", "Interaction", "Emotion inference", 28, 3, &["vital_signs", "pose"]),
+        ("activity_classification", "Interaction", "Activity classification", 19, 2, &["sensing_update", "introspection"]),
+        ("posture_analytics", "Interaction", "Posture analytics", 13, 3, &["pose"]),
+        ("gait_biometrics", "Interaction", "Gait biometrics", 24, 3, &["pose", "environment"]),
+    ];
+
+    modules
+        .iter()
+        .map(|(id, category, name, size_kb, required_nodes, streams)| {
+            let safety_note = if *category == "Health & Vitals" {
+                Some("Monitoring/screening only; not a medical diagnosis.")
+            } else {
+                None
+            };
+            serde_json::json!({
+                "id": id,
+                "category": category,
+                "name": name,
+                "size_kb": size_kb,
+                "status": module_status(active_nodes, *required_nodes),
+                "confidence": module_confidence(active_nodes, *required_nodes),
+                "required_nodes": required_nodes,
+                "evidence_streams": streams,
+                "safety_note": safety_note,
+            })
+        })
+        .collect()
+}
+
+async fn modules_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let active_nodes = active_node_count(&s, now);
+    let modules = business_modules(active_nodes);
+    Json(serde_json::json!({
+        "catalog": "ruvsense-edge",
+        "active_nodes": active_nodes,
+        "min_nodes": s.min_nodes,
+        "categories": [
+            "Health & Vitals",
+            "Safety & Security",
+            "Building Automation",
+            "Analytics",
+            "Interaction"
+        ],
+        "modules": modules,
+    }))
+}
+
+async fn calibration_overview_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let status = s
+        .field_model
+        .as_ref()
+        .map(|fm| format!("{:?}", fm.status()))
+        .unwrap_or_else(|| "not_started".to_string());
+    Json(serde_json::json!({
+        "status": status,
+        "enabled": s.field_model.is_some(),
+        "active_nodes": active_node_count(&s, std::time::Instant::now()),
+        "min_nodes": s.min_nodes,
+        "dedup_factor": s.dedup_factor,
+        "actions": {
+            "start": "/api/v1/calibration/start",
+            "stop": "/api/v1/calibration/stop",
+            "status": "/api/v1/calibration/status"
+        }
+    }))
+}
+
+async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl IntoResponse {
+    use std::fmt::Write;
+
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let active_nodes = active_node_count(&s, now);
+    let ready = if active_nodes >= s.min_nodes { 1 } else { 0 };
+    let mut body = String::with_capacity(2048);
+
+    let _ = writeln!(body, "# HELP ruvsense_master_ready Master readiness based on active node quorum");
+    let _ = writeln!(body, "# TYPE ruvsense_master_ready gauge");
+    let _ = writeln!(body, "ruvsense_master_ready {ready}");
+    let _ = writeln!(body, "# HELP ruvsense_active_nodes Active ESP32 nodes seen within readiness timeout");
+    let _ = writeln!(body, "# TYPE ruvsense_active_nodes gauge");
+    let _ = writeln!(body, "ruvsense_active_nodes {active_nodes}");
+    let _ = writeln!(body, "# HELP ruvsense_min_nodes Minimum active nodes required for ready");
+    let _ = writeln!(body, "# TYPE ruvsense_min_nodes gauge");
+    let _ = writeln!(body, "ruvsense_min_nodes {}", s.min_nodes);
+    let _ = writeln!(body, "# HELP ruvsense_ticks_total Sensing update ticks processed");
+    let _ = writeln!(body, "# TYPE ruvsense_ticks_total counter");
+    let _ = writeln!(body, "ruvsense_ticks_total {}", s.tick);
+    let _ = writeln!(body, "# HELP ruvsense_ws_clients Current WebSocket subscriber count");
+    let _ = writeln!(body, "# TYPE ruvsense_ws_clients gauge");
+    let _ = writeln!(body, "ruvsense_ws_clients {}", s.tx.receiver_count());
+
+    let _ = writeln!(body, "# HELP ruvsense_node_frame_rate_hz Per-node CSI frame-rate EMA");
+    let _ = writeln!(body, "# TYPE ruvsense_node_frame_rate_hz gauge");
+    for (&id, ns) in &s.node_states {
+        let _ = writeln!(body, "ruvsense_node_frame_rate_hz{{node=\"{id}\"}} {:.3}", ns.csi_fps_ema);
+    }
+    let _ = writeln!(body, "# HELP ruvsense_node_active Per-node active status");
+    let _ = writeln!(body, "# TYPE ruvsense_node_active gauge");
+    for (&id, ns) in &s.node_states {
+        let active = if is_node_active(ns, now) { 1 } else { 0 };
+        let _ = writeln!(body, "ruvsense_node_active{{node=\"{id}\"}} {active}");
+    }
+
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 async fn info_page() -> Html<String> {
@@ -5008,7 +5337,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: default_node_position(id),
                             amplitude: vec![],
                             subcarrier_count: 0,
                             // Vitals-only path; still expose the sync snapshot
@@ -5432,7 +5761,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: default_node_position(id),
                             amplitude: n
                                 .frame_history
                                 .back()
@@ -6420,6 +6749,8 @@ async fn main() {
     info!("  UDP:       0.0.0.0:{} (ESP32 CSI)", args.udp_port);
     info!("  UI path:   {}", args.ui_path.display());
     info!("  Source:    {}", args.source);
+    info!("  Min nodes: {}", args.min_nodes);
+    info!("  Data dir:  {}", args.data_dir.display());
 
     // Auto-detect data source
     let source = match args.source.as_str() {
@@ -6520,7 +6851,17 @@ async fn main() {
     // Ensure data directories exist for models and recordings
     let models_dir = effective_models_dir();
     let _ = std::fs::create_dir_all(&models_dir);
-    let _ = std::fs::create_dir_all("data/recordings");
+    let data_dir = args.data_dir.clone();
+    if let Err(e) = std::fs::create_dir_all(data_dir.join("recordings")) {
+        warn!(
+            "Failed to create recordings directory under {}: {e}",
+            data_dir.display()
+        );
+    }
+    match init_sqlite_store(&data_dir).await {
+        Ok(()) => info!("SQLite store ready at {}", data_dir.join("ruvsense.sqlite").display()),
+        Err(e) => warn!("SQLite store unavailable: {e}"),
+    }
 
     // Discover model and recording files on startup
     let initial_models = scan_model_files();
@@ -6532,7 +6873,6 @@ async fn main() {
     );
 
     // ADR-044 §5.3: load persisted runtime config from the data directory.
-    let data_dir = std::path::PathBuf::from("data");
     let runtime_config = load_runtime_config(&data_dir);
     info!(
         "Loaded runtime config: dedup_factor={:.2}",
@@ -6616,7 +6956,7 @@ async fn main() {
         tracing::warn!(
             "--mqtt set but this binary was built without the `mqtt` feature; the publisher is a \
              no-op. Use the official Docker image (built `--features mqtt`) or rebuild with \
-             `cargo build -p wifi-densepose-sensing-server --features mqtt`."
+             `cargo build -p ruvsense-master --features mqtt`."
         );
     }
 
@@ -6710,6 +7050,7 @@ async fn main() {
         p95_spectral_power: RollingP95::new(600, 60),
         // ADR-044 §5.3: runtime-configurable dedup factor (persisted).
         dedup_factor: runtime_config.dedup_factor,
+        min_nodes: args.min_nodes.max(1),
         data_dir: data_dir.clone(),
     }));
 
@@ -6807,12 +7148,16 @@ async fn main() {
         .route("/health/ready", get(health_ready))
         .route("/health/version", get(health_version))
         .route("/health/metrics", get(health_metrics))
+        .route("/metrics", get(prometheus_metrics_endpoint))
         // API info
         .route("/api/v1/info", get(api_info))
         .route("/api/v1/status", get(health_ready))
         .route("/api/v1/metrics", get(health_metrics))
         // Sensing endpoints
         .route("/api/v1/sensing/latest", get(latest))
+        .route("/api/v1/fleet", get(fleet_endpoint))
+        .route("/api/v1/environment", get(environment_endpoint))
+        .route("/api/v1/modules", get(modules_endpoint))
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
         // ADR-110 iter 29 — per-node mesh sync state for HTTP clients.
@@ -6875,6 +7220,7 @@ async fn main() {
         .route("/api/v1/calibration/start", post(calibration_start))
         .route("/api/v1/calibration/stop", post(calibration_stop))
         .route("/api/v1/calibration/status", get(calibration_status))
+        .route("/api/v1/calibration", get(calibration_overview_endpoint))
         // ADR-044 §5.3: runtime-configurable dedup factor
         .route(
             "/api/v1/config/dedup-factor",

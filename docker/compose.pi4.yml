@@ -1,0 +1,57 @@
+name: ruvsense-edge
+
+services:
+  ruvsense-master:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.master
+    image: ghcr.io/maelmoreau21/ruvsense-edge-master:local
+    container_name: ruvsense-master
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      CSI_SOURCE: ${CSI_SOURCE:-esp32}
+      RUVSENSE_HTTP_PORT: ${RUVSENSE_HTTP_PORT:-3000}
+      RUVSENSE_WS_PORT: ${RUVSENSE_WS_PORT:-3001}
+      RUVSENSE_UDP_PORT: ${RUVSENSE_UDP_PORT:-5005}
+      RUVSENSE_MIN_NODES: ${RUVSENSE_MIN_NODES:-3}
+      RUVSENSE_DATA_DIR: /var/lib/ruvsense
+      MODELS_DIR: /var/lib/ruvsense/models
+      RUVIEW_API_TOKEN: ${RUVIEW_API_TOKEN:-}
+    volumes:
+      - ../data/ruvsense:/var/lib/ruvsense
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${RUVSENSE_HTTP_PORT:-3000}/health/ready >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 8
+      start_period: 20s
+
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    profiles: ["home"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ../data/mosquitto:/mosquitto/data
+
+  legacy-python:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.python
+    image: ruvnet/wifi-densepose:python
+    profiles: ["legacy-python"]
+    ports:
+      - "8765:8765"
+      - "8080:8080"
+    environment:
+      PYTHONUNBUFFERED: "1"
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.ruvsense.yml:/etc/prometheus/prometheus.yml:ro

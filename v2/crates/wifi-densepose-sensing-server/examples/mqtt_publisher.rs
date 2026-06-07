@@ -2,7 +2,8 @@
 //! against a broadcast channel of `VitalsSnapshot`s.
 //!
 //! Run with:
-//!     cargo run --release -p wifi-densepose-sensing-server \
+//!     cargo run --release -p ruvsense-master \
+//!         --bin ruvsense-master \
 //!         --features mqtt --example mqtt_publisher -- \
 //!         --mqtt --mqtt-host 127.0.0.1
 //!
@@ -29,7 +30,7 @@
 fn main() {
     eprintln!(
         "This example requires --features mqtt. Re-run with: \n  \
-         cargo run -p wifi-densepose-sensing-server --features mqtt \
+         cargo run -p ruvsense-master --bin ruvsense-master --features mqtt \
          --example mqtt_publisher -- --mqtt"
     );
     std::process::exit(2);

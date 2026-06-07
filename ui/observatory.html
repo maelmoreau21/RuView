@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RuView Observatory — WiFi DensePose</title>
+  <title>RuvSense Console - Edge Sensing Observatory</title>
   <link rel="stylesheet" href="observatory/css/observatory.css">
 </head>
 <body>
@@ -14,8 +14,29 @@
 
     <!-- Top-left: Branding -->
     <div id="brand">
-      <div id="brand-logo"><span class="pi">&pi;</span> RuView</div>
-      <div id="brand-tagline">WiFi DensePose Sensing Observatory</div>
+      <div id="brand-logo"><span class="pi">&pi;</span> RuvSense Edge</div>
+      <div id="brand-tagline">RuvSense Console / WiFi CSI Fleet</div>
+    </div>
+
+    <!-- Top-left: Fleet readiness -->
+    <div id="panel-fleet" class="data-panel operational-panel">
+      <div class="panel-header">Fleet</div>
+      <div id="fleet-ready" class="fleet-readiness">Waiting for nodes</div>
+      <div class="fleet-kpis">
+        <div>
+          <span class="kpi-label">Active</span>
+          <span id="fleet-active" class="kpi-value">0</span>
+        </div>
+        <div>
+          <span class="kpi-label">Required</span>
+          <span id="fleet-min" class="kpi-value">3</span>
+        </div>
+        <div>
+          <span class="kpi-label">Source</span>
+          <span id="fleet-source" class="kpi-value">--</span>
+        </div>
+      </div>
+      <div id="fleet-list" class="fleet-list"></div>
     </div>
 
     <!-- Top-right: Connection + status + gear -->
@@ -105,16 +126,23 @@
       <div id="fall-alert" class="fall-alert" style="display:none">FALL DETECTED</div>
     </div>
 
+    <!-- Bottom-left: Business modules -->
+    <div id="panel-modules" class="data-panel operational-panel">
+      <div class="panel-header">Modules</div>
+      <div id="module-summary" class="module-summary">Catalog pending</div>
+      <div id="module-list" class="module-list"></div>
+    </div>
+
     <!-- Edge module badges (populated dynamically by HudController) -->
     <div id="edge-modules-bar"></div>
 
     <!-- Bottom bar: capabilities -->
     <div id="capabilities-bar">
-      <div class="cap-item"><span class="cap-icon">&#9898;</span><span>Human Pose Estimation</span></div>
+      <div class="cap-item"><span class="cap-icon">&#9898;</span><span>Environment</span></div>
       <div class="cap-divider"></div>
-      <div class="cap-item"><span class="cap-icon">&#9829;</span><span>Vital Sign Monitoring</span></div>
+      <div class="cap-item"><span class="cap-icon">&#9829;</span><span>Fleet Fusion</span></div>
       <div class="cap-divider"></div>
-      <div class="cap-item"><span class="cap-icon">&#9784;</span><span>Presence Detection</span></div>
+      <div class="cap-item"><span class="cap-icon">&#9784;</span><span>Vitals Monitoring</span></div>
     </div>
 
     <!-- Bottom-right: keyboard hints -->

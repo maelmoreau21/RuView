@@ -154,6 +154,12 @@ export class HudController {
 
     // Track current scenario for description/edge updates
     this._currentScenarioKey = null;
+
+    // Operational RuvSense Edge panels
+    this._opsFetchAt = 0;
+    this._opsFetchPending = false;
+    this._fleet = null;
+    this._modules = null;
   }
 
   // ============================================================
@@ -268,7 +274,7 @@ export class HudController {
       const blob = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'ruview-observatory-settings.json';
+      a.download = 'ruvsense-console-settings.json';
       a.click();
     });
     document.getElementById('btn-reset-settings').addEventListener('click', () => {
@@ -316,7 +322,7 @@ export class HudController {
 
   saveSettings() {
     try {
-      localStorage.setItem('ruview-observatory-settings', JSON.stringify(this._obs.settings));
+    localStorage.setItem('ruvsense-console-settings', JSON.stringify(this._obs.settings));
     } catch {}
   }
 
@@ -438,6 +444,9 @@ export class HudController {
     const fallEl = document.getElementById('fall-alert');
     if (fallEl) fallEl.style.display = cls.fall_detected ? 'block' : 'none';
 
+    this._updateFleetFromData(data);
+    this._refreshOperationalData();
+
     // Scenario description and edge modules
     const scenarioKey = demoData._autoMode ? (demoData.currentScenario || 'auto') : (demoData.currentScenario || 'auto');
     if (scenarioKey !== this._currentScenarioKey) {
@@ -507,6 +516,155 @@ export class HudController {
   _setBarColor(id, color) {
     const e = document.getElementById(id);
     if (e) e.style.background = color;
+  }
+
+  async _refreshOperationalData() {
+    const now = Date.now();
+    if (this._opsFetchPending || now - this._opsFetchAt < 3000) return;
+    this._opsFetchAt = now;
+    this._opsFetchPending = true;
+
+    try {
+      const [fleetResp, modulesResp] = await Promise.all([
+        fetch('/api/v1/fleet', { cache: 'no-store' }),
+        fetch('/api/v1/modules', { cache: 'no-store' }),
+      ]);
+
+      if (fleetResp.ok) {
+        this._fleet = await fleetResp.json();
+        this._renderFleetPanel(this._fleet);
+      }
+      if (modulesResp.ok) {
+        this._modules = await modulesResp.json();
+        this._renderModulesPanel(this._modules);
+      }
+    } catch {
+      // Demo/file mode has no API; the WebSocket/simulation fallback keeps the UI useful.
+    } finally {
+      this._opsFetchPending = false;
+    }
+  }
+
+  _updateFleetFromData(data) {
+    const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+    if (!nodes.length) return;
+    if (this._fleet && Date.now() - this._opsFetchAt < 4500) return;
+
+    const activeNodes = nodes.filter(n => {
+      const status = String(n.status || '').toLowerCase();
+      return n.active !== false && status !== 'stale' && status !== 'offline';
+    }).length;
+
+    this._renderFleetPanel({
+      source: 'ws',
+      active_nodes: activeNodes,
+      min_nodes: 3,
+      ready: activeNodes >= 3,
+      nodes,
+    });
+  }
+
+  _renderFleetPanel(fleet) {
+    const active = Number(fleet?.active_nodes ?? 0);
+    const minNodes = Number(fleet?.min_nodes ?? 3);
+    const ready = Boolean(fleet?.ready || active >= minNodes);
+    const readyEl = document.getElementById('fleet-ready');
+    if (readyEl) {
+      readyEl.textContent = ready ? 'Ready for fusion' : 'Waiting for quorum';
+      readyEl.className = `fleet-readiness ${ready ? 'fleet-readiness--ready' : 'fleet-readiness--pending'}`;
+    }
+
+    this._setText('fleet-active', String(active));
+    this._setText('fleet-min', String(minNodes));
+    this._setText('fleet-source', String(fleet?.source || 'live'));
+
+    const list = document.getElementById('fleet-list');
+    if (!list) return;
+    const nodes = Array.isArray(fleet?.nodes) ? [...fleet.nodes] : [];
+    nodes.sort((a, b) => Number(a.node_id || 0) - Number(b.node_id || 0));
+
+    list.replaceChildren();
+    if (!nodes.length) {
+      const empty = document.createElement('div');
+      empty.className = 'fleet-empty';
+      empty.textContent = 'No ESP32-C6 nodes seen yet';
+      list.appendChild(empty);
+      return;
+    }
+
+    for (const node of nodes.slice(0, 8)) {
+      const status = String(node.status || (node.active ? 'active' : 'stale')).toLowerCase();
+      const row = document.createElement('div');
+      row.className = `fleet-node fleet-node--${status}`;
+
+      const name = document.createElement('span');
+      name.className = 'fleet-node-name';
+      name.textContent = `C6-${node.node_id ?? '?'}`;
+
+      const meta = document.createElement('span');
+      meta.className = 'fleet-node-meta';
+      const lastSeen = Number(node.last_seen_ms);
+      const age = Number.isFinite(lastSeen)
+        ? (lastSeen < 1000 ? `${Math.round(lastSeen)}ms` : `${(lastSeen / 1000).toFixed(1)}s`)
+        : 'never';
+      const fps = Number(node.frame_rate_hz || 0).toFixed(1);
+      meta.textContent = `${status} / ${fps} Hz / ${age}`;
+
+      row.append(name, meta);
+      list.appendChild(row);
+    }
+  }
+
+  _renderModulesPanel(catalog) {
+    const list = document.getElementById('module-list');
+    const summary = document.getElementById('module-summary');
+    const modules = Array.isArray(catalog?.modules) ? catalog.modules : [];
+    if (!list || !summary || !modules.length) return;
+
+    const active = modules.filter(m => m.status === 'active').length;
+    const available = modules.filter(m => m.status === 'available').length;
+    const categories = new Set(modules.map(m => m.category)).size;
+    summary.textContent = `${modules.length} modules / ${active} active / ${available} available / ${categories} categories`;
+
+    const rank = { active: 0, available: 1, offline: 2 };
+    const ordered = [...modules].sort((a, b) => {
+      const byStatus = (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
+      if (byStatus !== 0) return byStatus;
+      return String(a.category).localeCompare(String(b.category));
+    });
+
+    list.replaceChildren();
+    for (const mod of ordered) {
+      const row = document.createElement('div');
+      const status = String(mod.status || 'offline').toLowerCase();
+      row.className = `module-row module-row--${status}`;
+
+      const copy = document.createElement('div');
+      copy.className = 'module-copy';
+      const name = document.createElement('span');
+      name.className = 'module-name';
+      name.textContent = mod.name || mod.id || 'Module';
+      const category = document.createElement('span');
+      category.className = 'module-category';
+      category.textContent = `${mod.category || 'General'} / ${mod.size_kb || 0} KB`;
+      copy.append(name, category);
+
+      const state = document.createElement('div');
+      state.className = 'module-state';
+      const statusEl = document.createElement('span');
+      statusEl.textContent = status;
+      const confEl = document.createElement('span');
+      confEl.textContent = this._formatPercent(mod.confidence);
+      state.append(statusEl, confEl);
+
+      row.append(copy, state);
+      list.appendChild(row);
+    }
+  }
+
+  _formatPercent(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? `${Math.round(n * 100)}%` : '--';
   }
 
   _bindRange(id, key, applyFn) {

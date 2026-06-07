@@ -54,7 +54,7 @@ pub use discovery::{
 
 /// Stable origin string written into every HA discovery payload's `origin`
 /// block so HA users can see which RuView version emitted the entities.
-pub const ORIGIN_NAME: &str = "wifi-densepose-sensing-server";
+pub const ORIGIN_NAME: &str = "ruvsense-master";
 
 /// Stable manufacturer string written into every HA discovery payload's
 /// `device` block.

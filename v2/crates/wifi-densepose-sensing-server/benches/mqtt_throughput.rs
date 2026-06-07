@@ -18,7 +18,7 @@
 //! build doesn't pull `criterion` in (it has a big-ish dep tree).
 //!
 //! Run with:
-//!   cargo bench -p wifi-densepose-sensing-server --bench mqtt_throughput
+//!   cargo bench -p ruvsense-master --bench mqtt_throughput
 
 #![cfg(feature = "mqtt")]
 

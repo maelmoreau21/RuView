@@ -1,5 +1,5 @@
 /**
- * RuView Observatory — Main Scene Orchestrator
+ * RuvSense Console - Main Scene Orchestrator
  *
  * Room-based WiFi sensing visualization with:
  * - Pool of 4 human wireframe figures (multi-person scenarios)
@@ -42,13 +42,14 @@ class Observatory {
 
     // Load saved settings
     try {
-      const ver = localStorage.getItem('ruview-settings-version');
+      const ver = localStorage.getItem('ruvsense-console-settings-version');
       if (ver === SETTINGS_VERSION) {
-        const saved = localStorage.getItem('ruview-observatory-settings');
+        const saved = localStorage.getItem('ruvsense-console-settings');
         if (saved) Object.assign(this.settings, JSON.parse(saved));
       } else {
         localStorage.removeItem('ruview-observatory-settings');
-        localStorage.setItem('ruview-settings-version', SETTINGS_VERSION);
+        localStorage.removeItem('ruvsense-console-settings');
+        localStorage.setItem('ruvsense-console-settings-version', SETTINGS_VERSION);
       }
     } catch {}
 

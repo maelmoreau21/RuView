@@ -1,4 +1,4 @@
-# π RuView
+# RuvSense Edge
 
 <p align="center">
   <a href="https://cognitum.one/seed">
@@ -21,7 +21,9 @@ Works natively with the four major smart-home ecosystems: **[Home Assistant](doc
 
 > Drop into any **Home Assistant** install with one `--mqtt` flag. Or pair into **Apple Home / Google Home / Alexa / SmartThings** as a Matter Bridge. Ships 21 entities per node (11 raw signals + 10 inferred semantic states: someone-sleeping, possible-distress, room-active, elderly-inactivity-anomaly, meeting-in-progress, bathroom-occupied, fall-risk-elevated, bed-exit, no-movement, multi-room-transition) plus 3 starter HA Blueprints. See [`docs/integrations/home-assistant.md`](docs/integrations/home-assistant.md) · [ADR-115](docs/adr/ADR-115-home-assistant-integration.md).
 
-### π RuView is a WiFi sensing platform that turns radio signals into spatial intelligence.
+### RuvSense Edge is a Raspberry Pi + ESP32-C6 appliance for WiFi spatial intelligence.
+
+RuvSense Edge is the professionalized RuView fork: a Rust `ruvsense-master` on a Raspberry Pi 4 receives UDP CSI from at least three ESP32-C6 nodes, exposes stable `/api/v1/*` APIs, serves the RuvSense Console, and reports readiness only when the configured node quorum is active. Health and vitals modules are monitoring/screening surfaces with confidence and evidence, not medical diagnosis.
 
 Every WiFi router already fills your space with radio waves. When people move, breathe, or even sit still, they disturb those waves in measurable ways. RuView captures these disturbances using Channel State Information (CSI) from low-cost ESP32 sensors and turns them into actionable data: who's there, what they're doing, and whether they're okay.
 
@@ -75,6 +77,16 @@ RuView turns ordinary WiFi into a contactless sensor. A $9 ESP32 board reads the
 > 🤗 **Pretrained weights**: download from [`ruvnet/wifi-densepose-pretrained`](https://huggingface.co/ruvnet/wifi-densepose-pretrained) — see [Loading the pretrained model](#loading-the-pretrained-model) below for one-command setup.
 
 ```bash
+# RuvSense Edge: Raspberry Pi 4 master + 3 ESP32-C6 nodes
+docker compose -f docker/compose.pi4.yml up -d
+curl http://127.0.0.1:3000/health/ready
+
+python firmware/esp32-csi-node/provision_three_c6.py \
+  --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
+  --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
+
+# Open http://<pi-ip>:3000/ui/observatory.html
+
 # Option 1: Docker (simulated data, no hardware needed)
 docker pull ruvnet/wifi-densepose:latest
 docker run -p 3000:3000 ruvnet/wifi-densepose:latest
@@ -92,8 +104,10 @@ python firmware/esp32-csi-node/provision.py --port COM9 \
 # Same csi-node firmware compiled for the C6 target — picks up the C6
 # overlay (sdkconfig.defaults.esp32c6) automatically.
 cd firmware/esp32-csi-node
-idf.py set-target esp32c6 && idf.py build
+./build_firmware.ps1 -Target esp32c6
 idf.py -p COM6 flash
+python provision_three_c6.py --ports COM6,COM7,COM8 \
+  --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
 # C6 boot extras (vs S3): HE-LTF subcarrier tagging in ADR-018 bytes 18-19,
 #   802.15.4 mesh time-sync on channel 15, TWT setup when the AP supports it,
 #   opt-in LP-core wake-on-motion for ~5 µA battery seed nodes.
@@ -529,16 +543,16 @@ WiFi Signal [56 channels] → Transformer + Graph Neural Network
 
 ```bash
 # Step 1: Learn from raw WiFi data (no labels needed)
-cargo run -p wifi-densepose-sensing-server -- --pretrain --dataset data/csi/ --pretrain-epochs 50
+cargo run -p ruvsense-master --bin ruvsense-master -- --pretrain --dataset data/csi/ --pretrain-epochs 50
 
 # Step 2: Fine-tune with pose labels for full capability
-cargo run -p wifi-densepose-sensing-server -- --train --dataset data/mmfi/ --epochs 100 --save-rvf model.rvf
+cargo run -p ruvsense-master --bin ruvsense-master -- --train --dataset data/mmfi/ --epochs 100 --save-rvf model.rvf
 
 # Step 3: Use the model — extract fingerprints from live WiFi
-cargo run -p wifi-densepose-sensing-server -- --model model.rvf --embed
+cargo run -p ruvsense-master --bin ruvsense-master -- --model model.rvf --embed
 
 # Step 4: Search — find similar environments or detect anomalies
-cargo run -p wifi-densepose-sensing-server -- --model model.rvf --build-index env
+cargo run -p ruvsense-master --bin ruvsense-master -- --model model.rvf --build-index env
 ```
 
 **Training Modes**

@@ -7,7 +7,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::state::AppState;
 
 /// Default binary name for the sensing server.
-const DEFAULT_SERVER_BIN: &str = "sensing-server";
+const DEFAULT_SERVER_BIN: &str = "ruvsense-master";
 
 /// Find the sensing server binary path.
 ///
@@ -58,7 +58,7 @@ fn find_server_binary(app: &AppHandle, custom_path: Option<&str>) -> Result<Stri
     }
 
     Err(format!(
-        "Sensing server binary '{}' not found. Please build it with: cargo build --release -p wifi-densepose-sensing-server",
+        "RuvSense master binary '{}' not found. Please build it with: cargo build --release -p ruvsense-master --bin ruvsense-master",
         DEFAULT_SERVER_BIN
     ))
 }

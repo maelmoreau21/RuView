@@ -1,12 +1,12 @@
 [package]
-name = "wifi-densepose-sensing-server"
+name = "ruvsense-master"
 version = "0.3.1"
 edition.workspace = true
-description = "Lightweight Axum server for WiFi sensing UI with RuVector signal processing"
+description = "RuvSense Edge master for WiFi/CSI sensing fleets on Raspberry Pi"
 license.workspace = true
 authors = ["rUv <ruv@ruv.net>", "WiFi-DensePose Contributors"]
 repository.workspace = true
-documentation = "https://docs.rs/wifi-densepose-sensing-server"
+documentation = "https://docs.rs/ruvsense-master"
 keywords = ["wifi", "sensing", "server", "websocket", "csi"]
 categories = ["web-programming::http-server", "science"]
 readme = "README.md"
@@ -17,6 +17,10 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "sensing-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "ruvsense-master"
 path = "src/main.rs"
 
 [dependencies]
@@ -30,10 +34,12 @@ ruvector-mincut = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json.workspace = true
+sqlx = { workspace = true }
 
 # Logging
 tracing.workspace = true
 tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

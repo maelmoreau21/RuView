@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(j["device"]["identifiers"][0], "wifi_densepose_aabbccddeeff");
         assert_eq!(j["device"]["name"], "Bedroom");
         assert_eq!(j["device"]["via_device"], "cognitum_seed_1");
-        assert_eq!(j["origin"]["name"], "wifi-densepose-sensing-server");
+        assert_eq!(j["origin"]["name"], "ruvsense-master");
     }
 
     #[test]

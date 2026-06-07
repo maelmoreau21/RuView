@@ -1,9 +1,7 @@
 /* ============================================================
-   RuView Observatory — Foundation Color Scheme
+   RuvSense Console - Foundation Color Scheme
    Warm dark background, electric green wireframe, amber data
    ============================================================ */
-
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
 
 :root {
   --bg-deep:     #080c14;
@@ -28,7 +26,7 @@
 body {
   background: var(--bg-deep);
   overflow: hidden;
-  font-family: 'Inter', -apple-system, sans-serif;
+  font-family: Inter, "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
 }
@@ -55,11 +53,11 @@ body {
 }
 
 #brand-logo {
-  font-family: 'Inter', sans-serif;
+  font-family: Inter, "Segoe UI", sans-serif;
   font-weight: 700;
   font-size: 32px;
   color: var(--text-primary);
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
   text-shadow: 0 0 30px rgba(0, 216, 120, 0.3);
 }
 
@@ -72,7 +70,7 @@ body {
 #brand-tagline {
   font-size: 11px;
   color: var(--text-secondary);
-  letter-spacing: 1.5px;
+  letter-spacing: 0;
   text-transform: uppercase;
   margin-top: 2px;
 }
@@ -91,12 +89,12 @@ body {
   align-items: center;
   gap: 6px;
   padding: 5px 12px;
-  border-radius: 20px;
+  border-radius: 8px;
   background: rgba(0, 216, 120, 0.1);
   border: 1px solid rgba(0, 216, 120, 0.25);
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  letter-spacing: 1px;
+  letter-spacing: 0;
   color: var(--green-glow);
 }
 
@@ -118,7 +116,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 5px 14px;
-  border-radius: 20px;
+  border-radius: 8px;
   background: rgba(255, 176, 32, 0.1);
   border: 1px solid rgba(255, 176, 32, 0.25);
   pointer-events: auto;
@@ -135,7 +133,7 @@ body {
   padding: 0;
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   color: var(--amber);
   cursor: pointer;
   outline: none;
@@ -162,7 +160,7 @@ body {
   width: 220px;
   background: var(--bg-panel);
   border: 1px solid var(--bg-panel-border);
-  border-radius: 12px;
+  border-radius: 8px;
   padding: 16px;
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -173,7 +171,7 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
   font-weight: 600;
-  letter-spacing: 2px;
+  letter-spacing: 0;
   text-transform: uppercase;
   color: var(--text-label);
   margin-bottom: 14px;
@@ -213,7 +211,7 @@ body {
 .vital-label {
   font-size: 10px;
   color: var(--text-label);
-  letter-spacing: 1px;
+  letter-spacing: 0;
   text-transform: uppercase;
   margin-bottom: 3px;
 }
@@ -266,7 +264,7 @@ body {
 .signal-label {
   font-size: 11px;
   color: var(--text-label);
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
 }
 
 .signal-value {
@@ -292,7 +290,7 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 14px;
   font-weight: 600;
-  letter-spacing: 2px;
+  letter-spacing: 0;
   transition: all 0.5s ease;
 }
 
@@ -324,7 +322,7 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
   font-weight: 700;
-  letter-spacing: 2px;
+  letter-spacing: 0;
   background: rgba(255, 48, 64, 0.15);
   color: var(--red-alert);
   border: 1px solid rgba(255, 48, 64, 0.4);
@@ -334,6 +332,167 @@ body {
 @keyframes pulse-alert {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
+}
+
+/* ---- Operational Panels ---- */
+.operational-panel {
+  width: 292px;
+}
+
+#panel-fleet {
+  left: 28px;
+  top: 96px;
+}
+
+#panel-modules {
+  left: 28px;
+  bottom: 86px;
+  width: 330px;
+  max-height: 300px;
+  display: flex;
+  flex-direction: column;
+}
+
+.fleet-readiness {
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+}
+
+.fleet-readiness--ready {
+  color: var(--green-glow);
+  border-color: rgba(0, 216, 120, 0.35);
+  background: rgba(0, 216, 120, 0.1);
+}
+
+.fleet-readiness--pending {
+  color: var(--amber);
+  border-color: rgba(255, 176, 32, 0.35);
+  background: rgba(255, 176, 32, 0.1);
+}
+
+.fleet-kpis {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.fleet-kpis > div {
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.035);
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+.kpi-label,
+.module-category {
+  display: block;
+  font-size: 10px;
+  color: var(--text-label);
+}
+
+.kpi-value {
+  display: block;
+  margin-top: 3px;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 13px;
+  color: var(--blue-signal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fleet-list,
+.module-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.module-list {
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.fleet-node,
+.module-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.035);
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+.fleet-node--active,
+.module-row--active {
+  border-color: rgba(0, 216, 120, 0.28);
+}
+
+.fleet-node--stale,
+.fleet-node--offline,
+.module-row--offline {
+  opacity: 0.62;
+}
+
+.fleet-node-name,
+.module-name {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.fleet-node-meta,
+.module-state {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.fleet-empty,
+.module-summary {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
+.module-summary {
+  margin-bottom: 10px;
+}
+
+.module-copy {
+  min-width: 0;
+}
+
+.module-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 190px;
+}
+
+.module-state {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.module-row--available .module-state {
+  color: var(--amber);
+}
+
+.module-row--active .module-state {
+  color: var(--green-glow);
 }
 
 /* ---- Capabilities Bar (bottom center) ---- */
@@ -347,7 +506,7 @@ body {
   gap: 0;
   background: var(--bg-panel);
   border: 1px solid var(--bg-panel-border);
-  border-radius: 30px;
+  border-radius: 8px;
   padding: 8px 24px;
   backdrop-filter: blur(12px);
 }
@@ -389,7 +548,7 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
   color: rgba(255,255,255,0.2);
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   padding: 3px 8px;
   border-radius: 4px;
   background: rgba(255,255,255,0.03);
@@ -433,7 +592,7 @@ body {
 .settings-dialog {
   background: rgba(10, 16, 28, 0.96);
   border: 1px solid rgba(0, 216, 120, 0.2);
-  border-radius: 16px;
+  border-radius: 8px;
   width: 440px;
   max-height: 80vh;
   overflow-y: auto;
@@ -450,7 +609,7 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
   font-weight: 600;
-  letter-spacing: 1px;
+  letter-spacing: 0;
   text-transform: uppercase;
   color: var(--text-primary);
 }
@@ -478,7 +637,7 @@ body {
   color: var(--text-label);
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
-  letter-spacing: 1px;
+  letter-spacing: 0;
   text-transform: uppercase;
   padding: 10px 14px;
   cursor: pointer;
@@ -598,7 +757,7 @@ body {
   color: var(--green-glow);
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  letter-spacing: 1px;
+  letter-spacing: 0;
   border-radius: 6px;
   cursor: pointer;
   transition: all 0.2s;
@@ -617,7 +776,7 @@ body {
   font-size: 11px;
   color: var(--text-secondary);
   font-style: italic;
-  letter-spacing: 0.3px;
+  letter-spacing: 0;
   line-height: 1.4;
   pointer-events: none;
   opacity: 0.7;
@@ -639,11 +798,11 @@ body {
 .edge-badge {
   display: inline-block;
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: 8px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 9px;
   font-weight: 600;
-  letter-spacing: 1px;
+  letter-spacing: 0;
   color: var(--badge-color, var(--text-secondary));
   background: rgba(255,255,255,0.04);
   border: 1px solid var(--badge-color, rgba(255,255,255,0.1));
@@ -687,6 +846,8 @@ body {
 /* ---- Responsive ---- */
 @media (max-width: 1200px) {
   .data-panel { width: 190px; padding: 12px; }
+  #panel-fleet { width: 250px; }
+  #panel-modules { display: none; }
   .vital-value { font-size: 22px; }
   #capabilities-bar { display: none; }
 }
@@ -695,4 +856,14 @@ body {
   .data-panel { display: none; }
   #key-hints { display: none; }
   .settings-dialog { width: 95vw; }
+  #brand { top: 16px; left: 16px; }
+  #brand-logo { font-size: 24px; }
+  #status-bar {
+    top: 16px;
+    right: 16px;
+    max-width: calc(100vw - 32px);
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+  #scenario-description { display: none; }
 }

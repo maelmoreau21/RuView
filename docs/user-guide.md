@@ -73,6 +73,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
 
 | Option | Cost | Capabilities |
 |--------|------|-------------|
+| RuvSense Edge fleet (Raspberry Pi 4 + 3 ESP32-C6) | ~$45-60 | Production CSI fleet: multistatic sensing, vitals screening, modules, RuvSense Console |
 | ESP32-S3 mesh (3-6 boards) | ~$54 | Full CSI: pose, breathing, heartbeat, presence |
 | Intel 5300 / Atheros AR9580 | $50-100 | Full CSI with 3x3 MIMO (Linux only) |
 | Any WiFi laptop | $0 | RSSI-only: coarse presence and motion detection |
@@ -86,6 +87,19 @@ No hardware? The system runs in **simulated mode** with synthetic CSI data.
 ### Docker (Recommended)
 
 The fastest path. No toolchain installation needed.
+
+For the RuvSense Edge appliance on a Raspberry Pi 4 64-bit OS, use the dedicated master compose file. It runs in host networking mode so three or more ESP32-C6 nodes can send UDP/5005 directly to the master.
+
+```bash
+docker compose -f docker/compose.pi4.yml up -d
+curl http://127.0.0.1:3000/health/ready
+
+python firmware/esp32-csi-node/provision_three_c6.py \
+  --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
+  --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
+```
+
+Open the console at `http://<pi-ip>:3000/ui/observatory.html`. Readiness is green only after at least `RUVSENSE_MIN_NODES` active nodes are seen; the default is `3`.
 
 ```bash
 docker pull ruvnet/wifi-densepose:latest
@@ -131,7 +145,7 @@ cargo build --release
 cargo test --workspace --no-default-features
 ```
 
-The compiled binary is at `target/release/sensing-server`.
+The compiled binary is at `target/release/ruvsense-master`; `target/release/sensing-server` remains as a legacy alias.
 
 ### From crates.io (Individual Crates)
 
@@ -386,7 +400,7 @@ If a standalone `aggregator` command prints live packets, the ESP32 fleet is alr
 ```bash
 # From a source build
 cd v2
-cargo run -p wifi-densepose-sensing-server -- \
+cargo run -p ruvsense-master --bin ruvsense-master -- \
   --source esp32 \
   --udp-port 5005 \
   --http-port 3000 \
@@ -1164,7 +1178,7 @@ print({k: tuple(v.shape) for k, v in state.items()})
 "
 
 # Sensing server — run heuristic for now:
-cargo run -p wifi-densepose-sensing-server --release -- \
+cargo run -p ruvsense-master --bin ruvsense-master --release -- \
     --source esp32 --udp-port 5005 --http-port 3000
 ```
 
