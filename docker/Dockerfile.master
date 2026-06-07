@@ -47,7 +47,7 @@ EXPOSE 5005/udp
 EXPOSE 1883
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=8 \
-  CMD wget -qO- http://127.0.0.1:${RUVSENSE_HTTP_PORT}/health/ready >/dev/null || exit 1
+  CMD wget -qO- http://127.0.0.1:${RUVSENSE_HTTP_PORT}/health/live >/dev/null || exit 1
 
 ENTRYPOINT ["/app/ruvsense-master-entrypoint.sh"]
 CMD []

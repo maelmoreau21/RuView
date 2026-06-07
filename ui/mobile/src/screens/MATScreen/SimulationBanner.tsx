@@ -25,7 +25,7 @@ export const SimulationBanner: React.FC<Props> = ({ visible }) => {
 
   return (
     <Animated.View style={[styles.banner, { opacity }]}>
-      <Text style={styles.text}>SIMULATED DATA - NOT CONNECTED TO REAL SENSORS</Text>
+      <Text style={styles.text}>DEV SIMULATION - NOT CONNECTED TO REAL SENSORS</Text>
     </Animated.View>
   );
 };

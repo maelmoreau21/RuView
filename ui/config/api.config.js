@@ -12,9 +12,9 @@ export const API_CONFIG = {
   WS_PREFIX: 'ws://',
   WSS_PREFIX: 'wss://',
 
-  // Mock server configuration (only for testing)
+  // Mock backends are disabled in the production console.
   MOCK_SERVER: {
-    ENABLED: false,  // Set to true only for testing without backend
+    ENABLED: false,
     AUTO_DETECT: false,  // Disabled — sensing tab uses its own WebSocket on :8765
   },
   

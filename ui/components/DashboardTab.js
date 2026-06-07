@@ -93,9 +93,9 @@ export class DashboardTab {
     const statusMsg  = el.querySelector('.status-message');
     const config = {
       'live':              { text: 'ESP32',     status: 'healthy', msg: 'Real hardware connected' },
-      'server-simulated':  { text: 'SIMULATED', status: 'warning', msg: 'Server running without hardware' },
+      'server-simulated':  { text: 'DEV SIM', status: 'warning', msg: 'Explicit simulation mode enabled' },
       'reconnecting':      { text: 'RECONNECTING', status: 'degraded', msg: 'Attempting to connect...' },
-      'simulated':         { text: 'OFFLINE',   status: 'unhealthy', msg: 'Server unreachable, local fallback' },
+      'offline':           { text: 'OFFLINE',   status: 'unhealthy', msg: 'Waiting for real hardware data' },
     };
     const cfg = config[ds] || config['reconnecting'];
     el.className = `component-status status-${cfg.status}`;
@@ -222,7 +222,7 @@ export class DashboardTab {
   // Update system metrics
   updateSystemMetrics(metrics) {
     // Handle both flat and nested metric structures
-    // Backend returns system_metrics.cpu.percent, mock returns metrics.cpu.percent
+    // Support both nested and flat metric shapes.
     const systemMetrics = metrics.system_metrics || metrics;
     const cpuPercent = systemMetrics.cpu?.percent || systemMetrics.cpu_percent;
     const memoryPercent = systemMetrics.memory?.percent || systemMetrics.memory_percent;

@@ -415,8 +415,8 @@ export class Environment {
     }
   }
 
-  // Generate a demo confidence heatmap centered on given positions
-  static generateDemoHeatmap(personPositions, cols, rows, roomWidth, roomDepth) {
+  // Generate a confidence heatmap centered on live person positions.
+  static generateConfidenceHeatmap(personPositions, cols, rows, roomWidth, roomDepth) {
     const map = new Float32Array(cols * rows);
     const cellW = roomWidth / cols;
     const cellD = roomDepth / rows;

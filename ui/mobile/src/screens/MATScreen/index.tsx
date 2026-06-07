@@ -56,7 +56,7 @@ export const MATScreen = () => {
 
   // Sync dataSource from connection status
   useEffect(() => {
-    setDataSource(connectionStatus === 'connected' ? 'real' : 'simulated');
+    setDataSource(connectionStatus === 'simulated' ? 'simulated' : 'real');
   }, [connectionStatus, setDataSource]);
 
   const { webViewRef, ready, onMessage, sendFrameUpdate, postEvent } = useMatBridge({

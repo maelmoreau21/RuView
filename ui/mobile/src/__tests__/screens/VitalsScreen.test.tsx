@@ -70,6 +70,6 @@ describe('VitalsScreen', () => {
         <VitalsScreen />
       </ThemeProvider>,
     );
-    expect(screen.getByText('SIMULATED DATA')).toBeTruthy();
+    expect(screen.getByText('DEV SIMULATION')).toBeTruthy();
   });
 });

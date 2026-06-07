@@ -53,7 +53,7 @@ export class ConnectionStatus {
 
     if (state === 'connected' || state === 'streaming') {
       const label = source === 'live' ? 'Live' :
-                    source === 'server-simulated' ? 'Simulated' :
+                    source === 'server-simulated' ? 'Dev simulation' :
                     'Connected';
       this.setStatus('connected', label);
     } else if (state === 'connecting' || state === 'reconnecting') {

@@ -1,476 +1,440 @@
-// WiFi DensePose Application - Main Entry Point
+const state = {
+  fleet: null,
+  environment: null,
+  modules: [],
+  latest: null,
+  ws: null,
+  selectedCategory: 'All',
+  reconnectTimer: null,
+};
 
-import { TabManager } from './components/TabManager.js';
-import { DashboardTab } from './components/DashboardTab.js';
-import { HardwareTab } from './components/HardwareTab.js';
-import { LiveDemoTab } from './components/LiveDemoTab.js';
-import { SensingTab } from './components/SensingTab.js';
-import { apiService } from './services/api.service.js';
-import { wsService } from './services/websocket.service.js';
-import { healthService } from './services/health.service.js';
-import { sensingService } from './services/sensing.service.js';
-import { backendDetector } from './utils/backend-detector.js';
-import { KeyboardShortcuts } from './utils/keyboard-shortcuts.js';
-import { PerfMonitor } from './utils/perf-monitor.js';
-import { toastManager } from './utils/toast.js';
-import { ThemeToggle } from './utils/theme-toggle.js';
-import { CommandPalette } from './utils/command-palette.js';
-import { ActivityLog } from './utils/activity-log.js';
-import { DataExport } from './utils/data-export.js';
-import { FullscreenManager } from './utils/fullscreen.js';
-import { ConnectionStatus } from './utils/connection-status.js';
-import { MobileNav } from './utils/mobile-nav.js';
-import { Router } from './utils/router.js';
-import { Onboarding } from './utils/onboarding.js';
-import { IdleManager } from './utils/idle-manager.js';
-import { NotificationCenter } from './utils/notification-center.js';
-import { i18n } from './utils/i18n.js';
-import { ScreenshotTool } from './utils/screenshot.js';
-import { UptimeClock } from './utils/uptime-clock.js';
-import { QuickSettings } from './utils/quick-settings.js';
+const $ = (selector) => document.querySelector(selector);
 
-class WiFiDensePoseApp {
-  constructor() {
-    this.components = {};
-    this.isInitialized = false;
+function logEvent(message, level = 'info') {
+  const list = $('#event-log');
+  if (!list) return;
+  const item = document.createElement('li');
+  item.className = `event event-${level}`;
+  const stamp = new Date().toLocaleTimeString();
+  item.textContent = `${stamp} - ${message}`;
+  list.prepend(item);
+  while (list.children.length > 80) list.lastElementChild?.remove();
+}
+
+async function fetchJson(path, options) {
+  const response = await fetch(path, { cache: 'no-store', ...options });
+  if (!response.ok) {
+    throw new Error(`${path} returned HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+function fmtHz(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(1)} Hz` : '0.0 Hz';
+}
+
+function fmtAge(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return 'never';
+  if (n < 1000) return `${Math.round(n)} ms`;
+  return `${(n / 1000).toFixed(1)} s`;
+}
+
+function percent(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${Math.round(n * 100)}%` : '--';
+}
+
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function setMasterStatus(status, text) {
+  const pill = $('#master-status');
+  if (!pill) return;
+  pill.className = `status-pill status-${status}`;
+  pill.querySelector('span:last-child').textContent = text;
+}
+
+function renderFleet() {
+  const fleet = state.fleet || {};
+  const active = Number(fleet.active_nodes || 0);
+  const minNodes = Number(fleet.min_nodes || 3);
+  const ready = Boolean(fleet.ready);
+  const fusion = fleet.fusion_status || (ready ? 'active' : active > 0 ? 'degraded' : 'offline');
+
+  setMasterStatus(ready ? 'live' : active > 0 ? 'degraded' : 'offline', ready ? 'Master ready' : active > 0 ? 'Master degraded' : 'Master waiting');
+  setText('fusion-status', fusion);
+  setText('active-nodes', String(active));
+  setText('min-nodes', String(minNodes));
+  setText('frame-rate', fmtHz(fleet.frame_rate_hz));
+  setText('source-mode', fleet.source_mode?.raw || fleet.source || 'offline');
+  setText('fleet-readiness', ready ? 'ready' : active > 0 ? 'degraded' : 'waiting');
+
+  const list = $('#node-list');
+  if (!list) return;
+  const nodes = Array.isArray(fleet.nodes) ? fleet.nodes : Array.isArray(state.environment?.nodes) ? state.environment.nodes : [];
+  list.replaceChildren();
+
+  if (!nodes.length) {
+    list.append(emptyRow('No configured ESP32-C6 nodes'));
+    return;
   }
 
-  // Initialize application
-  async init() {
-    try {
-      console.log('Initializing WiFi DensePose UI...');
-      
-      // Set up error handling
-      this.setupErrorHandling();
-      
-      // Initialize services
-      await this.initializeServices();
-      
-      // Initialize UI components
-      this.initializeComponents();
-
-      // Initialize enhancements
-      this.initializeEnhancements();
-
-      // Set up global event listeners
-      this.setupEventListeners();
-
-      this.isInitialized = true;
-      console.log('WiFi DensePose UI initialized successfully');
-      
-    } catch (error) {
-      console.error('Failed to initialize application:', error);
-      this.showGlobalError('Failed to initialize application. Please refresh the page.');
-    }
-  }
-
-  // Initialize services
-  async initializeServices() {
-    // Add request interceptor for error handling
-    apiService.addResponseInterceptor(async (response, url) => {
-      if (!response.ok && response.status === 401) {
-        console.warn('Authentication required for:', url);
-        // Handle authentication if needed
-      }
-      return response;
-    });
-
-    // Detect backend availability and initialize accordingly
-    const useMock = await backendDetector.shouldUseMockServer();
-    
-    if (useMock) {
-      console.log('🧪 Initializing with mock server for testing');
-      // Import and start mock server only when needed
-      const { mockServer } = await import('./utils/mock-server.js');
-      mockServer.start();
-      
-      // Show notification to user
-      this.showBackendStatus('Mock server active - testing mode', 'warning');
-    } else {
-      console.log('🔌 Connecting to backend...');
-
-      try {
-        const health = await healthService.checkLiveness();
-        console.log('✅ Backend responding:', health);
-        this.showBackendStatus('Connected to Rust sensing server', 'success');
-      } catch (error) {
-        console.warn('⚠️ Backend not available:', error.message);
-        this.showBackendStatus('Backend unavailable — start sensing-server', 'warning');
-      }
-
-      // Start the sensing WebSocket service early so the dashboard and
-      // live-demo tabs can show the correct data-source status immediately.
-      sensingService.start();
-    }
-  }
-
-  // Initialize UI components
-  initializeComponents() {
-    const container = document.querySelector('.container');
-    if (!container) {
-      throw new Error('Main container not found');
-    }
-
-    // Initialize tab manager
-    this.components.tabManager = new TabManager(container);
-    this.components.tabManager.init();
-
-    // Initialize tab components
-    this.initializeTabComponents();
-
-    // Set up tab change handling
-    this.components.tabManager.onTabChange((newTab, oldTab) => {
-      this.handleTabChange(newTab, oldTab);
-    });
-
-  }
-
-  // Initialize individual tab components
-  initializeTabComponents() {
-    // Dashboard tab
-    const dashboardContainer = document.getElementById('dashboard');
-    if (dashboardContainer) {
-      this.components.dashboard = new DashboardTab(dashboardContainer);
-      this.components.dashboard.init().catch(error => {
-        console.error('Failed to initialize dashboard:', error);
-      });
-    }
-
-    // Hardware tab
-    const hardwareContainer = document.getElementById('hardware');
-    if (hardwareContainer) {
-      this.components.hardware = new HardwareTab(hardwareContainer);
-      this.components.hardware.init();
-    }
-
-    // Live demo tab
-    const demoContainer = document.getElementById('demo');
-    if (demoContainer) {
-      this.components.demo = new LiveDemoTab(demoContainer);
-      this.components.demo.init();
-    }
-
-    // Sensing tab
-    const sensingContainer = document.getElementById('sensing');
-    if (sensingContainer) {
-      this.components.sensing = new SensingTab(sensingContainer);
-    }
-
-    // Training tab - lazy load to avoid breaking other tabs if import fails
-    this.initTrainingTab();
-
-    // Architecture tab - static content, no component needed
-
-    // Performance tab - static content, no component needed
-
-    // Applications tab - static content, no component needed
-  }
-
-  // Lazy-load Training tab panels (dynamic import so failures don't break other tabs)
-  async initTrainingTab() {
-    try {
-      const [{ default: TrainingPanel }, { default: ModelPanel }] = await Promise.all([
-        import('./components/TrainingPanel.js'),
-        import('./components/ModelPanel.js')
-      ]);
-
-      const trainingContainer = document.getElementById('training-panel-container');
-      if (trainingContainer) {
-        this.components.trainingPanel = new TrainingPanel(trainingContainer);
-      }
-
-      const modelContainer = document.getElementById('model-panel-container');
-      if (modelContainer) {
-        this.components.modelPanel = new ModelPanel(modelContainer);
-      }
-    } catch (error) {
-      console.error('Failed to load Training tab components:', error);
-    }
-  }
-
-  // Initialize enhancement modules
-  initializeEnhancements() {
-    // Toast notifications
-    toastManager.init();
-
-    // Connection status widget in header
-    this.connectionStatus = new ConnectionStatus();
-    this.connectionStatus.init();
-
-    // Theme toggle
-    this.themeToggle = new ThemeToggle();
-    this.themeToggle.init();
-
-    // Performance monitor
-    this.perfMonitor = new PerfMonitor();
-    this.perfMonitor.init();
-
-    // Activity log
-    this.activityLog = new ActivityLog();
-    this.activityLog.init();
-
-    // Data export
-    this.dataExport = new DataExport();
-    this.dataExport.init();
-
-    // Fullscreen manager
-    this.fullscreenManager = new FullscreenManager();
-    this.fullscreenManager.init();
-
-    // Command palette (Ctrl+K)
-    this.commandPalette = new CommandPalette(this);
-    this.commandPalette.init();
-
-    // Mobile navigation (hamburger menu for small screens)
-    this.mobileNav = new MobileNav();
-    this.mobileNav.init();
-
-    // Notification center (bell icon in header)
-    this.notificationCenter = new NotificationCenter();
-    this.notificationCenter.init();
-
-    // Screenshot tool
-    this.screenshotTool = new ScreenshotTool();
-    this.screenshotTool.init();
-
-    // Uptime clock
-    this.uptimeClock = new UptimeClock();
-    this.uptimeClock.init();
-
-    // Quick settings panel
-    this.quickSettings = new QuickSettings(this);
-    this.quickSettings.init();
-
-    // Internationalization (EN/PL)
-    i18n.init();
-
-    // Keyboard shortcuts (pass app reference for tab switching)
-    this.keyboardShortcuts = new KeyboardShortcuts(this);
-    this.keyboardShortcuts.register('l', 'Toggle activity log', () => {
-      document.dispatchEvent(new CustomEvent('toggle-activity-log'));
-    });
-    this.keyboardShortcuts.register('e', 'Export sensor data', () => {
-      document.dispatchEvent(new CustomEvent('export-data'));
-    });
-    this.keyboardShortcuts.register('f', 'Toggle fullscreen', () => {
-      document.dispatchEvent(new CustomEvent('toggle-fullscreen'));
-    });
-    this.keyboardShortcuts.register('s', 'Take screenshot', () => {
-      document.dispatchEvent(new CustomEvent('take-screenshot'));
-    });
-    this.keyboardShortcuts.init();
-
-    // Listen for show-shortcuts from command palette
-    document.addEventListener('show-shortcuts', () => {
-      this.keyboardShortcuts.showHelp();
-    });
-
-    // Register PWA service worker
-    this.registerServiceWorker();
-
-    // URL hash router (bookmarkable tabs)
-    this.router = new Router(this);
-    this.router.init();
-
-    // Idle detection (pause updates when inactive)
-    this.idleManager = new IdleManager();
-    this.idleManager.onIdle(() => {
-      healthService.stopHealthMonitoring();
-      console.info('[App] Paused health monitoring (idle)');
-    });
-    this.idleManager.onActive(() => {
-      healthService.startHealthMonitoring();
-      console.info('[App] Resumed health monitoring (active)');
-    });
-    this.idleManager.init();
-
-    // Onboarding tour (first-run walkthrough)
-    this.onboarding = new Onboarding(this);
-    this.onboarding.init();
-  }
-
-  // Register service worker for offline capability
-  registerServiceWorker() {
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js').then(reg => {
-        console.info('Service worker registered:', reg.scope);
-      }).catch(err => {
-        console.warn('Service worker registration failed:', err);
-      });
-    }
-  }
-
-  // Handle tab changes
-  handleTabChange(newTab, oldTab) {
-    console.log(`Tab changed from ${oldTab} to ${newTab}`);
-    
-    // Stop demo if leaving demo tab
-    if (oldTab === 'demo' && this.components.demo) {
-      this.components.demo.stopDemo();
-    }
-    
-    // Update components based on active tab
-    switch (newTab) {
-      case 'dashboard':
-        // Dashboard auto-updates when visible
-        break;
-        
-      case 'hardware':
-        // Hardware visualization is always active
-        break;
-        
-      case 'demo':
-        // Demo starts manually
-        break;
-
-      case 'sensing':
-        // Lazy-init sensing tab on first visit
-        if (this.components.sensing && !this.components.sensing.splatRenderer) {
-          this.components.sensing.init().catch(error => {
-            console.error('Failed to initialize sensing tab:', error);
-          });
-        }
-        break;
-
-      case 'training':
-        // Refresh panels when training tab becomes visible
-        if (this.components.trainingPanel && typeof this.components.trainingPanel.refresh === 'function') {
-          this.components.trainingPanel.refresh();
-        }
-        if (this.components.modelPanel && typeof this.components.modelPanel.refresh === 'function') {
-          this.components.modelPanel.refresh();
-        }
-        break;
-    }
-  }
-
-  // Set up global event listeners
-  setupEventListeners() {
-    // Handle window resize
-    window.addEventListener('resize', () => {
-      this.handleResize();
-    });
-
-    // Handle visibility change
-    document.addEventListener('visibilitychange', () => {
-      this.handleVisibilityChange();
-    });
-
-    // Handle before unload
-    window.addEventListener('beforeunload', () => {
-      this.cleanup();
-    });
-  }
-
-  // Handle window resize
-  handleResize() {
-    // Update canvas sizes if needed
-    const canvases = document.querySelectorAll('canvas');
-    canvases.forEach(canvas => {
-      const rect = canvas.parentElement.getBoundingClientRect();
-      if (canvas.width !== rect.width || canvas.height !== rect.height) {
-        canvas.width = rect.width;
-        canvas.height = rect.height;
-      }
-    });
-  }
-
-  // Handle visibility change
-  handleVisibilityChange() {
-    if (document.hidden) {
-      // Pause updates when page is hidden
-      console.log('Page hidden, pausing updates');
-      healthService.stopHealthMonitoring();
-    } else {
-      // Resume updates when page is visible
-      console.log('Page visible, resuming updates');
-      healthService.startHealthMonitoring();
-    }
-  }
-
-  // Set up error handling
-  setupErrorHandling() {
-    window.addEventListener('error', (event) => {
-      if (event.error) {
-        console.error('Global error:', event.error);
-        this.showGlobalError('An unexpected error occurred');
-      }
-    });
-
-    window.addEventListener('unhandledrejection', (event) => {
-      if (event.reason) {
-        console.error('Unhandled promise rejection:', event.reason);
-        this.showGlobalError('An unexpected error occurred');
-      }
-    });
-  }
-
-  // Show backend status notification (uses enhanced toast system)
-  showBackendStatus(message, type) {
-    const toastType = type === 'success' ? 'success' : 'warning';
-    toastManager[toastType](message, {
-      duration: type === 'success' ? 3000 : 8000
-    });
-  }
-
-  // Show global error message (uses enhanced toast system)
-  showGlobalError(message) {
-    toastManager.error(message, { duration: 6000 });
-  }
-
-  // Clean up resources
-  cleanup() {
-    console.log('Cleaning up application resources...');
-    
-    // Dispose all components
-    Object.values(this.components).forEach(component => {
-      if (component && typeof component.dispose === 'function') {
-        component.dispose();
-      }
-    });
-
-    // Disconnect all WebSocket connections
-    wsService.disconnectAll();
-
-    // Stop health monitoring
-    healthService.dispose();
-
-    // Dispose enhancements
-    if (this.keyboardShortcuts) this.keyboardShortcuts.dispose();
-    if (this.perfMonitor) this.perfMonitor.dispose();
-    if (this.themeToggle) this.themeToggle.dispose();
-    if (this.commandPalette) this.commandPalette.dispose();
-    if (this.activityLog) this.activityLog.dispose();
-    if (this.dataExport) this.dataExport.dispose();
-    if (this.fullscreenManager) this.fullscreenManager.dispose();
-    if (this.connectionStatus) this.connectionStatus.dispose();
-    if (this.mobileNav) this.mobileNav.dispose();
-    if (this.router) this.router.dispose();
-    if (this.onboarding) this.onboarding.dispose();
-    if (this.idleManager) this.idleManager.dispose();
-    if (this.notificationCenter) this.notificationCenter.dispose();
-    if (this.screenshotTool) this.screenshotTool.dispose();
-    if (this.uptimeClock) this.uptimeClock.dispose();
-    if (this.quickSettings) this.quickSettings.dispose();
-    i18n.dispose();
-    toastManager.dispose();
-  }
-
-  // Public API
-  getComponent(name) {
-    return this.components[name];
-  }
-
-  isReady() {
-    return this.isInitialized;
+  for (const node of nodes) {
+    const id = node.node_id ?? '?';
+    const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+    const row = document.createElement('article');
+    row.className = `device-row device-${status}`;
+    row.innerHTML = `
+      <div>
+        <strong>${node.label || `ESP32-C6 ${id}`}</strong>
+        <span>Node ${id} / slot ${node.tdm_slot ?? '-'} of ${node.tdm_total ?? '-'}</span>
+      </div>
+      <div class="device-meta">
+        <span>${status}</span>
+        <span>${fmtHz(node.frame_rate_hz)}</span>
+        <span>${fmtAge(node.last_seen_ms)}</span>
+      </div>
+    `;
+    list.append(row);
   }
 }
 
-// Initialize app when DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
-  window.wifiDensePoseApp = new WiFiDensePoseApp();
-  window.wifiDensePoseApp.init();
-});
+function renderEnvironment() {
+  const env = state.environment;
+  if (!env) return;
 
-// Export for testing
-export { WiFiDensePoseApp };
+  setText('room-name', env.room?.name || 'Primary room');
+  const dims = env.room?.dimensions_m || [0, 0, 0];
+  setText('room-size', `${dims.map((v) => Number(v).toFixed(1)).join(' x ')} m`);
+
+  const aps = Array.isArray(env.access_points) ? env.access_points : [];
+  const apList = $('#ap-list');
+  setText('ap-count', `${aps.length} AP`);
+  apList?.replaceChildren();
+  for (const ap of aps) {
+    const row = document.createElement('article');
+    row.className = `device-row ${ap.active ? 'device-active' : 'device-offline'}`;
+    row.innerHTML = `
+      <div>
+        <strong>${ap.label || ap.ap_id}</strong>
+        <span>${ap.ssid || 'ssid'} / ${ap.role || 'mesh'}</span>
+      </div>
+      <div class="device-meta">
+        <span>${ap.band || '2.4GHz'}</span>
+        <span>ch ${ap.channel ?? '-'}</span>
+      </div>
+    `;
+    apList?.append(row);
+  }
+
+  renderStage(env);
+  renderEnvironmentForm(env);
+}
+
+function renderStage(env) {
+  const stage = $('#environment-stage');
+  if (!stage) return;
+  stage.replaceChildren();
+
+  const dims = env.room?.dimensions_m || [5.2, 2.6, 4.8];
+  const width = Number(dims[0]) || 5.2;
+  const depth = Number(dims[2]) || 4.8;
+  const toPct = ([x, , z]) => ({
+    left: `${((Number(x) / width) + 0.5) * 100}%`,
+    top: `${((Number(z) / depth) + 0.5) * 100}%`,
+  });
+
+  const aps = env.access_points || [];
+  const nodes = mergeConfiguredNodes(env.nodes || [], state.fleet?.nodes || []);
+  const byAp = new Map(aps.map((ap) => [ap.ap_id, ap]));
+  const byNode = new Map(nodes.map((node) => [Number(node.node_id), node]));
+
+  for (const link of env.links || []) {
+    const ap = byAp.get(link.ap_id);
+    const node = byNode.get(Number(link.node_id));
+    if (!ap || !node) continue;
+    const a = toPct(ap.position_m || [0, 0, 0]);
+    const b = toPct(node.position_m || node.position || [0, 0, 0]);
+    const line = document.createElement('div');
+    line.className = `rf-link ${node.active ? 'rf-link-live' : 'rf-link-offline'}`;
+    const ax = parseFloat(a.left);
+    const ay = parseFloat(a.top);
+    const bx = parseFloat(b.left);
+    const by = parseFloat(b.top);
+    const dx = bx - ax;
+    const dy = by - ay;
+    line.style.left = a.left;
+    line.style.top = a.top;
+    line.style.width = `${Math.hypot(dx, dy)}%`;
+    line.style.transform = `rotate(${Math.atan2(dy, dx)}rad)`;
+    stage.append(line);
+  }
+
+  for (const ap of aps) {
+    const marker = markerEl('ap', ap.label || ap.ap_id, ap.position_m);
+    const p = toPct(ap.position_m || [0, 0, 0]);
+    marker.style.left = p.left;
+    marker.style.top = p.top;
+    stage.append(marker);
+  }
+
+  for (const node of nodes) {
+    const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+    const marker = markerEl(`node node-${status}`, node.label || `C6-${node.node_id}`, node.position_m || node.position);
+    const p = toPct(node.position_m || node.position || [0, 0, 0]);
+    marker.style.left = p.left;
+    marker.style.top = p.top;
+    stage.append(marker);
+  }
+}
+
+function markerEl(kind, label, position) {
+  const marker = document.createElement('div');
+  marker.className = `map-marker map-marker-${kind}`;
+  marker.title = `${label} @ ${(position || [0, 0, 0]).join(', ')}`;
+  marker.innerHTML = `<span></span><strong>${label}</strong>`;
+  return marker;
+}
+
+function mergeConfiguredNodes(configured, live) {
+  const liveById = new Map((live || []).map((node) => [Number(node.node_id), node]));
+  const merged = configured.map((cfg) => ({ ...cfg, ...(liveById.get(Number(cfg.node_id)) || {}) }));
+  for (const node of live || []) {
+    if (!merged.some((item) => Number(item.node_id) === Number(node.node_id))) merged.push(node);
+  }
+  return merged;
+}
+
+function renderModules() {
+  const modules = state.modules || [];
+  const categories = ['All', ...new Set(modules.map((mod) => mod.category || 'General'))];
+  const tabs = $('#module-tabs');
+  tabs?.replaceChildren();
+  for (const category of categories) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = category === state.selectedCategory ? 'active' : '';
+    button.textContent = category;
+    button.addEventListener('click', () => {
+      state.selectedCategory = category;
+      renderModules();
+    });
+    tabs?.append(button);
+  }
+
+  const active = modules.filter((mod) => mod.status === 'active').length;
+  const available = modules.filter((mod) => mod.status === 'available').length;
+  setText('module-summary', `${active} active / ${available} available`);
+
+  const list = $('#module-list');
+  list?.replaceChildren();
+  const filtered = modules.filter((mod) => state.selectedCategory === 'All' || mod.category === state.selectedCategory);
+  for (const mod of filtered) {
+    const row = document.createElement('article');
+    const status = String(mod.status || 'offline').toLowerCase();
+    row.className = `module-row module-${status}`;
+    row.innerHTML = `
+      <div>
+        <strong>${mod.name || mod.id}</strong>
+        <span>${mod.category || 'General'} / ${mod.size_kb || 0} KB / ${mod.required_nodes || 1} nodes</span>
+      </div>
+      <div class="module-state">
+        <span>${status}</span>
+        <span>${percent(mod.confidence)}</span>
+      </div>
+    `;
+    list?.append(row);
+  }
+}
+
+function renderLatest() {
+  const latest = state.latest;
+  const cls = latest?.classification || {};
+  setText('presence-state', cls.presence ? 'present' : 'absent');
+  setText('person-count', String(latest?.estimated_persons || 0));
+  setText('motion-level', cls.motion_level || 'unknown');
+}
+
+function renderCalibration(data) {
+  setText('calibration-status', data?.status || data?.calibration?.status || 'unknown');
+}
+
+function emptyRow(text) {
+  const row = document.createElement('div');
+  row.className = 'empty-row';
+  row.textContent = text;
+  return row;
+}
+
+function renderEnvironmentForm(env) {
+  const form = $('#environment-form');
+  if (!form || form.dataset.loaded === 'true') return;
+  form.dataset.loaded = 'true';
+
+  form.elements['room.name'].value = env.room?.name || 'primary';
+  form.elements['room.x'].value = env.room?.dimensions_m?.[0] ?? 5.2;
+  form.elements['room.y'].value = env.room?.dimensions_m?.[1] ?? 2.6;
+  form.elements['room.z'].value = env.room?.dimensions_m?.[2] ?? 4.8;
+
+  const fields = $('#environment-fields');
+  fields?.replaceChildren();
+  fields?.append(sectionEditor('Mesh AP', env.access_points || [], 'ap'));
+  fields?.append(sectionEditor('ESP32-C6 nodes', env.nodes || [], 'node'));
+}
+
+function sectionEditor(title, items, type) {
+  const section = document.createElement('section');
+  section.className = 'editor-section';
+  const heading = document.createElement('h3');
+  heading.textContent = title;
+  section.append(heading);
+  for (const item of items) {
+    const id = type === 'ap' ? item.ap_id : item.node_id;
+    const row = document.createElement('div');
+    row.className = 'position-row';
+    row.dataset.type = type;
+    row.dataset.id = id;
+    row.innerHTML = `
+      <strong>${item.label || id}</strong>
+      <label>X<input data-axis="0" type="number" step="0.1" value="${item.position_m?.[0] ?? 0}"></label>
+      <label>Y<input data-axis="1" type="number" step="0.1" value="${item.position_m?.[1] ?? 0}"></label>
+      <label>Z<input data-axis="2" type="number" step="0.1" value="${item.position_m?.[2] ?? 0}"></label>
+    `;
+    section.append(row);
+  }
+  return section;
+}
+
+function readEnvironmentForm() {
+  const env = structuredClone(state.environment || {});
+  const form = $('#environment-form');
+  env.room = env.room || {};
+  env.room.name = form.elements['room.name'].value.trim() || 'primary';
+  env.room.dimensions_m = [
+    Number(form.elements['room.x'].value) || 5.2,
+    Number(form.elements['room.y'].value) || 2.6,
+    Number(form.elements['room.z'].value) || 4.8,
+  ];
+
+  for (const row of document.querySelectorAll('.position-row')) {
+    const values = [...row.querySelectorAll('input')].map((input) => Number(input.value) || 0);
+    if (row.dataset.type === 'ap') {
+      const ap = env.access_points?.find((item) => item.ap_id === row.dataset.id);
+      if (ap) ap.position_m = values;
+    } else {
+      const node = env.nodes?.find((item) => String(item.node_id) === String(row.dataset.id));
+      if (node) node.position_m = values;
+    }
+  }
+  return env;
+}
+
+async function refreshRest() {
+  try {
+    const [fleet, environment, modules, calibration] = await Promise.all([
+      fetchJson('/api/v1/fleet'),
+      fetchJson('/api/v1/environment'),
+      fetchJson('/api/v1/modules'),
+      fetchJson('/api/v1/calibration').catch(() => null),
+    ]);
+    state.fleet = fleet;
+    state.environment = environment;
+    state.modules = Array.isArray(modules.modules) ? modules.modules : [];
+    renderFleet();
+    renderEnvironment();
+    renderModules();
+    renderCalibration(calibration);
+  } catch (error) {
+    setMasterStatus('offline', 'Master offline');
+    logEvent(error.message, 'warn');
+  }
+}
+
+function connectWs() {
+  if (state.ws && [WebSocket.OPEN, WebSocket.CONNECTING].includes(state.ws.readyState)) return;
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${protocol}//${window.location.host}/ws/sensing`;
+  const ws = new WebSocket(url);
+  state.ws = ws;
+
+  ws.onopen = () => {
+    logEvent('WebSocket connected');
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+  };
+  ws.onmessage = (event) => {
+    try {
+      state.latest = JSON.parse(event.data);
+      if (Array.isArray(state.latest.nodes) && state.fleet) {
+        state.fleet.nodes = mergeConfiguredNodes(state.environment?.nodes || [], state.latest.nodes);
+      }
+      renderLatest();
+      renderFleet();
+      renderEnvironment();
+    } catch (error) {
+      logEvent(`Bad sensing frame: ${error.message}`, 'warn');
+    }
+  };
+  ws.onclose = () => {
+    state.ws = null;
+    setMasterStatus('offline', 'Stream offline');
+    logEvent('WebSocket disconnected', 'warn');
+    state.reconnectTimer = setTimeout(connectWs, 3000);
+  };
+  ws.onerror = () => {
+    ws.close();
+  };
+}
+
+function bindActions() {
+  $('#clear-log')?.addEventListener('click', () => $('#event-log')?.replaceChildren());
+  $('#start-calibration')?.addEventListener('click', async () => {
+    try {
+      await fetchJson('/api/v1/calibration/start', { method: 'POST' });
+      logEvent('Calibration started');
+      await refreshRest();
+    } catch (error) {
+      logEvent(error.message, 'warn');
+    }
+  });
+  $('#stop-calibration')?.addEventListener('click', async () => {
+    try {
+      await fetchJson('/api/v1/calibration/stop', { method: 'POST' });
+      logEvent('Calibration stopped');
+      await refreshRest();
+    } catch (error) {
+      logEvent(error.message, 'warn');
+    }
+  });
+  $('#environment-form')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    setText('save-status', 'saving');
+    try {
+      const environment = readEnvironmentForm();
+      const saved = await fetchJson('/api/v1/environment', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(environment),
+      });
+      state.environment = saved.environment;
+      setText('save-status', 'saved');
+      logEvent('Environment saved');
+      renderEnvironment();
+    } catch (error) {
+      setText('save-status', 'error');
+      logEvent(error.message, 'warn');
+    }
+  });
+}
+
+async function init() {
+  bindActions();
+  await refreshRest();
+  connectWs();
+  setInterval(refreshRest, 5000);
+}
+
+init();

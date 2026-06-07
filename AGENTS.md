@@ -4,6 +4,8 @@
 
 RuvSense Edge is the professional RuView fork for WiFi/CSI sensing fleets:
 one Raspberry Pi `ruvsense-master` plus at least three ESP32-C6 nodes.
+Production behavior is live-only: no automatic demo/mock/simulation fallback when
+hardware is absent or below quorum. Simulation is explicit dev/test only.
 Legacy Python v1 lives under `archive/v1/`; the Rust workspace lives in `v2/`.
 ### Key Rust Crates
 | Crate | Description |
@@ -17,7 +19,7 @@ Legacy Python v1 lives under `archive/v1/`; the Rust workspace lives in `v2/`.
 | `wifi-densepose-ruvector` | RuVector v2.0.4 integration + cross-viewpoint fusion (5 modules) |
 | `wifi-densepose-wasm` | WebAssembly bindings for browser deployment |
 | `wifi-densepose-cli` | CLI tool (`wifi-densepose` binary) |
-| `ruvsense-master` | RuvSense Edge master: UDP CSI ingest, HTTP/WS APIs, SQLite state, Pi Docker runtime |
+| `ruvsense-master` | RuvSense Edge master: live UDP CSI ingest, HTTP/WS APIs, SQLite state, Pi Docker runtime, RuvSense Console |
 | `wifi-densepose-wifiscan` | Multi-BSSID WiFi scanning (ADR-022) |
 | `wifi-densepose-vitals` | ESP32 CSI-grade vital sign extraction (ADR-021) |
 | `nvsim` | Deterministic NV-diamond magnetometer pipeline simulator (ADR-089) — standalone leaf, WASM-ready |
@@ -84,6 +86,14 @@ All 5 ruvector crates integrated in workspace:
 | HLK-LD2410 | — | 24 GHz FMCW | Presence + distance | ~$3 |
 
 **Not supported:** ESP32 (original), ESP32-C3 — single-core, can't run CSI DSP pipeline.
+
+### Production Runtime Defaults
+
+- RuvSense Edge production target: Raspberry Pi 4/5 running `ruvsense-master` plus at least 3 ESP32-C6 CSI nodes
+- Docker Pi defaults: `CSI_SOURCE=esp32`, `RUVSENSE_HTTP_PORT=3000`, `RUVSENSE_WS_PORT=3001`, `RUVSENSE_UDP_PORT=5005`, `RUVSENSE_MIN_NODES=3`, `RUVSENSE_DATA_DIR=/var/lib/ruvsense`
+- Production readiness must fail closed when the live node quorum is absent; do not document or add automatic demo/mock/simulation fallback
+- Two mesh APs are operator-configurable through environment or provisioning inventory: `RUVSENSE_MESH_AP1_SSID`, `RUVSENSE_MESH_AP1_PASSWORD`, `RUVSENSE_MESH_AP2_SSID`, `RUVSENSE_MESH_AP2_PASSWORD`
+- Simulation, QEMU, mock CSI, and deterministic proof replay are explicit development/test workflows only
 
 ### Build & Test Commands (this repo)
 ```bash

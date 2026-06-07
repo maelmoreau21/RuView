@@ -21,44 +21,22 @@ export class CommandPalette {
 
   registerCommands() {
     // Navigation commands
-    const tabs = [
-      { id: 'dashboard', label: 'Dashboard', icon: 'grid' },
-      { id: 'hardware', label: 'Hardware', icon: 'cpu' },
-      { id: 'demo', label: 'Live Demo', icon: 'play' },
-      { id: 'architecture', label: 'Architecture', icon: 'layers' },
-      { id: 'performance', label: 'Performance', icon: 'zap' },
-      { id: 'applications', label: 'Applications', icon: 'box' },
-      { id: 'sensing', label: 'Sensing', icon: 'wifi' },
-      { id: 'training', label: 'Training', icon: 'database' },
+    const views = [
+      { label: 'Open Console', keywords: ['console', 'home', 'fleet'], icon: 'grid', href: 'index.html' },
+      { label: 'Open Observatory', keywords: ['observatory', '3d', 'signal'], icon: 'wifi', href: 'observatory.html' },
+      { label: 'Open Pose Fusion', keywords: ['pose', 'fusion', 'camera'], icon: 'external', href: 'pose-fusion.html' },
     ];
 
-    tabs.forEach(tab => {
+    views.forEach(view => {
       this.commands.push({
         category: 'Navigation',
-        label: `Go to ${tab.label}`,
-        keywords: [tab.id, tab.label.toLowerCase()],
-        icon: tab.icon,
+        label: view.label,
+        keywords: view.keywords,
+        icon: view.icon,
         action: () => {
-          const tm = this.app?.getComponent?.('tabManager');
-          if (tm) tm.switchToTab(tab.id);
+          window.location.href = view.href;
         }
       });
-    });
-
-    // External pages
-    this.commands.push({
-      category: 'Navigation',
-      label: 'Open Pose Fusion',
-      keywords: ['pose', 'fusion', 'camera'],
-      icon: 'external',
-      action: () => { window.location.href = 'pose-fusion.html'; }
-    });
-    this.commands.push({
-      category: 'Navigation',
-      label: 'Open Observatory',
-      keywords: ['observatory', '3d', 'signal'],
-      icon: 'external',
-      action: () => { window.location.href = 'observatory.html'; }
     });
 
     // Actions

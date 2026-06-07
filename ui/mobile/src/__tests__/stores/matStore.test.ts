@@ -62,7 +62,7 @@ describe('useMatStore', () => {
       survivors: [],
       alerts: [],
       selectedEventId: null,
-      dataSource: 'simulated',
+      dataSource: 'real',
       simulationAcknowledged: false,
     });
   });
@@ -199,8 +199,8 @@ describe('useMatStore', () => {
   });
 
   describe('dataSource', () => {
-    it('defaults to simulated', () => {
-      expect(useMatStore.getState().dataSource).toBe('simulated');
+    it('defaults to real', () => {
+      expect(useMatStore.getState().dataSource).toBe('real');
     });
 
     it('can be set to real', () => {

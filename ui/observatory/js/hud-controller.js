@@ -12,12 +12,6 @@
 
 // ---- Constants ----
 
-export const SCENARIO_NAMES = [
-  'EMPTY ROOM','VITAL SIGNS','MULTI-PERSON','FALL DETECT',
-  'SLEEP MONITOR','INTRUSION','GESTURE CTRL','CROWD OCCUPANCY',
-  'SEARCH RESCUE','ELDERLY CARE','FITNESS','SECURITY PATROL',
-];
-
 export const DEFAULTS = {
   bloom: 0.08, bloomRadius: 0.2, bloomThresh: 0.6,
   exposure: 1.3, vignette: 0.25, grain: 0.01, chromatic: 0.0005,
@@ -25,10 +19,10 @@ export const DEFAULTS = {
   wireColor: '#00d878', jointColor: '#ff4060', aura: 0.02,
   field: 0.45, waves: 0.4, ambient: 0.7, reflect: 0.2,
   fov: 50, orbitSpeed: 0.15, grid: true, room: true,
-  scenario: 'auto', cycle: 30, dataSource: 'demo', wsUrl: '',
+  dataSource: 'ws', wsUrl: '',
 };
 
-export const SETTINGS_VERSION = '6';
+export const SETTINGS_VERSION = '7';
 
 export const PRESETS = {
   foundation: {},
@@ -62,55 +56,6 @@ export const PRESETS = {
     glow: 0.6, trail: 0.3, aura: 0.04, field: 0.5,
     waves: 0.3, ambient: 0.5, reflect: 0.2, wireColor: '#00ccff', jointColor: '#ff3355',
   },
-};
-
-// Scenario descriptions shown below the dropdown
-const SCENARIO_DESCRIPTIONS = {
-  auto:              'Auto-cycling through all sensing scenarios.',
-  empty_room:        'Baseline calibration with no human presence in the monitored zone.',
-  single_breathing:  'Detecting vital signs through WiFi signal micro-variations.',
-  two_walking:       'Tracking multiple people simultaneously via CSI multiplex separation.',
-  fall_event:        'Sudden posture-change detection using acceleration feature analysis.',
-  sleep_monitoring:  'Monitoring breathing patterns and apnea events during sleep.',
-  intrusion_detect:  'Passive perimeter monitoring -- no cameras, pure RF sensing.',
-  gesture_control:   'DTW-based gesture recognition from hand/arm motion signatures.',
-  crowd_occupancy:   'Estimating room occupancy count from aggregate CSI variance.',
-  search_rescue:     'Through-wall survivor detection using WiFi-MAT multistatic mode.',
-  elderly_care:      'Continuous gait analysis for early mobility-decline detection.',
-  fitness_tracking:  'Rep counting and exercise classification from body kinematics.',
-  security_patrol:   'Multi-zone presence patrol with camera-free motion heatmaps.',
-};
-
-// Edge modules active per scenario
-const SCENARIO_EDGE_MODULES = {
-  auto:              [],
-  empty_room:        [],
-  single_breathing:  ['VITALS'],
-  two_walking:       ['GAIT', 'TRACKING'],
-  fall_event:        ['FALL', 'VITALS'],
-  sleep_monitoring:  ['VITALS', 'APNEA'],
-  intrusion_detect:  ['PRESENCE', 'ALERT'],
-  gesture_control:   ['GESTURE', 'DTW'],
-  crowd_occupancy:   ['OCCUPANCY'],
-  search_rescue:     ['MAT', 'VITALS', 'PRESENCE'],
-  elderly_care:      ['GAIT', 'VITALS', 'FALL'],
-  fitness_tracking:  ['GESTURE', 'GAIT'],
-  security_patrol:   ['PRESENCE', 'ALERT', 'TRACKING'],
-};
-
-// Edge-module badge colors
-const MODULE_COLORS = {
-  VITALS:    'var(--red-heart)',
-  GAIT:      'var(--green-glow)',
-  FALL:      'var(--red-alert)',
-  GESTURE:   'var(--amber)',
-  PRESENCE:  'var(--blue-signal)',
-  TRACKING:  'var(--green-bright)',
-  OCCUPANCY: 'var(--amber)',
-  ALERT:     'var(--red-alert)',
-  DTW:       'var(--amber)',
-  APNEA:     'var(--red-heart)',
-  MAT:       'var(--blue-signal)',
 };
 
 // Vital-sign color-coding thresholds
@@ -151,9 +96,6 @@ export class HudController {
     this._lerpHr = 0;
     this._lerpBr = 0;
     this._lerpConf = 0;
-
-    // Track current scenario for description/edge updates
-    this._currentScenarioKey = null;
 
     // Operational RuvSense Edge panels
     this._opsFetchAt = 0;
@@ -212,7 +154,6 @@ export class HudController {
       obs._camera.updateProjectionMatrix();
     });
     this._bindRange('opt-orbit-speed', 'orbitSpeed');
-    this._bindRange('opt-cycle', 'cycle', v => { obs._demoData.setCycleDuration(v); });
 
     // Color pickers
     document.getElementById('opt-wire-color').value = s.wireColor;
@@ -232,36 +173,6 @@ export class HudController {
     document.getElementById('opt-room').checked = s.room;
     document.getElementById('opt-room').addEventListener('change', (e) => {
       s.room = e.target.checked; obs._roomWire.visible = e.target.checked; this.saveSettings();
-    });
-
-    // Scenario select
-    const scenarioSel = document.getElementById('opt-scenario');
-    scenarioSel.value = s.scenario;
-    scenarioSel.addEventListener('change', (e) => {
-      s.scenario = e.target.value;
-      obs._demoData.setScenario(e.target.value);
-      this.saveSettings();
-    });
-
-    // Data source
-    const dsSel = document.getElementById('opt-data-source');
-    dsSel.value = s.dataSource;
-    dsSel.addEventListener('change', (e) => {
-      s.dataSource = e.target.value;
-      document.getElementById('ws-url-row').style.display = e.target.value === 'ws' ? 'flex' : 'none';
-      if (e.target.value === 'ws' && s.wsUrl) obs._connectWS(s.wsUrl);
-      else obs._disconnectWS();
-      this.updateSourceBadge(s.dataSource, obs._ws);
-      this.saveSettings();
-    });
-    document.getElementById('ws-url-row').style.display = s.dataSource === 'ws' ? 'flex' : 'none';
-
-    const wsInput = document.getElementById('opt-ws-url');
-    wsInput.value = s.wsUrl;
-    wsInput.addEventListener('change', (e) => {
-      s.wsUrl = e.target.value;
-      if (s.dataSource === 'ws') obs._connectWS(e.target.value);
-      this.saveSettings();
     });
 
     // Buttons
@@ -296,15 +207,7 @@ export class HudController {
   // ============================================================
 
   initQuickSelect() {
-    const sel = document.getElementById('scenario-quick-select');
-    if (!sel) return;
-    sel.addEventListener('change', (e) => {
-      this._obs._demoData.setScenario(e.target.value);
-      const settingsSel = document.getElementById('opt-scenario');
-      if (settingsSel) settingsSel.value = e.target.value;
-      this._obs.settings.scenario = e.target.value;
-      this.saveSettings();
-    });
+    // Live-only console: no scenario selector in production.
   }
 
   // ============================================================
@@ -335,7 +238,7 @@ export class HudController {
       'opt-exposure': 'exposure', 'opt-vignette': 'vignette', 'opt-grain': 'grain', 'opt-chromatic': 'chromatic',
       'opt-bone-thick': 'boneThick', 'opt-joint-size': 'jointSize', 'opt-glow': 'glow', 'opt-trail': 'trail', 'opt-aura': 'aura',
       'opt-field': 'field', 'opt-waves': 'waves', 'opt-ambient': 'ambient', 'opt-reflect': 'reflect',
-      'opt-fov': 'fov', 'opt-orbit-speed': 'orbitSpeed', 'opt-cycle': 'cycle',
+      'opt-fov': 'fov', 'opt-orbit-speed': 'orbitSpeed',
     };
     for (const [id, key] of Object.entries(rangeMap)) {
       const el = document.getElementById(id);
@@ -357,7 +260,6 @@ export class HudController {
     obs._floorMat.metalness = obs.settings.reflect * 0.5;
     obs._camera.fov = obs.settings.fov;
     obs._camera.updateProjectionMatrix();
-    obs._demoData.setCycleDuration(obs.settings.cycle);
     obs._applyColors();
   }
 
@@ -365,13 +267,15 @@ export class HudController {
   // Source badge
   // ============================================================
 
-  updateSourceBadge(dataSource, ws) {
+  updateSourceBadge(status, ws) {
     const dot = document.querySelector('#data-source-badge .dot');
     const label = document.getElementById('data-source-label');
-    if (dataSource === 'ws' && ws?.readyState === WebSocket.OPEN) {
+    if (status === 'live' && ws?.readyState === WebSocket.OPEN) {
       dot.className = 'dot dot--live'; label.textContent = 'LIVE';
+    } else if (status === 'degraded') {
+      dot.className = 'dot dot--degraded'; label.textContent = 'DEGRADED';
     } else {
-      dot.className = 'dot dot--demo'; label.textContent = 'DEMO';
+      dot.className = 'dot dot--offline'; label.textContent = 'OFFLINE';
     }
   }
 
@@ -379,18 +283,11 @@ export class HudController {
   // HUD update (called every frame)
   // ============================================================
 
-  updateHUD(data, demoData) {
+  updateHUD(data) {
     if (!data) return;
     const vs = data.vital_signs || {};
     const feat = data.features || {};
     const cls = data.classification || {};
-
-    // Sync scenario dropdown
-    const quickSel = document.getElementById('scenario-quick-select');
-    const cur = demoData._autoMode ? 'auto' : demoData.currentScenario;
-    if (quickSel && quickSel.value !== cur) quickSel.value = cur;
-    const autoIcon = document.getElementById('autoplay-icon');
-    if (autoIcon) autoIcon.className = demoData._autoMode ? '' : 'hidden';
 
     const targetHr = vs.heart_rate_bpm || 0;
     const targetBr = vs.breathing_rate_bpm || 0;
@@ -446,14 +343,6 @@ export class HudController {
 
     this._updateFleetFromData(data);
     this._refreshOperationalData();
-
-    // Scenario description and edge modules
-    const scenarioKey = demoData._autoMode ? (demoData.currentScenario || 'auto') : (demoData.currentScenario || 'auto');
-    if (scenarioKey !== this._currentScenarioKey) {
-      this._currentScenarioKey = scenarioKey;
-      this._updateScenarioDescription(scenarioKey);
-      this._updateEdgeModules(scenarioKey);
-    }
   }
 
   // ============================================================
@@ -539,7 +428,7 @@ export class HudController {
         this._renderModulesPanel(this._modules);
       }
     } catch {
-      // Demo/file mode has no API; the WebSocket/simulation fallback keeps the UI useful.
+      this.updateSourceBadge('offline', null);
     } finally {
       this._opsFetchPending = false;
     }
@@ -568,6 +457,7 @@ export class HudController {
     const active = Number(fleet?.active_nodes ?? 0);
     const minNodes = Number(fleet?.min_nodes ?? 3);
     const ready = Boolean(fleet?.ready || active >= minNodes);
+    this.updateSourceBadge(ready ? 'live' : active > 0 ? 'degraded' : 'offline', this._obs._ws);
     const readyEl = document.getElementById('fleet-ready');
     if (readyEl) {
       readyEl.textContent = ready ? 'Ready for fusion' : 'Waiting for quorum';
@@ -701,25 +591,4 @@ export class HudController {
     this._setText('persons-value', count);
   }
 
-  _updateScenarioDescription(scenarioKey) {
-    const el = document.getElementById('scenario-description');
-    if (!el) return;
-    el.textContent = SCENARIO_DESCRIPTIONS[scenarioKey] || '';
-  }
-
-  _updateEdgeModules(scenarioKey) {
-    const bar = document.getElementById('edge-modules-bar');
-    if (!bar) return;
-    const modules = SCENARIO_EDGE_MODULES[scenarioKey] || [];
-    if (modules.length === 0) {
-      bar.innerHTML = '';
-      bar.style.display = 'none';
-      return;
-    }
-    bar.style.display = 'flex';
-    bar.innerHTML = modules.map(m => {
-      const color = MODULE_COLORS[m] || 'var(--text-secondary)';
-      return `<span class="edge-badge" style="--badge-color:${color}">${m}</span>`;
-    }).join('');
-  }
 }

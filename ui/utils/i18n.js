@@ -6,7 +6,9 @@ const translations = {
     // Navigation
     'nav.dashboard': 'Dashboard',
     'nav.hardware': 'Hardware',
-    'nav.demo': 'Live Demo',
+    'nav.console': 'Console',
+    'nav.observatory': 'Observatory',
+    'nav.poseFusion': 'Pose Fusion',
     'nav.architecture': 'Architecture',
     'nav.performance': 'Performance',
     'nav.applications': 'Applications',
@@ -67,7 +69,7 @@ const translations = {
     'conn.offline': 'Offline',
     'conn.reconnecting': 'Reconnecting...',
     'conn.live': 'Live',
-    'conn.simulated': 'Simulated',
+    'conn.offlineHardware': 'Offline - waiting for hardware',
 
     // Misc
     'misc.loading': 'Loading...',
@@ -84,7 +86,9 @@ const translations = {
     // Navigation
     'nav.dashboard': 'Panel',
     'nav.hardware': 'Sprzet',
-    'nav.demo': 'Demo na zywo',
+    'nav.console': 'Konsola',
+    'nav.observatory': 'Obserwatorium',
+    'nav.poseFusion': 'Fuzja pozy',
     'nav.architecture': 'Architektura',
     'nav.performance': 'Wydajnosc',
     'nav.applications': 'Aplikacje',
@@ -145,7 +149,7 @@ const translations = {
     'conn.offline': 'Offline',
     'conn.reconnecting': 'Ponowne laczenie...',
     'conn.live': 'Na zywo',
-    'conn.simulated': 'Symulacja',
+    'conn.offlineHardware': 'Offline - oczekiwanie na sprzet',
 
     // Misc
     'misc.loading': 'Ladowanie...',

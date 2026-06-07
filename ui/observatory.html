@@ -42,28 +42,9 @@
     <!-- Top-right: Connection + status + gear -->
     <div id="status-bar">
       <div id="data-source-badge">
-        <span class="dot dot--demo"></span>
-        <span id="data-source-label">DEMO</span>
+        <span class="dot dot--offline"></span>
+        <span id="data-source-label">OFFLINE</span>
       </div>
-      <div id="scenario-area">
-        <span id="autoplay-icon" title="Auto-cycling">&#9654;</span>
-        <select id="scenario-quick-select" title="Change scenario">
-          <option value="auto">Auto-Cycle</option>
-          <option value="empty_room">Empty Room</option>
-          <option value="single_breathing">Vital Signs</option>
-          <option value="two_walking">Multi-Person</option>
-          <option value="fall_event">Fall Detect</option>
-          <option value="sleep_monitoring">Sleep Monitor</option>
-          <option value="intrusion_detect">Intrusion</option>
-          <option value="gesture_control">Gesture Ctrl</option>
-          <option value="crowd_occupancy">Crowd (4 ppl)</option>
-          <option value="search_rescue">Search Rescue</option>
-          <option value="elderly_care">Elderly Care</option>
-          <option value="fitness_tracking">Fitness</option>
-          <option value="security_patrol">Security Patrol</option>
-        </select>
-      </div>
-      <div id="scenario-description"></div>
       <div id="fps-counter" style="display:none">60 FPS</div>
       <button id="settings-btn" title="Settings">&#9881;</button>
     </div>
@@ -148,10 +129,8 @@
     <!-- Bottom-right: keyboard hints -->
     <div id="key-hints">
       <span class="key-hint">[A] Orbit</span>
-      <span class="key-hint">[D] Scenario</span>
       <span class="key-hint">[F] FPS</span>
       <span class="key-hint">[S] Settings</span>
-      <span class="key-hint">[Space] Pause</span>
     </div>
   </div>
 
@@ -291,39 +270,6 @@
       <!-- Data tab -->
       <div class="stab-content" id="stab-data">
         <label class="setting-row">
-          <span>Scenario</span>
-          <select id="opt-scenario">
-            <option value="auto">Auto-Cycle (30s)</option>
-            <optgroup label="Core Sensing">
-              <option value="empty_room">Empty Room</option>
-              <option value="single_breathing">Vital Signs (Breathing)</option>
-              <option value="two_walking">Multi-Person Tracking</option>
-              <option value="fall_event">Fall Detection</option>
-            </optgroup>
-            <optgroup label="Medical / Health">
-              <option value="sleep_monitoring">Sleep Monitoring (Apnea)</option>
-              <option value="elderly_care">Elderly Care (Gait)</option>
-              <option value="fitness_tracking">Fitness Tracking</option>
-            </optgroup>
-            <optgroup label="Security">
-              <option value="intrusion_detect">Intrusion Detection</option>
-              <option value="security_patrol">Security Patrol</option>
-            </optgroup>
-            <optgroup label="Building / Retail">
-              <option value="crowd_occupancy">Crowd Occupancy (4 ppl)</option>
-              <option value="gesture_control">Gesture Control (DTW)</option>
-            </optgroup>
-            <optgroup label="Disaster / Tactical">
-              <option value="search_rescue">Search &amp; Rescue (WiFi-Mat)</option>
-            </optgroup>
-          </select>
-        </label>
-        <label class="setting-row">
-          <span>Cycle Speed (s)</span>
-          <input type="range" id="opt-cycle" min="10" max="120" step="5" value="30">
-          <span class="range-val" id="opt-cycle-val">30</span>
-        </label>
-        <label class="setting-row">
           <span>Style Preset</span>
           <select id="opt-preset">
             <option value="custom">Custom</option>
@@ -335,17 +281,10 @@
             <option value="medical">Medical Monitor</option>
           </select>
         </label>
-        <label class="setting-row">
-          <span>Data Source</span>
-          <select id="opt-data-source">
-            <option value="demo" selected>Demo Generator</option>
-            <option value="ws">Live WebSocket</option>
-          </select>
-        </label>
-        <label class="setting-row" id="ws-url-row" style="display:none">
-          <span>WS URL</span>
-          <input type="text" id="opt-ws-url" value="" placeholder="ws://localhost:3000/ws/sensing">
-        </label>
+        <div class="setting-row readonly-row">
+          <span>Live stream</span>
+          <span id="live-stream-url">/ws/sensing</span>
+        </div>
         <button id="btn-reset-camera" class="settings-btn">Reset Camera</button>
         <button id="btn-reset-settings" class="settings-btn">Reset to Defaults</button>
         <button id="btn-export-settings" class="settings-btn">Export Settings</button>

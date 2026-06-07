@@ -8,18 +8,6 @@ jest.mock('@/stores/poseStore', () => ({
   },
 }));
 
-jest.mock('@/services/simulation.service', () => ({
-  generateSimulatedData: jest.fn(() => ({
-    type: 'sensing_update',
-    timestamp: Date.now(),
-    source: 'simulated',
-    nodes: [],
-    features: { mean_rssi: -45, variance: 1 },
-    classification: { motion_level: 'absent', presence: false, confidence: 0.5 },
-    signal_field: { grid_size: [20, 1, 20], values: [] },
-  })),
-}));
-
 // Create a fresh WsService for each test to avoid shared state
 function createWsService() {
   // Use jest.isolateModules to get a fresh module instance
@@ -103,11 +91,47 @@ describe('WsService', () => {
   });
 
   describe('connect with empty URL', () => {
-    it('falls back to simulation mode when URL is empty', () => {
+    it('stays disconnected when URL is empty', () => {
       const ws = createWsService();
       ws.connect('');
-      expect(ws.getStatus()).toBe('simulated');
+      expect(ws.getStatus()).toBe('disconnected');
       ws.disconnect();
+    });
+  });
+
+  describe('connection loss', () => {
+    it('reports disconnected instead of simulated when the socket closes unexpectedly', () => {
+      const OrigWebSocket = globalThis.WebSocket;
+      let socket: any = null;
+
+      class MockWebSocket {
+        static OPEN = 1;
+        static CONNECTING = 0;
+        readyState = 0;
+        onopen: (() => void) | null = null;
+        onclose: ((event: { code: number }) => void) | null = null;
+        onerror: (() => void) | null = null;
+        onmessage: (() => void) | null = null;
+        close() {}
+        constructor() {
+          socket = this;
+        }
+      }
+
+      globalThis.WebSocket = MockWebSocket as any;
+
+      try {
+        const ws = createWsService();
+        ws.connect('http://192.168.1.10:3000');
+        socket?.onopen?.();
+        expect(ws.getStatus()).toBe('connected');
+
+        socket?.onclose?.({ code: 1006 });
+        expect(ws.getStatus()).toBe('disconnected');
+        ws.disconnect();
+      } finally {
+        globalThis.WebSocket = OrigWebSocket;
+      }
     });
   });
 
@@ -121,18 +145,15 @@ describe('WsService', () => {
       ws.disconnect();
     });
 
-    it('listener receives simulated frames', () => {
+    it('does not emit simulated frames when disconnected', () => {
       const ws = createWsService();
       const listener = jest.fn();
       ws.subscribe(listener);
       ws.connect('');
 
-      // Advance timer to trigger simulation
       jest.advanceTimersByTime(600);
 
-      expect(listener).toHaveBeenCalled();
-      const frame = listener.mock.calls[0][0];
-      expect(frame).toHaveProperty('type', 'sensing_update');
+      expect(listener).not.toHaveBeenCalled();
       ws.disconnect();
     });
 
@@ -154,7 +175,7 @@ describe('WsService', () => {
     it('clears state and sets status to disconnected', () => {
       const ws = createWsService();
       ws.connect('');
-      expect(ws.getStatus()).toBe('simulated');
+      expect(ws.getStatus()).toBe('disconnected');
       ws.disconnect();
       expect(ws.getStatus()).toBe('disconnected');
     });

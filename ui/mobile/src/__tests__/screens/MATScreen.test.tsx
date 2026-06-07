@@ -73,8 +73,8 @@ describe('MATScreen', () => {
         <MATScreen />
       </ThemeProvider>,
     );
-    // Simulated status maps to 'simulated' banner -> "SIMULATED DATA"
-    expect(getByText('SIMULATED DATA')).toBeTruthy();
+    // Simulated status maps to an explicit dev-simulation banner.
+    expect(getByText('DEV SIMULATION')).toBeTruthy();
   });
 
   it('shows simulation warning overlay when simulated and not acknowledged', () => {

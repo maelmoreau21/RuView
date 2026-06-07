@@ -9,15 +9,16 @@ import { colors, spacing } from '@/theme';
 import type { ConnectionStatus, SensingFrame } from '@/types/sensing';
 import { LiveHUD } from './LiveHUD';
 
-type LiveMode = 'LIVE' | 'SIM' | 'RSSI';
+type LiveMode = 'LIVE' | 'DEV' | 'RSSI' | 'OFFLINE';
 
 const getMode = (
   status: ConnectionStatus,
   isSimulated: boolean,
   frame: SensingFrame | null,
 ): LiveMode => {
-  if (isSimulated || frame?.source === 'simulated') return 'SIM';
+  if (isSimulated || frame?.source === 'simulated') return 'DEV';
   if (status === 'connected') return 'LIVE';
+  if (status === 'disconnected') return 'OFFLINE';
   return 'RSSI';
 };
 
@@ -135,7 +136,17 @@ export default LiveScreen;
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
-  loadingWrap: { ...StyleSheet.absoluteFillObject, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center', gap: spacing.md },
+  loadingWrap: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: colors.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.md,
+  },
   loadingText: { color: colors.textSecondary },
   fallbackWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.md, padding: spacing.lg },
   errorText: { textAlign: 'center' },

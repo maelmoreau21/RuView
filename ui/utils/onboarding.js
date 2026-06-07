@@ -1,7 +1,7 @@
 // Onboarding Tour - Interactive first-run walkthrough
 // Shows on first visit, can be re-triggered from command palette or help
 
-const STORAGE_KEY = 'ruview-onboarding-done';
+const STORAGE_KEY = 'ruvsense-onboarding-done';
 
 export class Onboarding {
   constructor(app) {
@@ -26,38 +26,38 @@ export class Onboarding {
   defineSteps() {
     this.steps = [
       {
-        title: 'Welcome to RuView',
-        text: 'WiFi-based human pose estimation that works through walls. Let\'s take a quick tour of the dashboard.',
+        title: 'Welcome to RuvSense Console',
+        text: 'Operate the master, ESP32-C6 nodes, mesh APs, modules, calibration, and logs from one live page.',
         target: null, // No highlight, centered
         position: 'center'
       },
       {
-        title: 'System Status',
-        text: 'Monitor your WiFi sensing hardware and API server status in real time. Green means everything is connected.',
-        target: '.live-status-panel',
+        title: 'Fleet Status',
+        text: 'The console shows readiness, active nodes, fusion status, and source mode without switching to synthetic data.',
+        target: '#fleetState',
         position: 'bottom'
       },
       {
-        title: 'Live Demo',
-        text: 'Switch to the Live Demo tab to see real-time pose detection. Connect an ESP32 sensor or use the built-in simulation.',
-        target: '[data-tab="demo"]',
+        title: 'Environment',
+        text: 'Use the environment view to inspect your 2 AP mesh anchors, 3 ESP32-C6 sensing nodes, and live RF links.',
+        target: '#environmentStage',
         position: 'bottom'
       },
       {
-        title: 'Sensing Visualization',
-        text: 'The Sensing tab shows a 3D Gaussian splat visualization of WiFi signal fields, with real-time metrics.',
-        target: '[data-tab="sensing"]',
+        title: 'Advanced Views',
+        text: 'Buttons on the console open Observatory and Pose Fusion when you need deeper visualization.',
+        target: '.top-actions',
         position: 'bottom'
       },
       {
         title: 'Keyboard Shortcuts',
-        text: 'Press ? for shortcuts, Ctrl+K for the command palette, or use number keys 1-8 to switch tabs quickly.',
+        text: 'Press ? for shortcuts, Ctrl+K for the command palette, or use number keys 1-3 to open core pages.',
         target: null,
         position: 'center'
       },
       {
         title: 'You\'re all set!',
-        text: 'Explore the dashboard, connect hardware, or start the demo. You can replay this tour anytime from the command palette.',
+        text: 'Connect the Pi master and three ESP32-C6 nodes, then watch the console move from offline to live.',
         target: null,
         position: 'center'
       }

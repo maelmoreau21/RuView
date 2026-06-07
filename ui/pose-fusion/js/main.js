@@ -1,5 +1,5 @@
 /**
- * RuView — Dual-Modal Pose Estimation Demo
+ * RuvSense — Dual-Modal Pose Fusion
  *
  * Main orchestration: video capture → CNN embedding → CSI processing → fusion → rendering
  */
@@ -137,7 +137,8 @@ function init() {
   csiCnn.tryLoadWasm(wasmBase);
 
   // Auto-connect to local sensing server WebSocket if available
-  const defaultWsUrl = 'ws://localhost:8765/ws/sensing';
+  const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const defaultWsUrl = `${wsProto}//${window.location.host}/ws/sensing`;
   if (wsUrlInput) wsUrlInput.value = defaultWsUrl;
   csiSimulator.connectLive(defaultWsUrl).then(ok => {
     if (ok && connectWsBtn) {
@@ -145,6 +146,9 @@ function init() {
       connectWsBtn.classList.add('active');
       statusLabel.textContent = 'LIVE CSI';
       statusDot.classList.remove('offline');
+    } else if (statusLabel) {
+      statusLabel.textContent = 'CSI OFFLINE';
+      statusDot.classList.add('offline');
     }
   });
 
@@ -226,8 +230,6 @@ function mainLoop(timestamp) {
       videoEmb = visualCnn.extract(frame.rgb, frame.width, frame.height);
       motionRegion = videoCapture.detectMotionRegion(56, 56);
 
-      // Feed motion to CSI simulator for correlated demo data
-      // When detected=false, CSI simulator handles through-wall persistence
       csiSimulator.updatePersonState(
         motionRegion.detected ? 1.0 : 0,
         motionRegion.detected ? motionRegion.x + motionRegion.w / 2 : 0.5,
@@ -248,14 +250,16 @@ function mainLoop(timestamp) {
   if (mode !== 'video') {
     const t0 = performance.now();
     const csiFrame = csiSimulator.nextFrame(elapsed);
-    const pseudoImage = csiSimulator.buildPseudoImage(56);
-    csiEmb = csiCnn.extract(pseudoImage, 56, 56);
+    if (csiFrame) {
+      const pseudoImage = csiSimulator.buildPseudoImage(56);
+      csiEmb = csiCnn.extract(pseudoImage, 56, 56);
+    }
 
     fusionEngine.updateConfidence(
       videoCapture.brightnessScore,
       videoCapture.motionScore,
-      csiFrame.snr,
-      true
+      csiFrame?.snr || 0,
+      Boolean(csiFrame)
     );
 
     // Draw CSI heatmap
@@ -271,7 +275,7 @@ function mainLoop(timestamp) {
   latency.fusion = performance.now() - t0f;
 
   // --- Pose Decode ---
-  // For CSI-only mode, generate a synthetic motion region from CSI energy
+  // CSI-only mode requires live CSI energy.
   if (mode === 'csi' && (!motionRegion || !motionRegion.detected)) {
     const csiPresence = csiSimulator.personPresence;
     if (csiPresence > 0.1) {

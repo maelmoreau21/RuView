@@ -14,10 +14,10 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
    - [From Source (Python)](#from-source-python)
    - [Guided Installer](#guided-installer)
 3. [Quick Start](#quick-start)
-   - [30-Second Demo (Docker)](#30-second-demo-docker)
+   - [Production Bring-Up (RuvSense Edge)](#production-bring-up-ruvsense-edge)
    - [Verify the System Works](#verify-the-system-works)
 4. [Data Sources](#data-sources)
-   - [Simulated Mode (No Hardware)](#simulated-mode-no-hardware)
+   - [Simulated Mode (Explicit Dev/Test)](#simulated-mode-explicit-devtest)
    - [Windows WiFi (RSSI Only)](#windows-wifi-rssi-only)
    - [ESP32-S3 (Full CSI)](#esp32-s3-full-csi)
    - [ESP32 Multistatic Mesh (Advanced)](#esp32-multistatic-mesh-advanced)
@@ -69,7 +69,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
 | **Rust** (for source build) | 1.70+ | 1.85+ |
 | **Python** (for legacy v1) | 3.10+ | 3.13+ |
 
-**Hardware for live sensing (optional):**
+**Hardware for live sensing:**
 
 | Option | Cost | Capabilities |
 |--------|------|-------------|
@@ -78,7 +78,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
 | Intel 5300 / Atheros AR9580 | $50-100 | Full CSI with 3x3 MIMO (Linux only) |
 | Any WiFi laptop | $0 | RSSI-only: coarse presence and motion detection |
 
-No hardware? The system runs in **simulated mode** with synthetic CSI data.
+Production RuvSense Edge requires live CSI. It does not silently switch to demo, mock, or simulation data when nodes are offline. Use simulated mode only when explicitly developing, testing, or replaying deterministic proofs.
 
 ---
 
@@ -88,7 +88,7 @@ No hardware? The system runs in **simulated mode** with synthetic CSI data.
 
 The fastest path. No toolchain installation needed.
 
-For the RuvSense Edge appliance on a Raspberry Pi 4 64-bit OS, use the dedicated master compose file. It runs in host networking mode so three or more ESP32-C6 nodes can send UDP/5005 directly to the master.
+For the RuvSense Edge appliance on a Raspberry Pi 4 64-bit OS, use the dedicated master compose file. It runs in host networking mode so three or more ESP32-C6 nodes can send UDP/5005 directly to the master. Production defaults are live: `CSI_SOURCE=esp32`, HTTP `3000`, WS `3001`, UDP `5005`, `RUVSENSE_MIN_NODES=3`, and runtime state under `/var/lib/ruvsense`.
 
 ```bash
 docker compose -f docker/compose.pi4.yml up -d
@@ -99,7 +99,9 @@ python firmware/esp32-csi-node/provision_three_c6.py \
   --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
 ```
 
-Open the console at `http://<pi-ip>:3000/ui/observatory.html`. Readiness is green only after at least `RUVSENSE_MIN_NODES` active nodes are seen; the default is `3`.
+Open the RuvSense Console at `http://<pi-ip>:3000/ui/observatory.html`. Readiness is green only after at least `RUVSENSE_MIN_NODES` active nodes are seen; the default is `3`.
+
+For production RF coverage, configure two mesh APs in the deployment environment or provisioning inventory, then provision each C6 node against the intended AP. The documented names are `RUVSENSE_MESH_AP1_SSID`, `RUVSENSE_MESH_AP1_PASSWORD`, `RUVSENSE_MESH_AP2_SSID`, and `RUVSENSE_MESH_AP2_PASSWORD`; keep them in a local `.env` or secrets store, never in source control.
 
 ```bash
 docker pull ruvnet/wifi-densepose:latest
@@ -111,9 +113,8 @@ Multi-architecture image (amd64 + arm64). Works on Intel/AMD and Apple Silicon M
 
 | Value | Description |
 |-------|-------------|
-| `auto` | (default) Probe for ESP32 on UDP 5005, fall back to simulation |
-| `esp32` | Receive real CSI frames from ESP32 devices over UDP |
-| `simulated` | Generate synthetic CSI frames (no hardware required) |
+| `esp32` | Production default for RuvSense Edge; receive real CSI frames from ESP32 devices over UDP |
+| `simulated` | Explicit development/test mode; generate synthetic CSI frames |
 | `wifi` | Host Wi-Fi RSSI (not available inside containers) |
 
 Example: `docker run -e CSI_SOURCE=esp32 -p 3000:3000 -p 5005:5005/udp ruvnet/wifi-densepose:latest`
@@ -260,21 +261,27 @@ Non-interactive:
 
 ## Quick Start
 
-### 30-Second Demo (Docker)
+### Production Bring-Up (RuvSense Edge)
 
 ```bash
-# Pull and run
-docker run -p 3000:3000 -p 3001:3001 ruvnet/wifi-densepose:latest
+# Raspberry Pi 4 master, live ESP32-C6 fleet
+docker compose -f docker/compose.pi4.yml up -d
 
-# Open the UI in your browser
-# http://localhost:3000
+python firmware/esp32-csi-node/provision_three_c6.py \
+  --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
+  --ssid "YourWiFi" --password "secret" --target-ip <pi-ip>
+
+curl http://<pi-ip>:3000/health/ready
+# Open http://<pi-ip>:3000/ui/observatory.html
 ```
 
-You will see a Three.js visualization with:
+You will see the RuvSense Console with:
 - 3D body skeleton (17 COCO keypoints)
 - Signal amplitude heatmap
 - Phase plot
 - Vital signs panel (breathing + heartbeat)
+
+The ready endpoint remains unavailable until the live node quorum is met. There is no automatic demo/mock/simulation fallback.
 
 ### Verify the System Works
 
@@ -283,7 +290,7 @@ Open a second terminal and test the API:
 ```bash
 # Health check
 curl http://localhost:3000/health
-# Expected: {"status":"ok","source":"simulated","clients":0}
+# Expected source in production: "esp32"; readiness is gated by RUVSENSE_MIN_NODES
 
 # Latest sensing frame
 curl http://localhost:3000/api/v1/sensing/latest
@@ -298,25 +305,24 @@ curl http://localhost:3000/api/v1/pose/current
 curl http://localhost:3000/api/v1/info
 ```
 
-All endpoints return JSON. In simulated mode, data is generated from a deterministic reference signal.
+All endpoints return JSON. In production, values are derived from live ESP32 CSI frames.
 
 ---
 
 ## Data Sources
 
-The `--source` flag controls where CSI data comes from.
+The `--source` flag controls where CSI data comes from. Production RuvSense Edge uses `esp32`; simulation must be selected explicitly.
 
-### Simulated Mode (No Hardware)
+### Simulated Mode (Explicit Dev/Test)
 
-Default in Docker. Generates synthetic CSI data exercising the full pipeline.
+Generates synthetic CSI data exercising the pipeline for development, CI, and deterministic proof work. Do not use this mode for field deployments or operator acceptance tests.
 
 ```bash
-# Docker
-docker run -p 3000:3000 ruvnet/wifi-densepose:latest
-# (--source auto is the default; falls back to simulate when no hardware detected)
+# Docker dev/test only
+docker run -e CSI_SOURCE=simulate -e RUVSENSE_ENABLE_SIMULATION=true -p 3000:3000 ghcr.io/maelmoreau21/ruvsense-edge-master:local
 
 # From source
-./target/release/sensing-server --source simulate --http-port 3000 --ws-port 3001
+./target/release/ruvsense-master --source simulate --enable-simulation --http-port 3000 --ws-port 3001
 ```
 
 ### Windows WiFi (RSSI Only)
@@ -507,7 +513,7 @@ Base URL: `http://localhost:3000` (Docker) or `http://localhost:8080` (binary de
 
 | Method | Endpoint | Description | Example Response |
 |--------|----------|-------------|-----------------|
-| `GET` | `/health` | Server health check | `{"status":"ok","source":"simulated","clients":0}` |
+| `GET` | `/health` | Server health check | `{"status":"ok","source":"esp32:offline","clients":0}` |
 | `GET` | `/api/v1/sensing/latest` | Latest CSI sensing frame (amplitude, phase, motion) | JSON with subcarrier arrays |
 | `GET` | `/api/v1/vital-signs` | Breathing rate + heart rate + confidence | `{"breathing_bpm":16.2,"heart_bpm":72.1,"confidence":0.87}` |
 | `GET` | `/api/v1/pose/current` | 17 COCO keypoints (x, y, z, confidence) | Array of 17 joint positions |
@@ -1041,7 +1047,7 @@ The system extracts breathing rate and heart rate from CSI signal fluctuations u
 
 **Signal smoothing:** Vital sign estimates pass through a three-stage smoothing pipeline (ADR-048): outlier rejection (±8 BPM HR, ±2 BPM BR per frame), 21-frame trimmed mean, and EMA with α=0.02. This produces stable readings that hold steady for 5-10+ seconds instead of jumping every frame. See [Adaptive Classifier](#adaptive-classifier) for details.
 
-**Simulated mode** produces synthetic vital sign data for testing.
+**Simulated mode** produces synthetic vital sign data only when explicitly selected for testing.
 
 ---
 
@@ -1051,7 +1057,7 @@ The Rust sensing server binary accepts the following flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | `auto` | Data source: `auto`, `simulate`, `wifi`, `esp32` |
+| `--source` | `esp32` in RuvSense Edge Docker | Data source: `esp32`, `simulate`, or `wifi`; production uses `esp32` |
 | `--http-port` | `8080` | HTTP port for REST API and UI |
 | `--ws-port` | `8765` | WebSocket port |
 | `--udp-port` | `5005` | UDP port for ESP32 CSI frames |
@@ -1071,8 +1077,8 @@ The Rust sensing server binary accepts the following flags:
 ### Common Invocations
 
 ```bash
-# Simulated mode with UI (development)
-./target/release/sensing-server --source simulate --http-port 3000 --ws-port 3001 --ui-path ../../ui
+# Explicit simulated mode with UI (development/test only)
+./target/release/ruvsense-master --source simulate --enable-simulation --http-port 3000 --ws-port 3001 --ui-path ../../ui
 
 # ESP32 hardware mode
 ./target/release/sensing-server --source esp32 --udp-port 5005
@@ -1106,8 +1112,8 @@ The Observatory is an immersive Three.js visualization that renders WiFi sensing
 | Wireframe figures | Up to 4 human skeletons with joint pulsation synced to breathing |
 | Signal field | Volumetric WiFi wave visualization |
 | Live HUD | Heart rate, breathing rate, confidence, RSSI, motion level |
-| Auto-detect | Automatically connects to live ESP32 data when sensing server is running |
-| Scenario cycling | 6 preset scenarios with smooth transitions (demo mode) |
+| Live connection | Connects to the same-origin RuvSense Edge WebSocket when the server is running |
+| Scenario cycling | 6 preset scenarios, available only in explicit local simulation mode |
 
 **Keyboard shortcuts:**
 
@@ -1119,7 +1125,7 @@ The Observatory is an immersive Three.js visualization that renders WiFi sensing
 | `S` | Open settings |
 | `R` | Reset camera |
 
-**Live data auto-detect:** When served by the sensing server, the Observatory probes `/health` on the same origin and automatically connects via WebSocket. The HUD badge switches from `DEMO` to `LIVE`. No configuration needed.
+**Live data connection:** When served by `ruvsense-master`, the Observatory probes `/health` on the same origin and connects via WebSocket to the live ESP32 fleet. If the fleet is offline, production readiness remains unavailable instead of substituting simulated frames.
 
 ---
 
@@ -1938,7 +1944,15 @@ node scripts/benchmark-ruvllm.js --model models/csi-ruvllm
 
 ## Docker Compose (Multi-Service)
 
-For production deployments with both Rust and Python services:
+For production RuvSense Edge deployments, use the Pi master compose file:
+
+```bash
+docker compose -f docker/compose.pi4.yml up -d
+```
+
+This starts `ruvsense-master` with live ESP32 CSI defaults, host networking, SQLite state in `data/ruvsense`, and readiness gated by `RUVSENSE_MIN_NODES=3`.
+
+The older multi-service compose path is for development or legacy interoperability with the Python v1 server:
 
 ```bash
 cd docker
@@ -2317,7 +2331,7 @@ Run the terminal as Administrator (required for `netsh wlan` access). Verified w
 
 - Vital sign detection requires CSI-capable hardware (ESP32 or research NIC)
 - RSSI-only mode (Windows WiFi) does not have sufficient resolution for vital signs
-- In simulated mode, synthetic vital signs are generated after a few seconds of warm-up
+- Synthetic vital signs appear only in explicit simulated mode; production requires live CSI frames
 - With real ESP32 data, vital signs take ~5 seconds to stabilize (smoothing pipeline warm-up)
 
 ### Vital signs jumping around
@@ -2327,14 +2341,15 @@ The server applies a 3-stage smoothing pipeline (ADR-048). If readings are still
 - Train the adaptive classifier for your specific environment: `curl -X POST http://localhost:3000/api/v1/adaptive/train`
 - Check signal quality: `curl http://localhost:3000/api/v1/sensing/latest` — look for `signal_quality > 0.4`
 
-### Observatory shows DEMO instead of LIVE
+### Observatory is not LIVE
 
 - Verify the sensing server is running: `curl http://localhost:3000/health`
 - Access Observatory via the server URL: `http://localhost:3000/ui/observatory.html` (not a file:// URL)
 - If a standalone `aggregator` command is already listening on UDP `:5005`, stop it and run `sensing-server --source esp32 --udp-port 5005` instead; the Observatory reads the server WebSocket, not the standalone aggregator output
 - Verify the ESP32 nodes are provisioned to the IP address of the machine running `sensing-server`
+- Verify at least three ESP32-C6 nodes are active, or set `RUVSENSE_MIN_NODES` deliberately for a smaller lab setup
 - Hard refresh with Ctrl+Shift+R to clear cached settings
-- The auto-detect probes `/health` on the same origin — cross-origin won't work
+- The UI probes `/health` on the same origin; cross-origin browser access is unsupported
 
 ### QEMU: "qemu-system-xtensa: command not found"
 
@@ -2382,7 +2397,7 @@ Install PyYAML: `pip install pyyaml`
 ## FAQ
 
 **Q: Do I need special hardware to try this?**
-No. Run `docker run -p 3000:3000 ruvnet/wifi-densepose:latest` and open `http://localhost:3000`. Simulated mode exercises the full pipeline with synthetic data.
+For production RuvSense Edge, yes: use a Raspberry Pi master with at least three ESP32-C6 nodes. For development or proof replay only, run `docker run -e CSI_SOURCE=simulated -p 3000:3000 ruvnet/wifi-densepose:latest` and open `http://localhost:3000`.
 
 **Q: Can consumer WiFi laptops do pose estimation?**
 No. Consumer WiFi exposes only RSSI (one number per access point), not CSI (56+ complex subcarrier values per frame). RSSI supports coarse presence and motion detection. Full pose estimation requires CSI-capable hardware like an ESP32-S3 ($8) or a research NIC.

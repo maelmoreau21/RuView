@@ -1,5 +1,5 @@
 // Keyboard Shortcuts System
-// Press '?' to show help overlay, number keys to switch tabs, etc.
+// Press '?' to show help overlay and number keys to open core pages.
 
 export class KeyboardShortcuts {
   constructor(app) {
@@ -14,14 +14,9 @@ export class KeyboardShortcuts {
   registerDefaults() {
     this.register('?', 'Show keyboard shortcuts', () => this.toggleHelp());
     this.register('Escape', 'Close overlay / dialog', () => this.closeAll());
-    this.register('1', 'Switch to Dashboard tab', () => this.switchTab('dashboard'));
-    this.register('2', 'Switch to Hardware tab', () => this.switchTab('hardware'));
-    this.register('3', 'Switch to Live Demo tab', () => this.switchTab('demo'));
-    this.register('4', 'Switch to Architecture tab', () => this.switchTab('architecture'));
-    this.register('5', 'Switch to Performance tab', () => this.switchTab('performance'));
-    this.register('6', 'Switch to Applications tab', () => this.switchTab('applications'));
-    this.register('7', 'Switch to Sensing tab', () => this.switchTab('sensing'));
-    this.register('8', 'Switch to Training tab', () => this.switchTab('training'));
+    this.register('1', 'Open Console', () => this.openPage('index.html'));
+    this.register('2', 'Open Observatory', () => this.openPage('observatory.html'));
+    this.register('3', 'Open Pose Fusion', () => this.openPage('pose-fusion.html'));
     this.register('p', 'Toggle performance monitor', () => this.togglePerfMonitor());
     this.register('t', 'Toggle dark/light theme', () => this.toggleTheme());
   }
@@ -57,11 +52,8 @@ export class KeyboardShortcuts {
     }
   }
 
-  switchTab(tabId) {
-    const tabManager = this.app?.getComponent?.('tabManager');
-    if (tabManager) {
-      tabManager.switchToTab(tabId);
-    }
+  openPage(href) {
+    window.location.href = href;
   }
 
   togglePerfMonitor() {
@@ -99,6 +91,7 @@ export class KeyboardShortcuts {
         title: 'Navigation',
         items: Array.from(this.shortcuts.entries())
           .filter(([key]) => /^[1-8]$/.test(key))
+          .filter(([key]) => /^[1-3]$/.test(key))
       },
       {
         title: 'Actions',
@@ -108,7 +101,7 @@ export class KeyboardShortcuts {
       {
         title: 'General',
         items: Array.from(this.shortcuts.entries())
-          .filter(([key]) => !/^[1-8a-z]$/.test(key))
+          .filter(([key]) => !/^[1-3a-z]$/.test(key))
       }
     ];
 

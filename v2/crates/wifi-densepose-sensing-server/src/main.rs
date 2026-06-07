@@ -37,7 +37,7 @@ use axum::{
         Path, Query, State,
     },
     http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    response::{Html, IntoResponse, Json, Redirect},
     routing::{delete, get, post},
     Extension, Router,
 };
@@ -123,9 +123,13 @@ struct Args {
     #[command(flatten)]
     mqtt_opts: wifi_densepose_sensing_server::cli::MqttArgs,
 
-    /// Data source: auto, wifi, esp32, simulate
+    /// Data source: auto, wifi, esp32, simulate. Simulation requires --enable-simulation.
     #[arg(long, default_value = "auto")]
     source: String,
+
+    /// Explicitly allow the synthetic simulation source for dev/test runs.
+    #[arg(long, default_value_t = false, env = "RUVSENSE_ENABLE_SIMULATION")]
+    enable_simulation: bool,
 
     /// Run vital sign detection benchmark (1000 frames) and exit
     #[arg(long)]
@@ -827,15 +831,46 @@ fn default_node_position(node_id: u8) -> [f64; 3] {
     POSITIONS[(node_id as usize).saturating_sub(1) % POSITIONS.len()]
 }
 
-fn node_summary_json(id: u8, ns: &NodeState, now: std::time::Instant) -> serde_json::Value {
+fn configured_node(env: &EnvironmentConfig, node_id: u8) -> Option<&EnvironmentNodeConfig> {
+    env.nodes.iter().find(|n| n.node_id == node_id)
+}
+
+fn configured_node_position(env: &EnvironmentConfig, node_id: u8) -> [f64; 3] {
+    configured_node(env, node_id)
+        .map(|n| n.position_m)
+        .unwrap_or_else(|| default_node_position(node_id))
+}
+
+fn node_linked_ap(env: &EnvironmentConfig, node_id: u8) -> Option<String> {
+    configured_node(env, node_id)
+        .map(|n| n.linked_ap.clone())
+        .or_else(|| {
+            env.links
+                .iter()
+                .find(|l| l.node_id == node_id)
+                .map(|l| l.ap_id.clone())
+        })
+}
+
+fn node_summary_json(
+    id: u8,
+    ns: &NodeState,
+    now: std::time::Instant,
+    env: &EnvironmentConfig,
+) -> serde_json::Value {
     let last_seen_ms = ns
         .last_frame_time
         .map(|t| now.saturating_duration_since(t).as_millis() as u64)
         .unwrap_or(u64::MAX);
     let active = is_node_active(ns, now);
     let sync = ns.sync_snapshot();
+    let cfg = configured_node(env, id);
+    let position_m = configured_node_position(env, id);
     serde_json::json!({
         "node_id": id,
+        "label": cfg.map(|n| n.label.as_str()).unwrap_or("ESP32-C6"),
+        "kind": cfg.map(|n| n.kind.as_str()).unwrap_or("esp32_c6"),
+        "zone": cfg.map(|n| n.zone.as_str()).unwrap_or("unassigned"),
         "status": if active { "active" } else { "stale" },
         "active": active,
         "last_seen_ms": last_seen_ms,
@@ -845,11 +880,73 @@ fn node_summary_json(id: u8, ns: &NodeState, now: std::time::Instant) -> serde_j
         "motion_level": &ns.current_motion_level,
         "presence": !matches!(ns.current_motion_level.as_str(), "absent"),
         "person_count": ns.prev_person_count,
-        "position": default_node_position(id),
+        "position": position_m,
+        "position_m": position_m,
+        "tdm_slot": cfg.map(|n| n.tdm_slot),
+        "tdm_total": cfg.map(|n| n.tdm_total),
+        "linked_ap": node_linked_ap(env, id),
+        "sync_status": sync.as_ref().map(|s| if s.is_valid { "valid" } else { "stale" }).unwrap_or("no_sync"),
         "sync": sync,
         "coherence": ns.coherence_score,
         "novelty_score": ns.last_novelty_score,
     })
+}
+
+fn configured_offline_node_json(
+    cfg: &EnvironmentNodeConfig,
+    env: &EnvironmentConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": cfg.node_id,
+        "label": cfg.label.as_str(),
+        "kind": cfg.kind.as_str(),
+        "zone": cfg.zone.as_str(),
+        "status": "offline",
+        "active": false,
+        "last_seen_ms": serde_json::Value::Null,
+        "rssi_dbm": serde_json::Value::Null,
+        "frame_rate_hz": 0.0,
+        "frame_rate_samples": 0,
+        "motion_level": "unknown",
+        "presence": false,
+        "person_count": 0,
+        "position": cfg.position_m,
+        "position_m": cfg.position_m,
+        "tdm_slot": cfg.tdm_slot,
+        "tdm_total": cfg.tdm_total,
+        "linked_ap": node_linked_ap(env, cfg.node_id).unwrap_or_else(|| cfg.linked_ap.clone()),
+        "sync_status": "offline",
+        "sync": serde_json::Value::Null,
+        "coherence": serde_json::Value::Null,
+        "novelty_score": serde_json::Value::Null,
+    })
+}
+
+fn all_node_summaries_json(
+    s: &AppStateInner,
+    now: std::time::Instant,
+) -> Vec<serde_json::Value> {
+    let mut nodes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for cfg in &s.environment.nodes {
+        seen.insert(cfg.node_id);
+        if let Some(ns) = s.node_states.get(&cfg.node_id) {
+            nodes.push(node_summary_json(cfg.node_id, ns, now, &s.environment));
+        } else {
+            nodes.push(configured_offline_node_json(cfg, &s.environment));
+        }
+    }
+
+    let mut unknown: Vec<_> = s
+        .node_states
+        .iter()
+        .filter(|(&id, _)| !seen.contains(&id))
+        .map(|(&id, ns)| node_summary_json(id, ns, now, &s.environment))
+        .collect();
+    unknown.sort_by_key(|v| v.get("node_id").and_then(|id| id.as_u64()).unwrap_or(0));
+    nodes.extend(unknown);
+    nodes
 }
 
 // ── ADR-044 §5.2: Rolling P95 adaptive feature normalizer ────────────────────
@@ -909,16 +1006,154 @@ impl RollingP95 {
 
 // ── ADR-044 §5.3: Runtime config persistence ─────────────────────────────────
 
+fn default_dedup_factor() -> f64 {
+    3.0
+}
+
+/// Physical room profile used by the 3D console and calibration UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoomConfig {
+    pub name: String,
+    pub dimensions_m: [f64; 3],
+    pub coordinate_system: String,
+}
+
+/// Configured WiFi mesh AP anchor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AccessPointConfig {
+    pub ap_id: String,
+    pub label: String,
+    pub ssid: String,
+    pub bssid: Option<String>,
+    pub role: String,
+    pub position_m: [f64; 3],
+    pub channel: Option<u8>,
+    pub band: String,
+    pub active: bool,
+}
+
+/// Configured ESP32-C6 sensing node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EnvironmentNodeConfig {
+    pub node_id: u8,
+    pub label: String,
+    pub kind: String,
+    pub zone: String,
+    pub position_m: [f64; 3],
+    pub tdm_slot: u8,
+    pub tdm_total: u8,
+    pub linked_ap: String,
+}
+
+/// Configured AP-to-node RF link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EnvironmentLinkConfig {
+    pub link_id: String,
+    pub ap_id: String,
+    pub node_id: u8,
+}
+
+/// Persisted topology for the production console.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EnvironmentConfig {
+    pub room: RoomConfig,
+    pub access_points: Vec<AccessPointConfig>,
+    pub nodes: Vec<EnvironmentNodeConfig>,
+    pub links: Vec<EnvironmentLinkConfig>,
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            room: RoomConfig {
+                name: "primary".to_string(),
+                dimensions_m: [5.2, 2.6, 4.8],
+                coordinate_system: "x_right_y_up_z_depth".to_string(),
+            },
+            access_points: vec![
+                AccessPointConfig {
+                    ap_id: "ap-1".to_string(),
+                    label: "Mesh AP 1".to_string(),
+                    ssid: "ruvsense-mesh".to_string(),
+                    bssid: None,
+                    role: "gateway".to_string(),
+                    position_m: [-2.4, 1.9, -2.0],
+                    channel: Some(1),
+                    band: "2.4GHz".to_string(),
+                    active: true,
+                },
+                AccessPointConfig {
+                    ap_id: "ap-2".to_string(),
+                    label: "Mesh AP 2".to_string(),
+                    ssid: "ruvsense-mesh".to_string(),
+                    bssid: None,
+                    role: "mesh".to_string(),
+                    position_m: [2.4, 1.9, 2.0],
+                    channel: Some(6),
+                    band: "2.4GHz".to_string(),
+                    active: true,
+                },
+            ],
+            nodes: vec![
+                EnvironmentNodeConfig {
+                    node_id: 1,
+                    label: "ESP32-C6 1".to_string(),
+                    kind: "esp32_c6".to_string(),
+                    zone: "front_left".to_string(),
+                    position_m: [-2.0, 1.1, -1.6],
+                    tdm_slot: 0,
+                    tdm_total: 3,
+                    linked_ap: "ap-1".to_string(),
+                },
+                EnvironmentNodeConfig {
+                    node_id: 2,
+                    label: "ESP32-C6 2".to_string(),
+                    kind: "esp32_c6".to_string(),
+                    zone: "front_right".to_string(),
+                    position_m: [2.0, 1.1, -1.6],
+                    tdm_slot: 1,
+                    tdm_total: 3,
+                    linked_ap: "ap-1".to_string(),
+                },
+                EnvironmentNodeConfig {
+                    node_id: 3,
+                    label: "ESP32-C6 3".to_string(),
+                    kind: "esp32_c6".to_string(),
+                    zone: "rear".to_string(),
+                    position_m: [0.0, 1.1, 2.0],
+                    tdm_slot: 2,
+                    tdm_total: 3,
+                    linked_ap: "ap-2".to_string(),
+                },
+            ],
+            links: vec![
+                EnvironmentLinkConfig { link_id: "ap-1:c6-1".to_string(), ap_id: "ap-1".to_string(), node_id: 1 },
+                EnvironmentLinkConfig { link_id: "ap-1:c6-2".to_string(), ap_id: "ap-1".to_string(), node_id: 2 },
+                EnvironmentLinkConfig { link_id: "ap-1:c6-3".to_string(), ap_id: "ap-1".to_string(), node_id: 3 },
+                EnvironmentLinkConfig { link_id: "ap-2:c6-1".to_string(), ap_id: "ap-2".to_string(), node_id: 1 },
+                EnvironmentLinkConfig { link_id: "ap-2:c6-2".to_string(), ap_id: "ap-2".to_string(), node_id: 2 },
+                EnvironmentLinkConfig { link_id: "ap-2:c6-3".to_string(), ap_id: "ap-2".to_string(), node_id: 3 },
+            ],
+        }
+    }
+}
+
 /// Runtime configuration that persists across server restarts via `data/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RuntimeConfig {
     /// Divisor for multi-node person-count deduplication (sum / factor).
+    #[serde(default = "default_dedup_factor")]
     pub dedup_factor: f64,
+    #[serde(default)]
+    pub environment: EnvironmentConfig,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        Self { dedup_factor: 3.0 }
+        Self {
+            dedup_factor: default_dedup_factor(),
+            environment: EnvironmentConfig::default(),
+        }
     }
 }
 
@@ -1115,6 +1350,8 @@ struct AppStateInner {
     pub(crate) min_nodes: usize,
     /// Data directory for persisting runtime config (parent of `firmware_dir`).
     pub(crate) data_dir: std::path::PathBuf,
+    /// Persisted room/AP/node topology consumed by the RuvSense Console.
+    pub(crate) environment: EnvironmentConfig,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -1155,10 +1392,9 @@ impl AppStateInner {
 
     fn effective_source(&self) -> String {
         if self.source == "esp32" {
-            if let Some(last) = self.last_esp32_frame {
-                if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
-                    return "esp32:offline".to_string();
-                }
+            match self.last_esp32_frame {
+                Some(last) if last.elapsed() <= ESP32_OFFLINE_TIMEOUT => {}
+                _ => return "esp32:offline".to_string(),
             }
         }
         self.source.clone()
@@ -2873,7 +3109,7 @@ async fn api_introspection_snapshot(State(state): State<SharedState>) -> impl In
     Json(s.intro.snapshot().clone())
 }
 
-// ── Pose WebSocket handler (sends pose_data messages for Live Demo) ──────────
+// ── Pose WebSocket handler (sends pose_data messages for live pose clients) ──
 
 async fn ws_pose_handler(
     ws: WebSocketUpgrade,
@@ -4940,14 +5176,11 @@ async fn mesh_endpoint(State(state): State<SharedState>) -> Json<serde_json::Val
 async fn nodes_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let now = std::time::Instant::now();
-    let nodes: Vec<serde_json::Value> = s
-        .node_states
-        .iter()
-        .map(|(&id, ns)| node_summary_json(id, ns, now))
-        .collect();
+    let nodes = all_node_summaries_json(&s, now);
+    let total = nodes.len();
     Json(serde_json::json!({
         "nodes": nodes,
-        "total": nodes.len(),
+        "total": total,
         "active": active_node_count(&s, now),
         "min_nodes": s.min_nodes,
         "ready": fleet_ready(&s, now),
@@ -4958,25 +5191,53 @@ async fn fleet_endpoint(State(state): State<SharedState>) -> Json<serde_json::Va
     let s = state.read().await;
     let now = std::time::Instant::now();
     let active_nodes = active_node_count(&s, now);
-    let nodes: Vec<serde_json::Value> = s
-        .node_states
-        .iter()
-        .map(|(&id, ns)| node_summary_json(id, ns, now))
-        .collect();
+    let nodes = all_node_summaries_json(&s, now);
+    let avg_frame_rate_hz = if active_nodes > 0 {
+        s.node_states
+            .values()
+            .filter(|ns| is_node_active(ns, now))
+            .map(|ns| ns.csi_fps_ema)
+            .sum::<f64>() / active_nodes as f64
+    } else {
+        0.0
+    };
+    let fusion_status = if active_nodes >= s.min_nodes {
+        "active"
+    } else if active_nodes > 0 {
+        "degraded"
+    } else {
+        "offline"
+    };
     Json(serde_json::json!({
         "product": "RuvSense Edge",
         "service": "ruvsense-master",
         "version": env!("CARGO_PKG_VERSION"),
         "source": s.effective_source(),
+        "source_mode": source_mode_json(&s.effective_source()),
         "ready": active_nodes >= s.min_nodes,
         "active_nodes": active_nodes,
         "known_nodes": s.node_states.len(),
+        "configured_nodes": s.environment.nodes.len(),
         "min_nodes": s.min_nodes,
+        "frame_rate_hz": avg_frame_rate_hz,
+        "fusion_status": fusion_status,
         "uptime_seconds": s.start_time.elapsed().as_secs(),
         "tick": s.tick,
         "clients": s.tx.receiver_count(),
         "nodes": nodes,
     }))
+}
+
+fn source_mode_json(source: &str) -> serde_json::Value {
+    let simulated = matches!(source, "simulate" | "simulated");
+    let offline = source.ends_with(":offline") || source == "offline";
+    serde_json::json!({
+        "kind": source.split(':').next().unwrap_or(source),
+        "raw": source,
+        "live": !simulated && !offline,
+        "simulated": simulated,
+        "degraded_reason": if offline { Some("offline") } else { None::<&str> },
+    })
 }
 
 async fn environment_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -4990,11 +5251,9 @@ async fn environment_endpoint(State(state): State<SharedState>) -> Json<serde_js
         .map(|fm| format!("{:?}", fm.status()))
         .unwrap_or_else(|| "not_started".to_string());
     Json(serde_json::json!({
-        "room": {
-            "name": "primary",
-            "dimensions_m": [5.2, 2.6, 4.8],
-            "coordinate_system": "x_right_y_up_z_depth",
-        },
+        "room": &s.environment.room,
+        "access_points": &s.environment.access_points,
+        "links": &s.environment.links,
         "fusion": {
             "mode": if active_nodes >= 3 { "multistatic" } else if active_nodes > 0 { "single_or_partial" } else { "offline" },
             "active_nodes": active_nodes,
@@ -5011,10 +5270,78 @@ async fn environment_endpoint(State(state): State<SharedState>) -> Json<serde_js
             "motion_level": latest.map(|u| u.classification.motion_level.clone()).unwrap_or_else(|| "unknown".to_string()),
         },
         "signal_field": latest.map(|u| serde_json::to_value(&u.signal_field).unwrap_or_default()),
-        "nodes": s.node_states.iter()
-            .map(|(&id, ns)| node_summary_json(id, ns, now))
-            .collect::<Vec<_>>(),
+        "nodes": all_node_summaries_json(&s, now),
     }))
+}
+
+fn validate_environment(env: &EnvironmentConfig) -> Result<(), String> {
+    if env.room.dimensions_m.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err("room dimensions must be positive finite meters".to_string());
+    }
+    let mut ap_ids = std::collections::HashSet::new();
+    for ap in &env.access_points {
+        if ap.ap_id.trim().is_empty() {
+            return Err("access point id cannot be empty".to_string());
+        }
+        if !ap_ids.insert(ap.ap_id.as_str()) {
+            return Err(format!("duplicate access point id '{}'", ap.ap_id));
+        }
+        if ap.position_m.iter().any(|v| !v.is_finite()) {
+            return Err(format!("access point '{}' has invalid position", ap.ap_id));
+        }
+    }
+    let mut node_ids = std::collections::HashSet::new();
+    for node in &env.nodes {
+        if node.node_id == 0 {
+            return Err("node_id 0 is reserved for WiFi scan aggregate data".to_string());
+        }
+        if !node_ids.insert(node.node_id) {
+            return Err(format!("duplicate node_id {}", node.node_id));
+        }
+        if node.position_m.iter().any(|v| !v.is_finite()) {
+            return Err(format!("node {} has invalid position", node.node_id));
+        }
+    }
+    for link in &env.links {
+        if !ap_ids.contains(link.ap_id.as_str()) {
+            return Err(format!("link '{}' references unknown AP '{}'", link.link_id, link.ap_id));
+        }
+        if !node_ids.contains(&link.node_id) {
+            return Err(format!("link '{}' references unknown node {}", link.link_id, link.node_id));
+        }
+    }
+    Ok(())
+}
+
+async fn environment_update_endpoint(
+    State(state): State<SharedState>,
+    Json(environment): Json<EnvironmentConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(message) = validate_environment(&environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        ));
+    }
+
+    let mut s = state.write().await;
+    s.environment = environment.clone();
+    let data_dir = s.data_dir.clone();
+    let dedup_factor = s.dedup_factor;
+    drop(s);
+
+    save_runtime_config(
+        &data_dir,
+        &RuntimeConfig {
+            dedup_factor,
+            environment: environment.clone(),
+        },
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "environment": environment,
+    })))
 }
 
 fn module_status(active_nodes: usize, required_nodes: usize) -> &'static str {
@@ -5327,6 +5654,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
 
                     // Build nodes array with all active nodes.
+                    let environment = s.environment.clone();
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
@@ -5337,7 +5665,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: default_node_position(id),
+                            position: configured_node_position(&environment, id),
                             amplitude: vec![],
                             subcarrier_count: 0,
                             // Vitals-only path; still expose the sync snapshot
@@ -5751,6 +6079,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
 
                     // Build nodes array with all active nodes.
+                    let environment = s.environment.clone();
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
@@ -5761,7 +6090,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: default_node_position(id),
+                            position: configured_node_position(&environment, id),
                             amplitude: n
                                 .frame_history
                                 .back()
@@ -6749,6 +7078,7 @@ async fn main() {
     info!("  UDP:       0.0.0.0:{} (ESP32 CSI)", args.udp_port);
     info!("  UI path:   {}", args.ui_path.display());
     info!("  Source:    {}", args.source);
+    info!("  Simulation enabled: {}", args.enable_simulation);
     info!("  Min nodes: {}", args.min_nodes);
     info!("  Data dir:  {}", args.data_dir.display());
 
@@ -6763,12 +7093,27 @@ async fn main() {
                 info!("  Windows WiFi detected");
                 "wifi"
             } else {
-                info!("  No hardware detected, using simulation");
-                "simulate"
+                warn!(
+                    "  No hardware detected; starting ESP32 listener in offline state (simulation is explicit dev/test only)"
+                );
+                "esp32"
             }
         }
+        "simulate" | "simulated" if !args.enable_simulation => {
+            error!(
+                "Simulation source requested without --enable-simulation or RUVSENSE_ENABLE_SIMULATION=true"
+            );
+            std::process::exit(2);
+        }
+        "simulate" | "simulated" => "simulate",
+        "esp32" | "wifi" => args.source.as_str(),
         other => other,
     };
+
+    if !matches!(source, "esp32" | "wifi" | "simulate") {
+        error!("Unknown data source '{source}'. Expected auto, esp32, wifi, or simulate.");
+        std::process::exit(2);
+    }
 
     info!("Data source: {source}");
 
@@ -6875,8 +7220,10 @@ async fn main() {
     // ADR-044 §5.3: load persisted runtime config from the data directory.
     let runtime_config = load_runtime_config(&data_dir);
     info!(
-        "Loaded runtime config: dedup_factor={:.2}",
-        runtime_config.dedup_factor
+        "Loaded runtime config: dedup_factor={:.2}, aps={}, nodes={}",
+        runtime_config.dedup_factor,
+        runtime_config.environment.access_points.len(),
+        runtime_config.environment.nodes.len(),
     );
 
     // ADR-102: optional Edge Module Registry. None when --no-edge-registry
@@ -7052,6 +7399,7 @@ async fn main() {
         dedup_factor: runtime_config.dedup_factor,
         min_nodes: args.min_nodes.max(1),
         data_dir: data_dir.clone(),
+        environment: runtime_config.environment.clone(),
     }));
 
     // Start background tasks based on source
@@ -7063,9 +7411,10 @@ async fn main() {
         "wifi" => {
             tokio::spawn(windows_wifi_task(state.clone(), args.tick_ms));
         }
-        _ => {
+        "simulate" => {
             tokio::spawn(simulated_data_task(state.clone(), args.tick_ms));
         }
+        _ => unreachable!("source was validated before state creation"),
     }
 
     // ADR-050: Parse bind address once, use for all listeners
@@ -7140,7 +7489,7 @@ async fn main() {
     // HTTP server (serves UI + full DensePose-compatible REST API)
     let ui_path = args.ui_path.clone();
     let http_app = Router::new()
-        .route("/", get(info_page))
+        .route("/", get(|| async { Redirect::temporary("/ui/index.html") }))
         // Health endpoints (DensePose-compatible)
         .route("/health", get(health))
         .route("/health/health", get(health_system))
@@ -7156,7 +7505,10 @@ async fn main() {
         // Sensing endpoints
         .route("/api/v1/sensing/latest", get(latest))
         .route("/api/v1/fleet", get(fleet_endpoint))
-        .route("/api/v1/environment", get(environment_endpoint))
+        .route(
+            "/api/v1/environment",
+            get(environment_endpoint).put(environment_update_endpoint),
+        )
         .route("/api/v1/modules", get(modules_endpoint))
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
@@ -7646,11 +7998,13 @@ async fn config_set_dedup_factor(
     let mut s = state.write().await;
     s.dedup_factor = clamped;
     let data_dir = s.data_dir.clone();
+    let environment = s.environment.clone();
     drop(s);
     save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor: clamped,
+            environment,
         },
     );
     Json(serde_json::json!({
@@ -7692,11 +8046,13 @@ async fn config_set_ground_truth(
     let clamped = optimal.clamp(1.0, 10.0);
     s.dedup_factor = clamped;
     let data_dir = s.data_dir.clone();
+    let environment = s.environment.clone();
     drop(s);
     save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor: clamped,
+            environment,
         },
     );
     Json(serde_json::json!({

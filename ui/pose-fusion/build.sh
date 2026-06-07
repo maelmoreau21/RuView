@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build WASM packages for the dual-modal pose estimation demo.
+# Build WASM packages for the dual-modal pose estimation view.
 # Requires: wasm-pack (cargo install wasm-pack)
 #
 # Usage: ./build.sh
@@ -26,5 +26,5 @@ echo "Build complete!"
 echo "  WASM: $(du -sh "$OUT_DIR/ruvector_cnn_wasm_bg.wasm" | cut -f1)"
 echo "  JS:   $(du -sh "$OUT_DIR/ruvector_cnn_wasm.js" | cut -f1)"
 echo ""
-echo "Serve the demo: cd $SCRIPT_DIR/.. && python3 -m http.server 8080"
+echo "Serve Pose Fusion: cd $SCRIPT_DIR/.. && python3 -m http.server 8080"
 echo "Open: http://localhost:8080/pose-fusion.html"

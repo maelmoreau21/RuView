@@ -1,36 +1,14 @@
-// RuView Service Worker - Offline caching for the dashboard shell
+// RuvSense Console service worker - offline caching for the console shell
 // Strategy: Network-first for API calls, Cache-first for static assets
 
-const CACHE_NAME = 'ruview-v1';
+const CACHE_NAME = 'ruvsense-console-v1';
 const SHELL_ASSETS = [
   '/',
   '/index.html',
   '/style.css',
   '/app.js',
-  '/config/api.config.js',
-  '/components/TabManager.js',
-  '/components/DashboardTab.js',
-  '/components/HardwareTab.js',
-  '/components/LiveDemoTab.js',
-  '/components/SensingTab.js',
-  '/components/PoseDetectionCanvas.js',
-  '/services/api.service.js',
-  '/services/websocket.service.js',
-  '/services/health.service.js',
-  '/services/sensing.service.js',
-  '/services/pose.service.js',
-  '/services/stream.service.js',
-  '/utils/backend-detector.js',
-  '/utils/keyboard-shortcuts.js',
-  '/utils/perf-monitor.js',
-  '/utils/toast.js',
-  '/utils/theme-toggle.js',
-  '/utils/command-palette.js',
-  '/utils/activity-log.js',
-  '/utils/data-export.js',
-  '/utils/fullscreen.js',
-  '/utils/connection-status.js',
-  '/utils/mobile-nav.js'
+  '/observatory.html',
+  '/pose-fusion.html'
 ];
 
 // Install - cache shell assets

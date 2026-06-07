@@ -17,9 +17,9 @@ describe('ConnectionBanner', () => {
     expect(screen.getByText('DISCONNECTED')).toBeTruthy();
   });
 
-  it('renders SIMULATED DATA text when simulated', () => {
+  it('renders DEV SIMULATION text when simulated', () => {
     renderWithTheme(<ConnectionBanner status="simulated" />);
-    expect(screen.getByText('SIMULATED DATA')).toBeTruthy();
+    expect(screen.getByText('DEV SIMULATION')).toBeTruthy();
   });
 
   it('renders without crashing for each status', () => {

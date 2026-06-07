@@ -143,6 +143,17 @@ describe('usePoseStore', () => {
       usePoseStore.getState().setConnectionStatus('disconnected');
       expect(usePoseStore.getState().isSimulated).toBe(false);
     });
+
+    it('clears frame-derived data for disconnected status', () => {
+      usePoseStore.getState().handleFrame(makeFrame());
+      usePoseStore.getState().setConnectionStatus('disconnected');
+
+      const state = usePoseStore.getState();
+      expect(state.lastFrame).toBeNull();
+      expect(state.features).toBeNull();
+      expect(state.classification).toBeNull();
+      expect(state.signalField).toBeNull();
+    });
   });
 
   describe('reset', () => {

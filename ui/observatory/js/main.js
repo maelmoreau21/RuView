@@ -2,7 +2,7 @@
  * RuvSense Console - Main Scene Orchestrator
  *
  * Room-based WiFi sensing visualization with:
- * - Pool of 4 human wireframe figures (multi-person scenarios)
+ * - Pool of 4 human wireframe figures for live multi-person frames
  * - 7 pose types (standing, walking, lying, sitting, fallen, exercising, gesturing, crouching)
  * - Scenario-specific room props (chair, exercise mat, door, rubble wall, screen, desk)
  * - Dot-matrix mist body mass, particle trails, WiFi waves, signal field
@@ -11,13 +11,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-import { DemoDataGenerator } from './demo-data.js';
 import { NebulaBackground } from './nebula-background.js';
 import { PostProcessing } from './post-processing.js';
 import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
-import { ScenarioProps } from './scenario-props.js';
-import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES } from './hud-controller.js';
+import { HudController, DEFAULTS, SETTINGS_VERSION } from './hud-controller.js';
 
 // ---- Palette ----
 const C = {
@@ -90,23 +88,19 @@ class Observatory {
 
     this._clock = new THREE.Clock();
 
-    // Data
-    this._demoData = new DemoDataGenerator();
-    this._demoData.setCycleDuration(this.settings.cycle || 30);
-    if (this.settings.scenario && this.settings.scenario !== 'auto') {
-      this._demoData.setScenario(this.settings.scenario);
-    }
+    // Live data
     this._currentData = null;
-    this._currentScenario = null;
+    this._environment = null;
+    this._wsReconnectTimer = null;
+    this._lastLiveAt = 0;
 
     // Build scene
     this._setupLighting();
     this._nebula = new NebulaBackground(this._scene);
     this._buildRoom();
-    this._buildRouter();
+    this._buildTopologyDevices();
     this._poseSystem = new PoseSystem();
     this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
-    this._scenarioProps = new ScenarioProps(this._scene);
     this._buildDotMatrixMist();
     this._buildParticleTrail();
     this._buildWifiWaves();
@@ -131,12 +125,12 @@ class Observatory {
     // WebSocket for live data — always try auto-detect on startup
     this._ws = null;
     this._liveData = null;
+    this._fetchEnvironment();
     this._autoDetectLive();
 
     // Input
     this._initKeyboard();
     this._hud.initSettings();
-    this._hud.initQuickSelect();
     window.addEventListener('resize', () => this._onResize());
 
     // Start
@@ -210,65 +204,212 @@ class Observatory {
     floor.receiveShadow = true;
     this._scene.add(floor);
 
-    // Table under router
-    const tableGeo = new THREE.BoxGeometry(0.8, 0.6, 0.5);
-    const tableMat = new THREE.MeshStandardMaterial({ color: 0x6b5840, roughness: 0.55, emissive: 0x1a1408, emissiveIntensity: 0.25 });
-    const table = new THREE.Mesh(tableGeo, tableMat);
-    table.position.set(-4, 0.3, -3);
-    table.castShadow = true;
-    this._scene.add(table);
   }
 
-  // ---- Router ----
+  // ---- Topology devices ----
 
-  _buildRouter() {
-    this._routerGroup = new THREE.Group();
-    this._routerGroup.position.set(-4, 0.92, -3);
-
-    const bodyGeo = new THREE.BoxGeometry(0.6, 0.12, 0.35);
-    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x505060, roughness: 0.2, metalness: 0.7, emissive: 0x101018, emissiveIntensity: 0.2 });
-    this._routerGroup.add(new THREE.Mesh(bodyGeo, bodyMat));
-
-    for (let i = -1; i <= 1; i++) {
-      const antGeo = new THREE.CylinderGeometry(0.015, 0.015, 0.35);
-      const antMat = new THREE.MeshStandardMaterial({ color: 0x606068, roughness: 0.3, metalness: 0.6, emissive: 0x101018, emissiveIntensity: 0.15 });
-      const ant = new THREE.Mesh(antGeo, antMat);
-      ant.position.set(i * 0.2, 0.24, 0);
-      ant.rotation.z = i * 0.15;
-      this._routerGroup.add(ant);
-    }
-
-    const ledGeo = new THREE.SphereGeometry(0.025);
-    this._routerLed = new THREE.Mesh(ledGeo, new THREE.MeshBasicMaterial({ color: C.greenGlow }));
-    this._routerLed.position.set(0.22, 0.07, 0.18);
-    this._routerGroup.add(this._routerLed);
-
-    this._routerLight = new THREE.PointLight(C.blueSignal, 1.2, 8);
-    this._routerLight.position.set(0, 0.3, 0);
-    this._routerGroup.add(this._routerLight);
-
-    this._scene.add(this._routerGroup);
+  _buildTopologyDevices() {
+    this._topologyGroup = new THREE.Group();
+    this._linkGroup = new THREE.Group();
+    this._deviceMeshes = new Map();
+    this._linkMeshes = new Map();
+    this._wifiWaves = [];
+    this._scene.add(this._linkGroup);
+    this._scene.add(this._topologyGroup);
   }
 
   // ---- WiFi Waves ----
 
   _buildWifiWaves() {
     this._wifiWaves = [];
-    for (let i = 0; i < 5; i++) {
-      const radius = 0.8 + i * 1.0;
-      const geo = new THREE.SphereGeometry(radius, 24, 16, 0, Math.PI * 2, 0, Math.PI * 0.6);
-      const mat = new THREE.MeshBasicMaterial({
-        color: C.blueSignal,
-        transparent: true, opacity: 0,
-        side: THREE.DoubleSide,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false, wireframe: true,
+  }
+
+  _ensureWaveSource(id, position, active, scale = 1) {
+    let waves = this._wifiWaves.find(w => w.id === id);
+    if (!waves) {
+      waves = { id, active, shells: [] };
+      for (let i = 0; i < 3; i++) {
+        const radius = (0.6 + i * 0.65) * scale;
+        const geo = new THREE.SphereGeometry(radius, 18, 10, 0, Math.PI * 2, 0, Math.PI * 0.56);
+        const mat = new THREE.MeshBasicMaterial({
+          color: C.blueSignal,
+          transparent: true, opacity: 0,
+          side: THREE.DoubleSide,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false, wireframe: true,
+        });
+        const shell = new THREE.Mesh(geo, mat);
+        this._scene.add(shell);
+        waves.shells.push({ mesh: shell, mat, phase: i * 0.75 });
+      }
+      this._wifiWaves.push(waves);
+    }
+    waves.active = active;
+    for (const shell of waves.shells) {
+      shell.mesh.position.set(position[0], position[1] + 0.15, position[2]);
+      shell.mesh.visible = true;
+    }
+  }
+
+  _defaultEnvironment() {
+    return {
+      room: { dimensions_m: [5.2, 2.6, 4.8] },
+      access_points: [
+        { ap_id: 'ap-1', label: 'Mesh AP 1', position_m: [-2.4, 1.9, -2.0], active: true },
+        { ap_id: 'ap-2', label: 'Mesh AP 2', position_m: [2.4, 1.9, 2.0], active: true },
+      ],
+      nodes: [
+        { node_id: 1, label: 'ESP32-C6 1', position_m: [-2.0, 1.1, -1.6], linked_ap: 'ap-1' },
+        { node_id: 2, label: 'ESP32-C6 2', position_m: [2.0, 1.1, -1.6], linked_ap: 'ap-1' },
+        { node_id: 3, label: 'ESP32-C6 3', position_m: [0.0, 1.1, 2.0], linked_ap: 'ap-2' },
+      ],
+      links: [
+        { link_id: 'ap-1:c6-1', ap_id: 'ap-1', node_id: 1 },
+        { link_id: 'ap-1:c6-2', ap_id: 'ap-1', node_id: 2 },
+        { link_id: 'ap-1:c6-3', ap_id: 'ap-1', node_id: 3 },
+        { link_id: 'ap-2:c6-1', ap_id: 'ap-2', node_id: 1 },
+        { link_id: 'ap-2:c6-2', ap_id: 'ap-2', node_id: 2 },
+        { link_id: 'ap-2:c6-3', ap_id: 'ap-2', node_id: 3 },
+      ],
+    };
+  }
+
+  _fetchEnvironment() {
+    fetch('/api/v1/environment', { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(env => {
+        this._environment = env;
+        this._syncTopology(this._currentData);
+      })
+      .catch(() => {
+        this._environment = this._defaultEnvironment();
+        this._syncTopology(this._currentData);
       });
-      const shell = new THREE.Mesh(geo, mat);
-      shell.position.copy(this._routerGroup.position);
-      shell.position.y += 0.5;
-      this._scene.add(shell);
-      this._wifiWaves.push({ mesh: shell, mat, phase: i * 0.7 });
+  }
+
+  _mergeNodes(liveData) {
+    const env = this._environment || this._defaultEnvironment();
+    const live = new Map((liveData?.nodes || []).map(n => [Number(n.node_id), n]));
+    const nodes = (env.nodes || []).map(cfg => ({
+      ...cfg,
+      ...(live.get(Number(cfg.node_id)) || {}),
+    }));
+    for (const node of liveData?.nodes || []) {
+      if (!nodes.some(n => Number(n.node_id) === Number(node.node_id))) nodes.push(node);
+    }
+    return nodes;
+  }
+
+  _positionOf(entity) {
+    return entity?.position_m || entity?.position || [0, 0, 0];
+  }
+
+  _upsertDevice(key, kind, label, position, active) {
+    let entry = this._deviceMeshes.get(key);
+    if (!entry) {
+      const group = new THREE.Group();
+      const color = kind === 'ap' ? C.blueSignal : C.greenGlow;
+      const bodyGeo = kind === 'ap'
+        ? new THREE.BoxGeometry(0.54, 0.16, 0.34)
+        : new THREE.CylinderGeometry(0.11, 0.11, 0.32, 16);
+      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
+      const body = new THREE.Mesh(bodyGeo, mat);
+      body.castShadow = true;
+      group.add(body);
+
+      if (kind === 'ap') {
+        for (let i = -1; i <= 1; i++) {
+          const ant = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.012, 0.012, 0.38, 8),
+            new THREE.MeshBasicMaterial({ color: 0x9fb6c8, transparent: true, opacity: 0.75 })
+          );
+          ant.position.set(i * 0.16, 0.28, 0);
+          ant.rotation.z = i * 0.18;
+          group.add(ant);
+        }
+      }
+
+      const beacon = new THREE.Mesh(
+        new THREE.SphereGeometry(kind === 'ap' ? 0.055 : 0.045, 16, 12),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1 })
+      );
+      beacon.position.y = kind === 'ap' ? 0.2 : 0.23;
+      group.add(beacon);
+
+      this._topologyGroup.add(group);
+      entry = { group, mat, beacon, label };
+      this._deviceMeshes.set(key, entry);
+    }
+    entry.group.position.set(position[0], position[1], position[2]);
+    entry.mat.opacity = active ? 0.9 : 0.28;
+    entry.beacon.material.opacity = active ? 1 : 0.28;
+    entry.group.visible = true;
+  }
+
+  _upsertLink(key, from, to, active) {
+    let line = this._linkMeshes.get(key);
+    if (!line) {
+      const geo = new THREE.BufferGeometry();
+      const mat = new THREE.LineBasicMaterial({
+        color: active ? C.blueSignal : 0x385060,
+        transparent: true,
+        opacity: active ? 0.55 : 0.16,
+      });
+      line = new THREE.Line(geo, mat);
+      this._linkGroup.add(line);
+      this._linkMeshes.set(key, line);
+    }
+    line.geometry.setFromPoints([
+      new THREE.Vector3(from[0], from[1], from[2]),
+      new THREE.Vector3(to[0], to[1], to[2]),
+    ]);
+    line.material.opacity = active ? 0.55 : 0.16;
+    line.material.color.set(active ? C.blueSignal : 0x385060);
+    line.visible = true;
+  }
+
+  _syncTopology(liveData) {
+    const env = this._environment || this._defaultEnvironment();
+    const nodes = this._mergeNodes(liveData);
+    const nodeById = new Map(nodes.map(n => [Number(n.node_id), n]));
+    const apById = new Map((env.access_points || []).map(ap => [ap.ap_id, ap]));
+    const visibleDevices = new Set();
+    const visibleLinks = new Set();
+
+    for (const ap of env.access_points || []) {
+      const position = this._positionOf(ap);
+      const key = `ap:${ap.ap_id}`;
+      visibleDevices.add(key);
+      this._upsertDevice(key, 'ap', ap.label || ap.ap_id, position, ap.active !== false);
+      this._ensureWaveSource(key, position, ap.active !== false, 1.15);
+    }
+
+    for (const node of nodes) {
+      const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+      const active = Boolean(node.active) && !['offline', 'stale'].includes(status);
+      const position = this._positionOf(node);
+      const key = `node:${node.node_id}`;
+      visibleDevices.add(key);
+      this._upsertDevice(key, 'node', node.label || `C6-${node.node_id}`, position, active);
+      if (active) this._ensureWaveSource(key, position, true, 0.55);
+    }
+
+    for (const link of env.links || []) {
+      const ap = apById.get(link.ap_id);
+      const node = nodeById.get(Number(link.node_id));
+      if (!ap || !node) continue;
+      const nodeStatus = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+      const active = Boolean(node.active) && !['offline', 'stale'].includes(nodeStatus);
+      const key = link.link_id || `${link.ap_id}:c6-${link.node_id}`;
+      visibleLinks.add(key);
+      this._upsertLink(key, this._positionOf(ap), this._positionOf(node), active);
+    }
+
+    for (const [key, entry] of this._deviceMeshes) {
+      if (!visibleDevices.has(key)) entry.group.visible = false;
+    }
+    for (const [key, line] of this._linkMeshes) {
+      if (!visibleLinks.has(key)) line.visible = false;
     }
   }
 
@@ -401,16 +542,11 @@ class Observatory {
           this._autopilot = !this._autopilot;
           this._controls.enabled = !this._autopilot;
           break;
-        case 'd': this._demoData.cycleScenario(); break;
         case 'f':
           this._showFps = !this._showFps;
           document.getElementById('fps-counter').style.display = this._showFps ? 'block' : 'none';
           break;
         case 's': this._hud.toggleSettings(); break;
-        case ' ':
-          e.preventDefault();
-          this._demoData.paused = !this._demoData.paused;
-          break;
       }
     });
   }
@@ -449,7 +585,9 @@ class Observatory {
 
     const tryNext = (i) => {
       if (i >= unique.length) {
-        console.log('[Observatory] No sensing server detected, using demo mode');
+        console.log('[Observatory] No sensing server detected; staying offline');
+        this._hud.updateSourceBadge('offline', null);
+        this._scheduleReconnect();
         return;
       }
       const base = unique[i];
@@ -479,22 +617,58 @@ class Observatory {
       this._ws = new WebSocket(url);
       this._ws.onopen = () => {
         console.log('[Observatory] WebSocket connected');
-        this._hud.updateSourceBadge('ws', this._ws);
+        this._hud.updateSourceBadge('live', this._ws);
       };
-      this._ws.onmessage = (evt) => { try { this._liveData = JSON.parse(evt.data); } catch {} };
+      this._ws.onmessage = (evt) => {
+        try {
+          this._liveData = JSON.parse(evt.data);
+          this._lastLiveAt = performance.now();
+          this._syncTopology(this._liveData);
+        } catch {}
+      };
       this._ws.onclose = () => {
-        console.log('[Observatory] WebSocket closed, falling back to demo');
+        console.log('[Observatory] WebSocket closed; stream offline');
         this._ws = null;
-        this.settings.dataSource = 'demo';
-        this._hud.updateSourceBadge('demo', null);
+        this._hud.updateSourceBadge('offline', null);
+        this._scheduleReconnect();
       };
       this._ws.onerror = () => {};
     } catch {}
   }
 
+  _scheduleReconnect() {
+    if (this._wsReconnectTimer) return;
+    this._wsReconnectTimer = window.setTimeout(() => {
+      this._wsReconnectTimer = null;
+      this._autoDetectLive();
+    }, 3000);
+  }
+
   _disconnectWS() {
     if (this._ws) { this._ws.close(); this._ws = null; }
     this._liveData = null;
+  }
+
+  _emptyLiveFrame() {
+    return {
+      msg_type: 'sensing_update',
+      source: 'offline',
+      nodes: this._mergeNodes(null),
+      persons: [],
+      estimated_persons: 0,
+      features: {
+        mean_rssi: 0,
+        variance: 0,
+        motion_band_power: 0,
+      },
+      classification: {
+        presence: false,
+        motion_level: 'absent',
+        confidence: 0,
+      },
+      signal_field: null,
+      vital_signs: null,
+    };
   }
 
   // ========================================
@@ -506,28 +680,21 @@ class Observatory {
     const dt = Math.min(this._clock.getDelta(), 0.1);
     const elapsed = this._clock.getElapsedTime();
 
-    // Data source
-    if (this.settings.dataSource === 'ws' && this._liveData) {
-      this._currentData = this._liveData;
-    } else {
-      this._currentData = this._demoData.update(dt);
-    }
+    // Live data only. Without WebSocket frames the scene remains in a real
+    // offline state instead of fabricating movement.
+    this._currentData = this._liveData || this._emptyLiveFrame();
     const data = this._currentData;
 
     // Updates
     this._nebula.update(dt, elapsed);
     this._figurePool.update(data, elapsed);
-    this._scenarioProps.update(data, this._demoData.currentScenario);
     this._updateDotMatrixMist(data, elapsed);
     this._updateParticleTrail(data, dt, elapsed);
+    this._syncTopology(data);
     this._updateWifiWaves(elapsed);
     this._updateSignalField(data);
-    this._hud.updateHUD(data, this._demoData);
+    this._hud.updateHUD(data);
     this._hud.updateSparkline(data);
-
-    // Router LED
-    this._routerLed.material.opacity = 0.5 + 0.5 * Math.sin(elapsed * 8);
-    this._routerLight.intensity = 0.3 + 0.2 * Math.sin(elapsed * 3);
 
     // Autopilot orbit
     if (this._autopilot) {
@@ -641,13 +808,16 @@ class Observatory {
   // ---- WiFi Waves ----
 
   _updateWifiWaves(elapsed) {
-    for (const w of this._wifiWaves) {
-      const t = (elapsed * 0.8 + w.phase) % 4.5;
-      const life = t / 4.5;
-      w.mat.opacity = Math.max(0, this.settings.waves * 0.25 * (1 - life));
-      const scale = 1 + life * 0.6;
-      w.mesh.scale.set(scale, scale, scale);
-      w.mesh.rotation.y = elapsed * 0.05;
+    for (const source of this._wifiWaves) {
+      for (const w of source.shells) {
+        const t = (elapsed * 0.8 + w.phase) % 4.5;
+        const life = t / 4.5;
+        const activity = source.active ? 1 : 0.22;
+        w.mat.opacity = Math.max(0, this.settings.waves * 0.22 * activity * (1 - life));
+        const scale = 1 + life * 0.7;
+        w.mesh.scale.set(scale, scale, scale);
+        w.mesh.rotation.y = elapsed * 0.05;
+      }
     }
   }
 
