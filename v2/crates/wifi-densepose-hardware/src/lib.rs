@@ -40,6 +40,8 @@ mod csi_frame;
 mod error;
 pub mod esp32;
 mod esp32_parser;
+#[cfg(feature = "serial-reconnect")]
+pub mod serial_reconnect;
 pub mod sync_packet;
 
 // ADR-081: Rust mirror of the firmware radio abstraction layer (L1) and
@@ -55,6 +57,16 @@ pub use esp32_parser::{
     ruview_sibling_packet_name, Esp32CsiParser, ESP32_CSI_MAGIC, RUVIEW_COMPRESSED_CSI_MAGIC,
     RUVIEW_FEATURE_MAGIC, RUVIEW_FEATURE_STATE_MAGIC, RUVIEW_FUSED_VITALS_MAGIC,
     RUVIEW_TEMPORAL_MAGIC, RUVIEW_VITALS_MAGIC,
+};
+#[cfg(feature = "serial-reconnect")]
+pub use serial_reconnect::{
+    SerialPortFactory, SerialPortHandle, SerialReconnectConfig, SerialReconnectError,
+    SerialReconnectEvent, SerialReconnectStats, SerialReconnectSupervisor,
+    SystemSerialPortFactory,
+};
+#[cfg(all(feature = "serial-reconnect", feature = "serial-reconnect-testkit"))]
+pub use serial_reconnect::{
+    FakeOpenAction, FakeReadAction, FakeSerialPort, FakeSerialPortFactory,
 };
 pub use sync_packet::{
     SyncPacket, SyncPacketFlags, SYNC_PACKET_MAGIC, SYNC_PACKET_SIZE, SYNC_PACKET_PROTO_VER,

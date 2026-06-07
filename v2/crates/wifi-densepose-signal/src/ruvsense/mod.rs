@@ -72,13 +72,17 @@ pub mod rf_slam;
 
 // ADR-135: Empty-room baseline calibration (Welford online, circular phase)
 pub mod calibration;
+pub mod calibration_drift;
 
 // Re-export core types for ergonomic access
-pub use coherence::CoherenceState;
-pub use coherence_gate::{GateDecision, GatePolicy};
 pub use array_coordinator::{
     ArrayCoordinator, ArrayCoordinatorConfig, ArrayNodeInput, DirectionalEvidence,
 };
+pub use calibration_drift::{
+    CalibrationDriftConfig, CalibrationDriftDecision, CalibrationDriftDetector,
+};
+pub use coherence::CoherenceState;
+pub use coherence_gate::{GateDecision, GatePolicy};
 pub use evolution::{
     ChangePoint, EvolutionTracker, TemporalVoxel, TemporalVoxelMap, VoxelGate, VoxelPrivacy,
 };

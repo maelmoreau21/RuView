@@ -73,6 +73,10 @@ pub use ruvsense::calibration::{
     BaselineCalibration, CalibrationConfig, CalibrationDeviationScore, CalibrationError,
     CalibrationRecorder, PhyTier, SubcarrierBaseline,
 };
+pub use ruvsense::calibration_drift;
+pub use ruvsense::calibration_drift::{
+    CalibrationDriftConfig, CalibrationDriftDecision, CalibrationDriftDetector,
+};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

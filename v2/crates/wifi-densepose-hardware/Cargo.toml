@@ -20,6 +20,10 @@ esp32 = []
 intel5300 = []
 # Enable Linux WiFi interface for commodity sensing (ADR-013)
 linux-wifi = []
+# Enable blocking serial hot-plug supervision with reopen/backoff.
+serial-reconnect = ["std", "dep:serialport"]
+# Test helper types for downstream serial reconnect tests; never enabled by default.
+serial-reconnect-testkit = ["serial-reconnect"]
 
 [dependencies]
 # CLI argument parsing (for bin/aggregator)
@@ -38,6 +42,9 @@ tracing = "0.1"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Serial hot-plug supervision
+serialport = { workspace = true, optional = true }
 
 # QUIC transport (ADR-032a)
 midstreamer-quic = { workspace = true }

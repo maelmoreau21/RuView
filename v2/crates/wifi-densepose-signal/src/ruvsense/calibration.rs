@@ -255,9 +255,16 @@ impl BaselineCalibration {
         }
         let amplitude_z_median = median_abs(&z_amp);
         let amplitude_z_max = z_amp.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let drift_score = mean_square(&z_amp);
         let phase_drift_median = median_slice(&phase_drift);
         let motion_flagged = amplitude_z_median > 2.0 || phase_drift_median > std::f32::consts::PI / 6.0;
-        Ok(CalibrationDeviationScore { amplitude_z_median, amplitude_z_max, phase_drift_median, motion_flagged })
+        Ok(CalibrationDeviationScore {
+            amplitude_z_median,
+            amplitude_z_max,
+            phase_drift_median,
+            drift_score,
+            motion_flagged,
+        })
     }
 
     /// Deterministic calibration epoch id (ADR-137 `CalibrationId`), derived
@@ -414,6 +421,8 @@ pub struct CalibrationDeviationScore {
     pub amplitude_z_max: f32,
     /// Median circular distance (radians) between live and baseline phase.
     pub phase_drift_median: f32,
+    /// Mean squared amplitude z-score across active subcarriers.
+    pub drift_score: f32,
     /// Heuristic: `amplitude_z_median > 2.0 || phase_drift_median > π/6`.
     pub motion_flagged: bool,
 }
@@ -468,9 +477,16 @@ impl CalibrationRecorder {
         }
         let amplitude_z_median = median_slice(&z_amp_abs);
         let amplitude_z_max = z_amp_abs.iter().copied().fold(0.0_f32, f32::max);
+        let drift_score = mean_square(&z_amp_abs);
         let phase_drift_median = median_slice(&phase_drift);
         let motion_flagged = amplitude_z_median > 2.0 || phase_drift_median > std::f32::consts::PI / 6.0;
-        Ok(CalibrationDeviationScore { amplitude_z_median, amplitude_z_max, phase_drift_median, motion_flagged })
+        Ok(CalibrationDeviationScore {
+            amplitude_z_median,
+            amplitude_z_max,
+            phase_drift_median,
+            drift_score,
+            motion_flagged,
+        })
     }
 
     /// Number of frames recorded so far.
@@ -546,6 +562,13 @@ fn median_in_place(v: &mut Vec<f32>) -> f32 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = v.len() / 2;
     if v.len() % 2 == 0 { (v[mid - 1] + v[mid]) / 2.0 } else { v[mid] }
+}
+
+fn mean_square(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32
 }
 
 /// Current Unix timestamp in seconds. Falls back to 0 if unavailable.

@@ -19,6 +19,7 @@ mod rvf_container;
 mod rvf_pipeline;
 mod tracker_bridge;
 pub mod types;
+mod udp_jitter;
 mod vital_signs;
 
 // Training pipeline modules (exposed via lib.rs)
@@ -44,6 +45,7 @@ use axum::{
 use clap::Parser;
 
 use axum::http::HeaderValue;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
@@ -859,6 +861,12 @@ fn active_node_count(s: &AppStateInner, now: std::time::Instant) -> usize {
         .count()
 }
 
+fn record_pose_latency(s: &mut AppStateInner, started: std::time::Instant) {
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    s.latest_pose_latency_ms = elapsed_ms;
+    s.pose_latency_p95_ms.push(elapsed_ms);
+}
+
 fn fleet_ready(s: &AppStateInner, now: std::time::Instant) -> bool {
     active_node_count(s, now) >= s.min_nodes
 }
@@ -1441,7 +1449,8 @@ fn default_enabled_modules() -> Vec<String> {
 }
 
 /// Physical room profile used by the 3D console and calibration UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RoomConfig {
     pub name: String,
     pub dimensions_m: [f64; 3],
@@ -1449,7 +1458,8 @@ pub(crate) struct RoomConfig {
 }
 
 /// Configured WiFi mesh AP anchor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AccessPointConfig {
     pub ap_id: String,
     pub label: String,
@@ -1463,7 +1473,8 @@ pub(crate) struct AccessPointConfig {
 }
 
 /// Configured ESP32-C6 sensing node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnvironmentNodeConfig {
     pub node_id: u8,
     pub label: String,
@@ -1476,7 +1487,8 @@ pub(crate) struct EnvironmentNodeConfig {
 }
 
 /// Configured AP-to-node RF link.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnvironmentLinkConfig {
     pub link_id: String,
     pub ap_id: String,
@@ -1484,7 +1496,8 @@ pub(crate) struct EnvironmentLinkConfig {
 }
 
 /// Persisted topology for the production console.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnvironmentConfig {
     pub room: RoomConfig,
     pub access_points: Vec<AccessPointConfig>,
@@ -1519,7 +1532,8 @@ impl Default for EnvironmentConfig {
 }
 
 /// Runtime configuration that persists across server restarts via `data/config.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeConfig {
     /// Divisor for multi-node person-count deduplication (sum / factor).
     #[serde(default = "default_dedup_factor")]
@@ -1548,19 +1562,6 @@ fn normalize_runtime_config(mut config: RuntimeConfig) -> RuntimeConfig {
         config.enabled_modules = default_enabled_modules();
     }
 
-    let valid_module_ids: HashSet<String> = {
-        let empty = HashSet::new();
-        business_modules(0, &empty)
-            .into_iter()
-            .filter_map(|module| {
-                module
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            })
-            .collect()
-    };
-    config.enabled_modules.retain(|id| valid_module_ids.contains(id));
     config.enabled_modules.sort();
     config.enabled_modules.dedup();
 
@@ -1568,26 +1569,94 @@ fn normalize_runtime_config(mut config: RuntimeConfig) -> RuntimeConfig {
     config
 }
 
+fn valid_module_ids() -> HashSet<String> {
+    let empty = HashSet::new();
+    business_modules(0, &empty)
+        .into_iter()
+        .filter_map(|module| {
+            module
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), String> {
+    if !config.dedup_factor.is_finite() || !(1.0..=10.0).contains(&config.dedup_factor) {
+        return Err("dedup_factor must be a finite value in [1.0, 10.0]".to_string());
+    }
+    if config.module_config_version > MODULE_CONFIG_VERSION {
+        return Err(format!(
+            "unsupported module_config_version {} (max {})",
+            config.module_config_version, MODULE_CONFIG_VERSION
+        ));
+    }
+    validate_environment(&config.environment)?;
+
+    let valid_module_ids = valid_module_ids();
+    for id in &config.enabled_modules {
+        if !valid_module_ids.contains(id) {
+            return Err(format!("unknown enabled module id '{id}'"));
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn runtime_config_schema() -> schemars::schema::RootSchema {
+    schemars::schema_for!(RuntimeConfig)
+}
+
 /// Load persisted runtime config from `<data_dir>/config.json`.
-/// Falls back to [`RuntimeConfig::default`] if the file is absent or malformed.
-pub(crate) fn load_runtime_config(data_dir: &std::path::Path) -> RuntimeConfig {
+/// Falls back to [`RuntimeConfig::default`] only when the file is absent.
+pub(crate) fn load_runtime_config(data_dir: &std::path::Path) -> Result<RuntimeConfig, String> {
     let path = data_dir.join("config.json");
     match std::fs::read_to_string(&path) {
-        Ok(json) => normalize_runtime_config(serde_json::from_str(&json).unwrap_or_default()),
-        Err(_) => RuntimeConfig::default(),
+        Ok(json) => {
+            let parsed: RuntimeConfig = serde_json::from_str(&json)
+                .map_err(|e| format!("{}: JSON schema parse error: {e}", path.display()))?;
+            validate_runtime_config(&parsed)
+                .map_err(|e| format!("{}: invalid runtime config: {e}", path.display()))?;
+            Ok(normalize_runtime_config(parsed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RuntimeConfig::default()),
+        Err(e) => Err(format!("{}: failed to read runtime config: {e}", path.display())),
     }
 }
 
 /// Persist runtime config to `<data_dir>/config.json`.
-pub(crate) fn save_runtime_config(data_dir: &std::path::Path, config: &RuntimeConfig) {
+pub(crate) fn save_runtime_config(
+    data_dir: &std::path::Path,
+    config: &RuntimeConfig,
+) -> Result<(), String> {
+    validate_runtime_config(config)?;
     let path = data_dir.join("config.json");
-    if let Ok(json) = serde_json::to_string_pretty(config) {
-        if let Err(e) = std::fs::write(&path, json) {
-            warn!("Failed to save runtime config to {}: {e}", path.display());
-        } else {
-            info!("Runtime config saved to {}", path.display());
-        }
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| format!("failed to create {}: {e}", data_dir.display()))?;
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("failed to serialize runtime config: {e}"))?;
+    let tmp_path = data_dir.join("config.json.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("failed to create {}: {e}", tmp_path.display()))?;
+        use std::io::Write as _;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
+        file.write_all(b"\n")
+            .map_err(|e| format!("failed to finalize {}: {e}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to sync {}: {e}", tmp_path.display()))?;
     }
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to save runtime config to {}: {e}",
+            path.display()
+        ));
+    }
+    info!("Runtime config saved to {}", path.display());
+    Ok(())
 }
 
 async fn init_sqlite_store(data_dir: &std::path::Path) -> anyhow::Result<()> {
@@ -1735,6 +1804,8 @@ struct AppStateInner {
     /// Per-node sensing state for multi-node deployments.
     /// Keyed by `node_id` from the ESP32 frame header.
     node_states: HashMap<u8, NodeState>,
+    /// Per-node UDP jitter/re-sequencing counters keyed by ESP32 node id.
+    udp_jitter_stats: HashMap<u8, udp_jitter::NodeJitterSnapshot>,
     /// Access points currently visible to the Raspberry Pi master.
     detected_access_points: Vec<AccessPointObservation>,
     /// Wireless interface used for Pi-side AP discovery.
@@ -1757,6 +1828,10 @@ struct AppStateInner {
     pub(crate) p95_motion_band_power: RollingP95,
     /// Rolling P95 of `FeatureInfo.spectral_power` over the last ~30 s.
     pub(crate) p95_spectral_power: RollingP95,
+    /// Latest pose/model processing latency observed in the live update path.
+    latest_pose_latency_ms: f64,
+    /// Rolling P95 of pose/model processing latency.
+    pose_latency_p95_ms: RollingP95,
     // ── ADR-044 §5.3: runtime-configurable dedup factor ───────────────────────
     /// Divisor for multi-node person-count deduplication (sum / factor).
     /// Default 3.0 (one body visible to ~3 nodes on average).
@@ -3208,6 +3283,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         };
 
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
+        let pose_started = std::time::Instant::now();
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
         let persons = persons_for_update(
@@ -3217,6 +3293,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             &mut last_tracker_instant,
         );
         s.last_tracker_instant = last_tracker_instant;
+        record_pose_latency(&mut s, pose_started);
         if !persons.is_empty() {
             update.persons = Some(persons);
         }
@@ -3364,6 +3441,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         node_features: None,
     };
 
+    let pose_started = std::time::Instant::now();
     let raw_persons = derive_pose_from_sensing(&update);
     let mut last_tracker_instant = s.last_tracker_instant.take();
     let persons = persons_for_update(
@@ -3373,6 +3451,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         &mut last_tracker_instant,
     );
     s.last_tracker_instant = last_tracker_instant;
+    record_pose_latency(&mut s, pose_started);
     if !persons.is_empty() {
         update.persons = Some(persons);
     }
@@ -6319,15 +6398,13 @@ async fn environment_update_endpoint(
         ));
     }
 
-    let mut s = state.write().await;
-    s.environment = environment.clone();
-    apply_environment_node_positions(&mut s.multistatic_fuser, &environment);
+    let s = state.read().await;
     let data_dir = s.data_dir.clone();
     let dedup_factor = s.dedup_factor;
     let enabled_modules = s.enabled_modules.iter().cloned().collect();
     drop(s);
 
-    save_runtime_config(
+    if let Err(message) = save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor,
@@ -6335,7 +6412,16 @@ async fn environment_update_endpoint(
             module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
-    );
+    ) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        ));
+    }
+
+    let mut s = state.write().await;
+    s.environment = environment.clone();
+    apply_environment_node_positions(&mut s.multistatic_fuser, &environment);
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -6689,14 +6775,15 @@ async fn module_enabled_update_endpoint(
         ));
     }
 
-    let mut s = state.write().await;
+    let s = state.read().await;
+    let mut next_enabled_modules = s.enabled_modules.clone();
     if body.enabled {
-        s.enabled_modules.insert(id.clone());
+        next_enabled_modules.insert(id.clone());
     } else {
-        s.enabled_modules.remove(&id);
+        next_enabled_modules.remove(&id);
     }
     let active_nodes = active_node_count(&s, std::time::Instant::now());
-    let modules = business_modules(active_nodes, &s.enabled_modules);
+    let modules = business_modules(active_nodes, &next_enabled_modules);
     let module = modules
         .into_iter()
         .find(|module| module.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
@@ -6704,10 +6791,10 @@ async fn module_enabled_update_endpoint(
     let data_dir = s.data_dir.clone();
     let dedup_factor = s.dedup_factor;
     let environment = s.environment.clone();
-    let enabled_modules = s.enabled_modules.iter().cloned().collect();
+    let enabled_modules = next_enabled_modules.iter().cloned().collect();
     drop(s);
 
-    save_runtime_config(
+    if let Err(message) = save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor,
@@ -6715,7 +6802,15 @@ async fn module_enabled_update_endpoint(
             module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
-    );
+    ) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        ));
+    }
+
+    let mut s = state.write().await;
+    s.enabled_modules = next_enabled_modules;
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -6744,6 +6839,101 @@ async fn calibration_overview_endpoint(
             "status": "/api/v1/calibration/status"
         }
     }))
+}
+
+fn append_udp_jitter_prometheus_metrics(
+    body: &mut String,
+    stats_by_node: &HashMap<u8, udp_jitter::NodeJitterSnapshot>,
+) {
+    use std::fmt::Write;
+
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_csi_frames_total CSI frames emitted by the UDP jitter buffer"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_csi_frames_total counter");
+    for (&id, stats) in stats_by_node {
+        let _ = writeln!(
+            body,
+            "ruvsense_csi_frames_total{{node=\"{id}\",kind=\"live\"}} {}",
+            stats.emitted_live_total
+        );
+        let _ = writeln!(
+            body,
+            "ruvsense_csi_frames_total{{node=\"{id}\",kind=\"interpolated\"}} {}",
+            stats.interpolated_total
+        );
+    }
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_udp_packets_dropped_total CSI packet gaps or stale duplicates dropped by the UDP jitter buffer"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_udp_packets_dropped_total counter");
+    for (&id, stats) in stats_by_node {
+        let _ = writeln!(
+            body,
+            "ruvsense_udp_packets_dropped_total{{node=\"{id}\",reason=\"missing_gap\"}} {}",
+            stats.missing_dropped_total
+        );
+        let _ = writeln!(
+            body,
+            "ruvsense_udp_packets_dropped_total{{node=\"{id}\",reason=\"late_or_duplicate\"}} {}",
+            stats.late_or_duplicate_total
+        );
+    }
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_node_dropped_packet_ratio Dropped CSI packet ratio per ESP32 node"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_node_dropped_packet_ratio gauge");
+    for (&id, stats) in stats_by_node {
+        let _ = writeln!(
+            body,
+            "ruvsense_node_dropped_packet_ratio{{node=\"{id}\"}} {:.6}",
+            stats.dropped_ratio()
+        );
+    }
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_udp_reordered_frames_total Out-of-order CSI frames recovered by the UDP jitter buffer"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_udp_reordered_frames_total counter");
+    for (&id, stats) in stats_by_node {
+        let _ = writeln!(
+            body,
+            "ruvsense_udp_reordered_frames_total{{node=\"{id}\"}} {}",
+            stats.reordered_total
+        );
+    }
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_udp_jitter_buffer_depth Current queued CSI frames in the UDP jitter buffer"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_udp_jitter_buffer_depth gauge");
+    for (&id, stats) in stats_by_node {
+        let _ = writeln!(
+            body,
+            "ruvsense_udp_jitter_buffer_depth{{node=\"{id}\"}} {}",
+            stats.buffer_depth
+        );
+    }
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_udp_jitter_hold_ms Latest and max jitter-buffer hold time"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_udp_jitter_hold_ms gauge");
+    for (&id, stats) in stats_by_node {
+        let _ = writeln!(
+            body,
+            "ruvsense_udp_jitter_hold_ms{{node=\"{id}\",kind=\"latest\"}} {}",
+            stats.last_hold_ms
+        );
+        let _ = writeln!(
+            body,
+            "ruvsense_udp_jitter_hold_ms{{node=\"{id}\",kind=\"max\"}} {}",
+            stats.max_hold_ms
+        );
+    }
 }
 
 async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl IntoResponse {
@@ -6804,6 +6994,42 @@ async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl I
         let active = if is_node_active(ns, now) { 1 } else { 0 };
         let _ = writeln!(body, "ruvsense_node_active{{node=\"{id}\"}} {active}");
     }
+    append_udp_jitter_prometheus_metrics(&mut body, &s.udp_jitter_stats);
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_neural_inference_latency_ms Latest and P95 pose/model processing latency"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_neural_inference_latency_ms gauge");
+    let _ = writeln!(
+        body,
+        "ruvsense_neural_inference_latency_ms{{quantile=\"latest\"}} {:.3}",
+        s.latest_pose_latency_ms
+    );
+    let p95 = s.pose_latency_p95_ms.current().unwrap_or(0.0);
+    let _ = writeln!(
+        body,
+        "ruvsense_neural_inference_latency_ms{{quantile=\"p95\"}} {:.3}",
+        p95
+    );
+    let active_tracking_zones = s
+        .latest_update
+        .as_ref()
+        .and_then(|u| u.persons.as_ref())
+        .map(|persons| {
+            persons
+                .iter()
+                .filter(|person| person.confidence > 0.0)
+                .map(|person| person.zone.as_str())
+                .collect::<HashSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_active_tracking_zones Active tracking zones with live person tracks"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_active_tracking_zones gauge");
+    let _ = writeln!(body, "ruvsense_active_tracking_zones {active_tracking_zones}");
 
     (
         [(
@@ -6847,6 +7073,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
     };
 
     let mut buf = [0u8; 2048];
+    let mut jitter = udp_jitter::UdpJitterBuffer::default();
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, src)) => {
@@ -7044,7 +7271,12 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-                        source: "esp32".to_string(),
+                        source: if is_live_frame {
+                            "esp32"
+                        } else {
+                            "esp32:interpolated"
+                        }
+                        .to_string(),
                         tick,
                         nodes: active_nodes,
                         features: fused_features.clone(),
@@ -7087,6 +7319,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         node_features: build_node_features(&s.node_states, now),
                     };
 
+                    let pose_started = std::time::Instant::now();
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
                     let persons = persons_for_update(
@@ -7096,6 +7329,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         &mut last_tracker_instant,
                     );
                     s.last_tracker_instant = last_tracker_instant;
+                    record_pose_latency(&mut s, pose_started);
                     if !persons.is_empty() {
                         update.persons = Some(persons);
                     }
@@ -7218,14 +7452,34 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                 }
 
                 if let Some(frame) = parse_esp32_frame(&buf[..len]) {
-                    debug!(
-                        "ESP32 frame from {src}: node={}, subs={}, seq={}",
-                        frame.node_id, frame.n_subcarriers, frame.sequence
-                    );
+                    let jitter_node_id = frame.node_id;
+                    let delivered_frames = jitter.push(frame, std::time::Instant::now());
+                    if delivered_frames.is_empty() {
+                        if let Some(stats) = jitter.snapshot(jitter_node_id) {
+                            state
+                                .write()
+                                .await
+                                .udp_jitter_stats
+                                .insert(jitter_node_id, stats);
+                        }
+                    }
+                    for delivered in delivered_frames {
+                        let frame = delivered.frame;
+                        let is_live_frame = delivered.kind == udp_jitter::FrameKind::Live;
+                        let jitter_snapshot = jitter.snapshot(frame.node_id);
+                        debug!(
+                            "ESP32 frame from {src}: node={}, subs={}, seq={}",
+                            frame.node_id, frame.n_subcarriers, frame.sequence
+                        );
 
                     let mut s = state.write().await;
-                    s.source = "esp32".to_string();
-                    s.last_esp32_frame = Some(std::time::Instant::now());
+                    if let Some(stats) = jitter_snapshot {
+                        s.udp_jitter_stats.insert(frame.node_id, stats);
+                    }
+                    if is_live_frame {
+                        s.source = "esp32".to_string();
+                        s.last_esp32_frame = Some(std::time::Instant::now());
+                    }
 
                     // Also maintain global frame_history for backward compat
                     // (simulation path, REST endpoints, etc.).
@@ -7272,7 +7526,9 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     // ADR-110 iter 19 — feed the per-node fps EMA from real
                     // CSI arrivals. The helper sets `last_frame_time` as a
                     // side effect, so the previous bare assignment is gone.
-                    ns.observe_csi_frame_arrival(std::time::Instant::now());
+                    if is_live_frame {
+                        ns.observe_csi_frame_arrival(std::time::Instant::now());
+                    }
                     ns.observe_remote_addr(src);
 
                     // ADR-084 Pass 3: cluster-Pi novelty sensor.
@@ -7411,14 +7667,17 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         0
                     };
 
-                    // Feed field model calibration if active (use per-node history for ESP32).
-                    if let Some(frame_history) = s
-                        .node_states
-                        .get(&node_id)
-                        .map(|ns| ns.frame_history.clone())
-                    {
-                        if let Some(ref mut fm) = s.field_model {
-                            field_bridge::maybe_feed_calibration(fm, &frame_history);
+                    // Feed field model calibration only from live CSI. Interpolated
+                    // frames stabilize runtime DSP but never alter baselines.
+                    if is_live_frame {
+                        if let Some(frame_history) = s
+                            .node_states
+                            .get(&node_id)
+                            .map(|ns| ns.frame_history.clone())
+                        {
+                            if let Some(ref mut fm) = s.field_model {
+                                field_bridge::maybe_feed_calibration(fm, &frame_history);
+                            }
                         }
                     }
 
@@ -7486,6 +7745,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         node_features: build_node_features(&s.node_states, now),
                     };
 
+                    let pose_started = std::time::Instant::now();
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
                     let persons = persons_for_update(
@@ -7495,6 +7755,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         &mut last_tracker_instant,
                     );
                     s.last_tracker_instant = last_tracker_instant;
+                    record_pose_latency(&mut s, pose_started);
                     if !persons.is_empty() {
                         update.persons = Some(persons);
                     }
@@ -7648,6 +7909,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         };
 
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
+        let pose_started = std::time::Instant::now();
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
         let persons = persons_for_update(
@@ -7657,6 +7919,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             &mut last_tracker_instant,
         );
         s.last_tracker_instant = last_tracker_instant;
+        record_pose_latency(&mut s, pose_started);
         if !persons.is_empty() {
             update.persons = Some(persons);
         }
@@ -8573,7 +8836,13 @@ async fn main() {
     );
 
     // ADR-044 §5.3: load persisted runtime config from the data directory.
-    let runtime_config = load_runtime_config(&data_dir);
+    let runtime_config = match load_runtime_config(&data_dir) {
+        Ok(config) => config,
+        Err(message) => {
+            error!("Runtime config validation failed: {message}");
+            std::process::exit(2);
+        }
+    };
     info!(
         "Loaded runtime config: dedup_factor={:.2}, aps={}, nodes={}, enabled_modules={}",
         runtime_config.dedup_factor,
@@ -8721,6 +8990,7 @@ async fn main() {
                     );
                 }),
         node_states: HashMap::new(),
+        udp_jitter_stats: HashMap::new(),
         detected_access_points: Vec::new(),
         wifi_interface: args.wifi_interface.clone(),
         ap_scan_interval_secs: args.ap_scan_interval_secs.max(1),
@@ -8761,6 +9031,8 @@ async fn main() {
         p95_variance: RollingP95::new(600, 60),
         p95_motion_band_power: RollingP95::new(600, 60),
         p95_spectral_power: RollingP95::new(600, 60),
+        latest_pose_latency_ms: 0.0,
+        pose_latency_p95_ms: RollingP95::new(600, 10),
         // ADR-044 §5.3: runtime-configurable dedup factor (persisted).
         dedup_factor: runtime_config.dedup_factor,
         enabled_modules: runtime_config.enabled_modules.iter().cloned().collect(),
@@ -9047,11 +9319,14 @@ async fn main() {
 #[cfg(test)]
 mod topology_console_tests {
     use super::{
-        business_modules, default_dedup_factor, default_enabled_modules, module_status,
-        normalize_runtime_config, topology_nodes_json, topology_readiness_json, EnvironmentConfig,
-        NodeState, RuntimeConfig, ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION,
+        business_modules, default_dedup_factor, default_enabled_modules, load_runtime_config,
+        module_status, normalize_runtime_config, runtime_config_schema, save_runtime_config,
+        topology_nodes_json, topology_readiness_json, validate_runtime_config, AccessPointConfig,
+        EnvironmentConfig, EnvironmentLinkConfig, EnvironmentNodeConfig, NodeState, RoomConfig,
+        RuntimeConfig, ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION,
     };
     use std::collections::HashMap;
+    use std::fs;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -9157,6 +9432,172 @@ mod topology_console_tests {
             .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(enabled, defaults);
+    }
+
+    #[test]
+    fn runtime_config_schema_exposes_strict_top_level_properties() {
+        let schema = runtime_config_schema();
+        let object = schema
+            .schema
+            .object
+            .as_ref()
+            .expect("RuntimeConfig schema should be an object");
+
+        assert!(object.properties.contains_key("dedup_factor"));
+        assert!(object.properties.contains_key("environment"));
+        assert!(object.properties.contains_key("enabled_modules"));
+        assert!(matches!(
+            object.additional_properties.as_deref(),
+            Some(schemars::schema::Schema::Bool(false))
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_config_uses_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let loaded = load_runtime_config(dir.path()).expect("missing config should default");
+
+        assert_eq!(loaded.dedup_factor, default_dedup_factor());
+        assert_eq!(loaded.module_config_version, MODULE_CONFIG_VERSION);
+    }
+
+    #[test]
+    fn malformed_runtime_config_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("config.json"), "{ definitely not json").expect("write");
+
+        let err = load_runtime_config(dir.path()).expect_err("malformed JSON must fail");
+
+        assert!(err.contains("JSON schema parse error"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_unknown_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut value = serde_json::to_value(RuntimeConfig::default()).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("surprise".to_string(), serde_json::json!(true));
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_string_pretty(&value).expect("json"),
+        )
+        .expect("write");
+
+        let err = load_runtime_config(dir.path()).expect_err("unknown fields must fail");
+
+        assert!(err.contains("JSON schema parse error"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_dedup_factor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = RuntimeConfig::default();
+        config.dedup_factor = 0.5;
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_string_pretty(&config).expect("json"),
+        )
+        .expect("write");
+
+        let err = load_runtime_config(dir.path()).expect_err("invalid config must fail");
+
+        assert!(err.contains("dedup_factor"));
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_topology_links() {
+        let mut config = RuntimeConfig::default();
+        config.environment = EnvironmentConfig {
+            room: RoomConfig {
+                name: "test".to_string(),
+                dimensions_m: [4.0, 3.0, 2.8],
+                coordinate_system: "x_right_y_up_z_depth".to_string(),
+            },
+            access_points: vec![AccessPointConfig {
+                ap_id: "ap1".to_string(),
+                label: "AP 1".to_string(),
+                ssid: "lab".to_string(),
+                bssid: None,
+                role: "mesh".to_string(),
+                position_m: [0.0, 2.0, 0.0],
+                channel: Some(6),
+                band: "2.4GHz".to_string(),
+                active: true,
+            }],
+            nodes: vec![EnvironmentNodeConfig {
+                node_id: 1,
+                label: "node 1".to_string(),
+                kind: "esp32-c6".to_string(),
+                zone: "zone_1".to_string(),
+                position_m: [1.0, 1.0, 1.0],
+                tdm_slot: 0,
+                tdm_total: 1,
+                linked_ap: "ap1".to_string(),
+            }],
+            links: vec![EnvironmentLinkConfig {
+                link_id: "bad-link".to_string(),
+                ap_id: "missing-ap".to_string(),
+                node_id: 1,
+            }],
+        };
+
+        let err = validate_runtime_config(&config).expect_err("bad topology must fail");
+
+        assert!(err.contains("unknown AP"));
+    }
+
+    #[test]
+    fn save_runtime_config_rejects_invalid_config_without_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = RuntimeConfig::default();
+        config.enabled_modules.push("not-a-real-module".to_string());
+
+        let err = save_runtime_config(dir.path(), &config).expect_err("invalid save must fail");
+
+        assert!(err.contains("unknown enabled module id"));
+        assert!(!dir.path().join("config.json").exists());
+    }
+}
+
+#[cfg(test)]
+mod prometheus_metrics_tests {
+    use super::{append_udp_jitter_prometheus_metrics, udp_jitter::NodeJitterSnapshot};
+    use std::collections::HashMap;
+
+    #[test]
+    fn udp_jitter_metrics_use_bounded_node_labels_and_ratios() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            9,
+            NodeJitterSnapshot {
+                received_live_total: 4,
+                emitted_live_total: 3,
+                interpolated_total: 1,
+                reordered_total: 2,
+                missing_dropped_total: 1,
+                late_or_duplicate_total: 1,
+                buffer_depth: 2,
+                last_hold_ms: 7,
+                max_hold_ms: 15,
+            },
+        );
+
+        let mut body = String::new();
+        append_udp_jitter_prometheus_metrics(&mut body, &stats);
+
+        assert!(body.contains("ruvsense_csi_frames_total{node=\"9\",kind=\"live\"} 3"));
+        assert!(
+            body.contains("ruvsense_csi_frames_total{node=\"9\",kind=\"interpolated\"} 1")
+        );
+        assert!(
+            body.contains("ruvsense_udp_packets_dropped_total{node=\"9\",reason=\"missing_gap\"} 1")
+        );
+        assert!(body.contains("ruvsense_node_dropped_packet_ratio{node=\"9\"} 0.400000"));
+        assert!(body.contains("ruvsense_udp_jitter_hold_ms{node=\"9\",kind=\"max\"} 15"));
+        assert!(!body.contains("COM"));
+        assert!(!body.contains('\n') || body.lines().all(|line| !line.contains("metric 1")));
     }
 }
 
@@ -9578,13 +10019,12 @@ async fn config_set_dedup_factor(
 ) -> Json<serde_json::Value> {
     let value = body.get("value").and_then(|v| v.as_f64()).unwrap_or(3.0);
     let clamped = value.clamp(1.0, 10.0);
-    let mut s = state.write().await;
-    s.dedup_factor = clamped;
+    let s = state.read().await;
     let data_dir = s.data_dir.clone();
     let environment = s.environment.clone();
     let enabled_modules = s.enabled_modules.iter().cloned().collect();
     drop(s);
-    save_runtime_config(
+    if let Err(message) = save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor: clamped,
@@ -9592,7 +10032,14 @@ async fn config_set_dedup_factor(
             module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
-    );
+    ) {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": message,
+        }));
+    }
+    let mut s = state.write().await;
+    s.dedup_factor = clamped;
     Json(serde_json::json!({
         "status": "ok",
         "dedup_factor": clamped,
@@ -9613,7 +10060,7 @@ async fn config_set_ground_truth(
         Some(n) if n > 0 => n as usize,
         _ => return Json(serde_json::json!({"error": "count must be a positive integer"})),
     };
-    let mut s = state.write().await;
+    let s = state.read().await;
     let raw_sum: usize = s
         .node_states
         .values()
@@ -9630,12 +10077,11 @@ async fn config_set_ground_truth(
         3.0
     };
     let clamped = optimal.clamp(1.0, 10.0);
-    s.dedup_factor = clamped;
     let data_dir = s.data_dir.clone();
     let environment = s.environment.clone();
     let enabled_modules = s.enabled_modules.iter().cloned().collect();
     drop(s);
-    save_runtime_config(
+    if let Err(message) = save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor: clamped,
@@ -9643,7 +10089,14 @@ async fn config_set_ground_truth(
             module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
-    );
+    ) {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": message,
+        }));
+    }
+    let mut s = state.write().await;
+    s.dedup_factor = clamped;
     Json(serde_json::json!({
         "status": "ok",
         "ground_truth": ground_truth,
