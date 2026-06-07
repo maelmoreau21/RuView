@@ -2,6 +2,7 @@ const state = {
   topology: null,
   modules: [],
   vitals: null,
+  edgeVitals: null,
   calibration: null,
   latest: null,
   ws: null,
@@ -87,6 +88,14 @@ async function fetchJson(path, options) {
   return response.json();
 }
 
+async function setModuleEnabled(id, enabled) {
+  return fetchJson(`/api/v1/modules/${encodeURIComponent(id)}/enabled`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 function topologyRoom() {
   return state.topology?.room || { name: 'primary', dimensions_m: [5.2, 2.6, 4.8] };
 }
@@ -124,7 +133,7 @@ function renderStatus() {
   const topology = state.topology;
   const readiness = topology?.readiness || {};
   const activeNodes = Number(readiness.active_nodes || topology?.nodes?.length || 0);
-  const aps = Array.isArray(topology?.access_points) ? topology.access_points.length : 0;
+  const enabledModules = state.modules.filter((mod) => mod.enabled !== false).length;
   const ready = Boolean(readiness.ready);
   const fusion = text(readiness.fusion_mode, 'offline');
   const source = text(topology?.source, 'offline');
@@ -138,7 +147,7 @@ function renderStatus() {
     master.querySelector('strong').textContent = ready ? 'ready' : activeNodes > 0 ? 'limited' : 'offline';
   }
   setText('active-nodes', `${activeNodes}/${Number(readiness.min_nodes || 1)}`);
-  setText('ap-count', String(aps));
+  setText('enabled-modules', String(enabledModules));
   setText('fusion-mode', fusion);
   setText('source-mode', source);
   setText('scan-interface', text(topology?.wifi_scan?.interface, 'wlan0'));
@@ -153,11 +162,11 @@ function marker(kind, item, compact) {
   const p = pointToStage(pos);
   const label = kind === 'ap'
     ? text(item.ssid || item.label || item.bssid, 'Hidden AP')
-    : text(item.label || `C6-${item.node_id}`, `C6-${item.node_id}`);
+    : text(item.display_label || item.label || `C6-${item.node_id}`, `C6-${item.node_id}`);
   const detail = kind === 'ap'
     ? `${fmtDbm(item.rssi_dbm)} / ch ${text(item.channel)}`
-    : `${fmtHz(item.frame_rate_hz)} / ${fmtDbm(item.rssi_dbm)}`;
-  const el = create('div', `topology-marker ${kind} ${statusClass(pos.source)}${compact ? ' compact' : ''}`);
+    : `${text(item.health_status || item.status, 'offline')} / ${fmtDbm(item.rssi_dbm)}`;
+  const el = create('div', `topology-marker ${kind} ${statusClass(item.health_status || item.status || pos.source)} ${statusClass(pos.source)}${compact ? ' compact' : ''}`);
   el.style.left = `${p.left}%`;
   el.style.top = `${p.top}%`;
   el.title = `${label} / ${pos.source} / confidence ${fmtPct(pos.confidence)}`;
@@ -193,7 +202,7 @@ function renderTopology() {
   const compact = nodes.length > 24 || window.innerWidth < 520;
 
   if (!aps.length && !nodes.length) {
-    stage.append(emptyRow('Aucun AP ou ESP32-C6 live vu par le master'));
+    stage.append(emptyRow('Aucun ESP32-C6 vu par le master'));
     return;
   }
 
@@ -224,21 +233,22 @@ function renderFleet() {
   clear(apList);
 
   if (!nodes.length) {
-    nodeList?.append(emptyRow('Aucun ESP32-C6 live'));
+    nodeList?.append(emptyRow('Aucun ESP32-C6 vu par le master'));
   } else {
     for (const node of nodes) {
       const pos = positionOf(node);
+      const status = text(node.health_status || node.status, node.active ? 'live' : 'offline');
       nodeList?.append(denseRow(
-        text(node.label, `ESP32-C6 ${node.node_id}`),
-        `node_id ${node.node_id} / ${text(node.sync_status, 'no_sync')} / pos ${pos.source}`,
-        [fmtHz(node.frame_rate_hz), fmtAge(node.last_seen_ms), fmtPct(pos.confidence)],
-        'active'
+        text(node.display_label || node.label, `ESP32-C6 #${node.node_id}`),
+        `node_id ${node.node_id} / ${text(node.remote_addr, 'no addr')} / pos ${pos.source}`,
+        [fmtHz(node.frame_rate_hz), `CSI ${fmtAge(node.last_csi_ms ?? node.last_seen_ms)}`, fmtPct(pos.confidence)],
+        status
       ));
     }
   }
 
   if (!aps.length) {
-    apList?.append(emptyRow('Aucun AP detecte'));
+    apList?.append(emptyRow('Scan AP ignore pour ce correctif'));
   } else {
     for (const ap of aps) {
       const pos = positionOf(ap);
@@ -275,17 +285,17 @@ function renderModules() {
     .filter((mod) => state.moduleCategory === 'All' || mod.category === state.moduleCategory)
     .filter((mod) => !q || `${mod.name} ${mod.id} ${mod.category}`.toLowerCase().includes(q))
     .sort((a, b) => {
-      const rank = { active: 0, available: 1, offline: 2 };
+      const rank = { active: 0, live: 0, available: 1, disabled: 2, offline: 3 };
       return (rank[a.status] ?? 3) - (rank[b.status] ?? 3) || Number(a.required_nodes || 0) - Number(b.required_nodes || 0);
     });
   const active = state.modules.filter((mod) => mod.status === 'active').length;
-  const available = state.modules.filter((mod) => mod.status === 'available').length;
-  setText('module-summary', `${active} active / ${available} limited`);
+  const enabled = state.modules.filter((mod) => mod.enabled !== false).length;
+  setText('module-summary', `${enabled} enabled / ${active} active`);
 
   if (!modules.length) {
     const row = create('tr');
     const cell = create('td', '', 'No modules');
-    cell.colSpan = 4;
+    cell.colSpan = 5;
     row.append(cell);
     body?.append(row);
     return;
@@ -293,12 +303,21 @@ function renderModules() {
 
   for (const mod of modules) {
     const row = create('tr');
+    const toggle = create('label', 'module-toggle');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = mod.enabled !== false;
+    checkbox.dataset.moduleId = mod.id;
+    checkbox.setAttribute('aria-label', `${text(mod.name, mod.id)} enabled`);
+    toggle.append(checkbox);
     row.append(
       tableCell(`${text(mod.name, mod.id)}`, text(mod.category, 'General')),
+      create('td'),
       create('td', '', String(mod.required_nodes || 1)),
-      pillCell(mod.status || 'offline'),
+      pillCell(mod.effective_status || mod.status || 'offline'),
       create('td', '', fmtPct(mod.confidence))
     );
+    row.children[1].append(toggle);
     body?.append(row);
   }
 }
@@ -321,14 +340,15 @@ function firstDefined(...values) {
 
 function renderVitals() {
   const vitals = state.vitals?.vital_signs || state.vitals || {};
+  const edgeVitals = state.edgeVitals?.edge_vitals || {};
   const latestVitals = state.latest?.vital_signs || {};
   const edge = String(state.latest?.type || '').includes('vitals') ? state.latest : {};
   const presence = firstDefined(state.latest?.classification?.presence, edge.presence, false);
   const motion = firstDefined(state.latest?.classification?.motion_level, edge.motion ? 'motion' : undefined, 'unknown');
-  const persons = firstDefined(state.latest?.estimated_persons, edge.n_persons, 0);
-  const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, vitals.breathing_rate_bpm);
-  const heart = firstDefined(latestVitals.heart_rate_bpm, edge.heartrate_bpm, vitals.heart_rate_bpm);
-  const quality = firstDefined(latestVitals.signal_quality, edge.presence_score, vitals.signal_quality);
+  const persons = firstDefined(state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
+  const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, edgeVitals.breathing_rate_bpm, vitals.breathing_rate_bpm);
+  const heart = firstDefined(latestVitals.heart_rate_bpm, edge.heartrate_bpm, edgeVitals.heartrate_bpm, vitals.heart_rate_bpm);
+  const quality = firstDefined(latestVitals.signal_quality, edge.presence_score, edgeVitals.presence_score, vitals.signal_quality);
 
   setText('presence-state', presence ? 'present' : 'absent');
   setText('person-count', String(persons || 0));
@@ -381,10 +401,11 @@ function activatePanel(panel) {
 }
 
 async function refreshRest() {
-  const [topologyResult, modulesResult, vitalsResult, calibrationResult] = await Promise.allSettled([
+  const [topologyResult, modulesResult, vitalsResult, edgeVitalsResult, calibrationResult] = await Promise.allSettled([
     fetchJson('/api/v1/topology'),
     fetchJson('/api/v1/modules'),
     fetchJson('/api/v1/vital-signs').catch(() => null),
+    fetchJson('/api/v1/edge-vitals').catch(() => null),
     fetchJson('/api/v1/calibration').catch(() => null),
   ]);
 
@@ -396,6 +417,7 @@ async function refreshRest() {
   }
   if (modulesResult.status === 'fulfilled') state.modules = modulesResult.value.modules || [];
   if (vitalsResult.status === 'fulfilled') state.vitals = vitalsResult.value;
+  if (edgeVitalsResult.status === 'fulfilled') state.edgeVitals = edgeVitalsResult.value;
   if (calibrationResult.status === 'fulfilled') state.calibration = calibrationResult.value;
   renderAll();
 }
@@ -441,6 +463,21 @@ function bindActions() {
   $('#module-category')?.addEventListener('change', (event) => {
     state.moduleCategory = event.target.value;
     renderModules();
+  });
+  $('#module-table')?.addEventListener('change', async (event) => {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || !input.dataset.moduleId) return;
+    input.disabled = true;
+    try {
+      await setModuleEnabled(input.dataset.moduleId, input.checked);
+      logEvent(`${input.dataset.moduleId} ${input.checked ? 'enabled' : 'disabled'}`);
+      await refreshRest();
+    } catch (error) {
+      input.checked = !input.checked;
+      logEvent(error.message, 'warn');
+    } finally {
+      input.disabled = false;
+    }
   });
   $('#start-calibration')?.addEventListener('click', async () => {
     try {

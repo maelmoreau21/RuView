@@ -85,52 +85,20 @@ pub fn parse_wasm_output(buf: &[u8]) -> Option<WasmOutputPacket> {
 }
 
 pub fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
-    if buf.len() < 20 {
-        return None;
-    }
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != 0xC511_0001 {
-        return None;
-    }
-
-    let node_id = buf[4];
-    let n_antennas = buf[5];
-    let n_subcarriers = buf[6];
-    let freq_mhz = u16::from_le_bytes([buf[8], buf[9]]);
-    let sequence = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let rssi_raw = buf[14] as i8;
-    let rssi = if rssi_raw > 0 {
-        rssi_raw.saturating_neg()
-    } else {
-        rssi_raw
-    };
-    let noise_floor = buf[15] as i8;
-
-    let iq_start = 20;
-    let n_pairs = n_antennas as usize * n_subcarriers as usize;
-    let expected_len = iq_start + n_pairs * 2;
-    if buf.len() < expected_len {
-        return None;
-    }
-
-    let mut amplitudes = Vec::with_capacity(n_pairs);
-    let mut phases = Vec::with_capacity(n_pairs);
-    for k in 0..n_pairs {
-        let i_val = buf[iq_start + k * 2] as i8 as f64;
-        let q_val = buf[iq_start + k * 2 + 1] as i8 as f64;
-        amplitudes.push((i_val * i_val + q_val * q_val).sqrt());
-        phases.push(q_val.atan2(i_val));
-    }
+    let (frame, _consumed) = wifi_densepose_hardware::Esp32CsiParser::parse_frame(buf).ok()?;
+    let (amplitudes, phases) = frame.to_amplitude_phase();
+    let n_subcarriers = u8::try_from(frame.metadata.n_subcarriers).ok()?;
+    let freq_mhz = u16::try_from(frame.metadata.channel_freq_mhz).ok()?;
 
     Some(Esp32Frame {
-        magic,
-        node_id,
-        n_antennas,
+        magic: wifi_densepose_hardware::ESP32_CSI_MAGIC,
+        node_id: frame.metadata.node_id,
+        n_antennas: frame.metadata.n_antennas,
         n_subcarriers,
         freq_mhz,
-        sequence,
-        rssi,
-        noise_floor,
+        sequence: frame.metadata.sequence,
+        rssi: frame.metadata.rssi_dbm,
+        noise_floor: frame.metadata.noise_floor_dbm,
         amplitudes,
         phases,
     })

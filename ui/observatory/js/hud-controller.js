@@ -483,13 +483,13 @@ export class HudController {
     }
 
     for (const node of nodes.slice(0, 8)) {
-      const status = String(node.status || (node.active ? 'active' : 'stale')).toLowerCase();
+      const status = String(node.health_status || node.status || (node.active ? 'live' : 'stale')).toLowerCase();
       const row = document.createElement('div');
       row.className = `fleet-node fleet-node--${status}`;
 
       const name = document.createElement('span');
       name.className = 'fleet-node-name';
-      name.textContent = `C6-${node.node_id ?? '?'}`;
+      name.textContent = node.display_label || node.label || `ESP32-C6 #${node.node_id ?? '?'}`;
 
       const meta = document.createElement('span');
       meta.className = 'fleet-node-meta';
@@ -511,14 +511,14 @@ export class HudController {
     const modules = Array.isArray(catalog?.modules) ? catalog.modules : [];
     if (!list || !summary || !modules.length) return;
 
-    const active = modules.filter(m => m.status === 'active').length;
-    const available = modules.filter(m => m.status === 'available').length;
+    const active = modules.filter(m => (m.effective_status || m.status) === 'active').length;
+    const enabled = modules.filter(m => m.enabled !== false).length;
     const categories = new Set(modules.map(m => m.category)).size;
-    summary.textContent = `${modules.length} modules / ${active} active / ${available} available / ${categories} categories`;
+    summary.textContent = `${modules.length} modules / ${enabled} enabled / ${active} active / ${categories} categories`;
 
-    const rank = { active: 0, available: 1, offline: 2 };
+    const rank = { active: 0, live: 0, available: 1, disabled: 2, offline: 3 };
     const ordered = [...modules].sort((a, b) => {
-      const byStatus = (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
+      const byStatus = (rank[a.effective_status || a.status] ?? 9) - (rank[b.effective_status || b.status] ?? 9);
       if (byStatus !== 0) return byStatus;
       return String(a.category).localeCompare(String(b.category));
     });
@@ -526,7 +526,7 @@ export class HudController {
     list.replaceChildren();
     for (const mod of ordered) {
       const row = document.createElement('div');
-      const status = String(mod.status || 'offline').toLowerCase();
+      const status = String(mod.effective_status || mod.status || 'offline').toLowerCase();
       row.className = `module-row module-row--${status}`;
 
       const copy = document.createElement('div');

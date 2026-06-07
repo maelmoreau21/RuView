@@ -92,6 +92,9 @@ class Observatory {
     this._currentData = null;
     this._environment = null;
     this._environmentNotice = null;
+    this._sensorOrigin = [0, 0, 0];
+    this._sensorBounds = { width: 12, depth: 10 };
+    this._cameraFramedToSensors = false;
     this._wsReconnectTimer = null;
     this._lastLiveAt = 0;
 
@@ -257,6 +260,8 @@ class Observatory {
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(env => {
         this._environment = env;
+        this._recomputeSceneFrame(env, env.nodes || []);
+        this._frameCameraToSensors();
         this._setEnvironmentNotice(false);
         this._syncTopology(this._currentData);
       })
@@ -306,8 +311,77 @@ class Observatory {
     }
   }
 
+  _rawPositionOf(entity) {
+    const pos = entity?.position_m || entity?.position || [0, 0, 0];
+    if (Array.isArray(pos)) {
+      return [
+        Number(pos[0]) || 0,
+        Number(pos[1]) || 0,
+        Number(pos[2]) || 0,
+      ];
+    }
+    return [
+      Number(pos.x) || 0,
+      Number(pos.y) || 0,
+      Number(pos.z) || 0,
+    ];
+  }
+
   _positionOf(entity) {
-    return entity?.position_m || entity?.position || [0, 0, 0];
+    const raw = this._rawPositionOf(entity);
+    return [
+      raw[0] - this._sensorOrigin[0],
+      raw[1],
+      raw[2] - this._sensorOrigin[2],
+    ];
+  }
+
+  _recomputeSceneFrame(env, nodes = []) {
+    const sourceNodes = nodes.length ? nodes : (env?.nodes || []);
+    const positions = sourceNodes
+      .map(node => this._rawPositionOf(node))
+      .filter(pos => pos.every(Number.isFinite));
+    if (!positions.length) return;
+
+    const xs = positions.map(pos => pos[0]);
+    const zs = positions.map(pos => pos[2]);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minZ = Math.min(...zs);
+    const maxZ = Math.max(...zs);
+    this._sensorOrigin = [
+      xs.reduce((sum, value) => sum + value, 0) / xs.length,
+      0,
+      zs.reduce((sum, value) => sum + value, 0) / zs.length,
+    ];
+    this._sensorBounds = {
+      width: Math.max(maxX - minX, Number(env?.room?.dimensions_m?.[0]) || 4, 2),
+      depth: Math.max(maxZ - minZ, Number(env?.room?.dimensions_m?.[2]) || 4, 2),
+    };
+  }
+
+  _frameCameraToSensors() {
+    if (this._cameraFramedToSensors) return;
+    const span = Math.max(this._sensorBounds.width, this._sensorBounds.depth, 4);
+    const distance = Math.min(Math.max(span * 1.35, 6), 18);
+    this._camera.position.set(distance * 0.72, Math.max(4.2, span * 0.52), distance);
+    this._controls.target.set(0, 1.2, 0);
+    this._controls.maxDistance = Math.max(25, distance * 2.2);
+    this._controls.update();
+    this._cameraFramedToSensors = true;
+  }
+
+  _sceneFrameData(data) {
+    if (!data) return data;
+    const persons = (data.persons || []).map(person => {
+      const position = this._positionOf(person);
+      return {
+        ...person,
+        position,
+        position_m: position,
+      };
+    });
+    return { ...data, persons };
   }
 
   _upsertDevice(key, kind, label, position, active) {
@@ -381,6 +455,8 @@ class Observatory {
       return;
     }
     const nodes = this._mergeNodes(liveData);
+    this._recomputeSceneFrame(env, nodes);
+    this._frameCameraToSensors();
     const nodeById = new Map(nodes.map(n => [Number(n.node_id), n]));
     const apById = new Map((env.access_points || []).map(ap => [ap.ap_id, ap]));
     const visibleDevices = new Set();
@@ -395,12 +471,12 @@ class Observatory {
     }
 
     for (const node of nodes) {
-      const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
-      const active = Boolean(node.active) && !['offline', 'stale'].includes(status);
+      const status = String(node.health_status || node.status || (node.active === false ? 'offline' : 'live')).toLowerCase();
+      const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(status);
       const position = this._positionOf(node);
       const key = `node:${node.node_id}`;
       visibleDevices.add(key);
-      this._upsertDevice(key, 'node', node.label || `C6-${node.node_id}`, position, active);
+      this._upsertDevice(key, 'node', node.display_label || node.label || `C6-${node.node_id}`, position, active);
       if (active) this._ensureWaveSource(key, position, true, 0.55);
     }
 
@@ -408,8 +484,8 @@ class Observatory {
       const ap = apById.get(link.ap_id);
       const node = nodeById.get(Number(link.node_id));
       if (!ap || !node) continue;
-      const nodeStatus = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
-      const active = Boolean(node.active) && !['offline', 'stale'].includes(nodeStatus);
+      const nodeStatus = String(node.health_status || node.status || (node.active === false ? 'offline' : 'live')).toLowerCase();
+      const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(nodeStatus);
       const key = link.link_id || `${link.ap_id}:c6-${link.node_id}`;
       visibleLinks.add(key);
       this._upsertLink(key, this._positionOf(ap), this._positionOf(node), active);
@@ -693,7 +769,7 @@ class Observatory {
     // Live data only. Without WebSocket frames the scene remains in a real
     // offline state instead of fabricating movement.
     this._currentData = this._liveData || this._emptyLiveFrame();
-    const data = this._currentData;
+    const data = this._sceneFrameData(this._currentData);
 
     // Updates
     this._nebula.update(dt, elapsed);

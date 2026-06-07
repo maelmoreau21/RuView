@@ -23,7 +23,7 @@
     <div class="status-grid">
       <div class="status-cell status-master" id="master-status"><span></span><strong>offline</strong><small>master</small></div>
       <div class="status-cell"><strong id="active-nodes">0</strong><small>nodes live</small></div>
-      <div class="status-cell"><strong id="ap-count">0</strong><small>AP visibles</small></div>
+      <div class="status-cell"><strong id="enabled-modules">0</strong><small>modules on</small></div>
       <div class="status-cell"><strong id="fusion-mode">offline</strong><small>fusion</small></div>
       <div class="status-cell"><strong id="source-mode">offline</strong><small>source</small></div>
       <div class="status-cell"><strong id="scan-interface">wlan0</strong><small>scan</small></div>
@@ -32,10 +32,12 @@
 
   <main id="main" class="console-shell">
     <nav class="console-rail" aria-label="Console views">
-      <button class="rail-button is-active" type="button" data-panel="fleet" title="Fleet">FLEET</button>
-      <button class="rail-button" type="button" data-panel="modules" title="Modules">MOD</button>
-      <button class="rail-button" type="button" data-panel="vitals" title="Vital signs">VITAL</button>
-      <button class="rail-button" type="button" data-panel="calibration" title="Calibration">CAL</button>
+      <button class="rail-button is-active" type="button" data-panel="fleet" title="Fleet">Fleet</button>
+      <a class="rail-button" href="/ui/observatory.html" title="Environment 3D">3D</a>
+      <button class="rail-button" type="button" data-panel="modules" title="Modules">Modules</button>
+      <button class="rail-button" type="button" data-panel="vitals" title="Vital signs">Vitals</button>
+      <button class="rail-button" type="button" data-panel="calibration" title="Calibration">Cal</button>
+      <button class="rail-button" type="button" data-panel="diagnostics" title="Diagnostics">Diag</button>
     </nav>
 
     <section class="topology-pane" aria-labelledby="topology-title">
@@ -54,8 +56,7 @@
       <div id="topology-stage" class="topology-stage" aria-label="Detected AP and ESP32-C6 node topology"></div>
 
       <div class="topology-legend">
-        <span><i class="legend-dot legend-ap"></i>AP vu par le Pi</span>
-        <span><i class="legend-dot legend-node"></i>ESP32-C6 live</span>
+        <span><i class="legend-dot legend-node"></i>ESP32-C6</span>
         <span><i class="legend-line"></i>Lien estime</span>
         <span><i class="legend-hint"></i>Position estimee</span>
       </div>
@@ -64,9 +65,11 @@
     <aside class="side-panel" aria-label="Console details">
       <div class="panel-tabs">
         <button class="is-active" type="button" data-panel="fleet">Fleet</button>
+        <a href="/ui/observatory.html">3D</a>
         <button type="button" data-panel="modules">Modules</button>
         <button type="button" data-panel="vitals">Vitals</button>
         <button type="button" data-panel="calibration">Calibration</button>
+        <button type="button" data-panel="diagnostics">Diagnostics</button>
       </div>
 
       <section class="panel-view is-active" data-view="fleet">
@@ -79,12 +82,8 @@
         </div>
         <div class="split-list">
           <section>
-            <h3>Noeuds actifs</h3>
+            <h3>Noeuds ESP32-C6</h3>
             <div id="node-list" class="dense-list"></div>
-          </section>
-          <section>
-            <h3>AP detectes</h3>
-            <div id="ap-list" class="dense-list"></div>
           </section>
         </div>
       </section>
@@ -106,6 +105,7 @@
             <thead>
               <tr>
                 <th>Module</th>
+                <th>Enabled</th>
                 <th>Nodes</th>
                 <th>Status</th>
                 <th>Confidence</th>
@@ -150,6 +150,22 @@
           <table class="data-table">
             <tbody id="calibration-table"></tbody>
           </table>
+        </div>
+      </section>
+
+      <section class="panel-view" data-view="diagnostics">
+        <div class="section-head compact">
+          <div>
+            <p class="eyebrow">Runtime</p>
+            <h2>Diagnostics</h2>
+          </div>
+          <span id="diagnostics-status" class="badge">live</span>
+        </div>
+        <div class="split-list">
+          <section>
+            <h3>AP scan</h3>
+            <div id="ap-list" class="dense-list"></div>
+          </section>
         </div>
         <div class="advanced-links" aria-label="Advanced diagnostic views">
           <a href="/ui/observatory.html">Observatory 3D</a>

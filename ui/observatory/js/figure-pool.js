@@ -260,6 +260,41 @@ export class FigurePool {
 
   // ---- Per-frame update ----
 
+  _personPosition(person) {
+    const pos = person?.position_m || person?.position || [0, 0, 0];
+    if (Array.isArray(pos)) {
+      return [Number(pos[0]) || 0, Number(pos[1]) || 0, Number(pos[2]) || 0];
+    }
+    return [Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0];
+  }
+
+  _liveKeypoints(person, position) {
+    const source = person?.keypoints_m || person?.keypoints;
+    if (!Array.isArray(source) || source.length < 17) return null;
+
+    const values = source.slice(0, 17).map((kp) => {
+      if (Array.isArray(kp)) {
+        return [Number(kp[0]) || 0, Number(kp[1]) || 0, Number(kp[2]) || 0];
+      }
+      return [Number(kp.x) || 0, Number(kp.y) || 0, Number(kp.z) || 0];
+    });
+
+    const looksLikePixels = values.some(([x, y]) => Math.abs(x) > 12 || Math.abs(y) > 12);
+    if (!looksLikePixels || person?.keypoints_m) return values;
+
+    const anchor = [5, 6, 11, 12]
+      .map((idx) => values[idx])
+      .filter(Boolean);
+    const centerX = anchor.reduce((sum, kp) => sum + kp[0], 0) / Math.max(anchor.length, 1);
+    const centerY = anchor.reduce((sum, kp) => sum + kp[1], 0) / Math.max(anchor.length, 1);
+    const pxToM = 0.006;
+    return values.map(([x, y, z]) => [
+      position[0] + (x - centerX) * pxToM,
+      Math.max(0.05, position[1] + (centerY - y) * pxToM),
+      position[2] + z * 0.08,
+    ]);
+  }
+
   /**
    * Update all figures based on current data frame.
    * @param {object} data - Current sensing data with persons[], vital_signs, classification
@@ -278,8 +313,10 @@ export class FigurePool {
       const fig = this._figures[f];
       if (f < persons.length && isPresent) {
         const p = persons[f];
-        const kps = this._poseSystem.generateKeypoints(p, elapsed, breathPulse);
-        this.applyKeypoints(fig, kps, breathPulse, p.position || [0, 0, 0], elapsed, p.pose);
+        const position = this._personPosition(p);
+        const kps = this._liveKeypoints(p, position)
+          || this._poseSystem.generateKeypoints({ ...p, position }, elapsed, breathPulse);
+        this.applyKeypoints(fig, kps, breathPulse, position, elapsed, p.pose);
         fig.visible = true;
       } else {
         if (fig.visible) {

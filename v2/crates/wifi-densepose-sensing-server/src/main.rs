@@ -25,7 +25,7 @@ mod vital_signs;
 use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, trainer};
 
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use axum::{
     },
     http::StatusCode,
     response::{Html, IntoResponse, Json, Redirect},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Extension, Router,
 };
 use clap::Parser;
@@ -404,6 +404,12 @@ struct PersonDetection {
     keypoints: Vec<PoseKeypoint>,
     bbox: BoundingBox,
     zone: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_m: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,6 +443,9 @@ struct NodeState {
     vital_detector: VitalSignDetector,
     latest_vitals: VitalSigns,
     pub(crate) last_frame_time: Option<std::time::Instant>,
+    last_csi_time: Option<std::time::Instant>,
+    last_vitals_time: Option<std::time::Instant>,
+    remote_addr: Option<String>,
     edge_vitals: Option<Esp32VitalsPacket>,
     /// ADR-110 §A0.12: Latest sync packet received from this node. When a
     /// CSI frame arrives with byte 19 bit 4 set (`adr018_flags.ieee802154_sync_valid`),
@@ -547,6 +556,15 @@ mod fps_ema_tests {
 }
 
 impl NodeState {
+    pub(crate) fn observe_remote_addr(&mut self, addr: SocketAddr) {
+        self.remote_addr = Some(addr.to_string());
+    }
+
+    pub(crate) fn observe_edge_vitals_arrival(&mut self, now: std::time::Instant) {
+        self.last_frame_time = Some(now);
+        self.last_vitals_time = Some(now);
+    }
+
     /// ADR-110 §A0.12 timestamp recovery: given a CSI frame's node-local
     /// `esp_timer_get_time()` snapshot, return the mesh-aligned epoch
     /// computed from this node's most recent sync packet — or `None`
@@ -638,6 +656,7 @@ impl NodeState {
             }
         }
         self.last_frame_time = Some(now);
+        self.last_csi_time = Some(now);
     }
 
     pub(crate) fn new() -> Self {
@@ -661,6 +680,9 @@ impl NodeState {
             vital_detector: VitalSignDetector::new(10.0),
             latest_vitals: VitalSigns::default(),
             last_frame_time: None,
+            last_csi_time: None,
+            last_vitals_time: None,
+            remote_addr: None,
             edge_vitals: None,
             latest_sync: None,
             latest_sync_at: None,
@@ -860,6 +882,14 @@ fn configured_node_position(env: &EnvironmentConfig, node_id: u8) -> [f64; 3] {
         .unwrap_or_else(|| default_node_position(node_id))
 }
 
+fn node_display_label(env: &EnvironmentConfig, node_id: u8) -> String {
+    configured_node(env, node_id)
+        .map(|n| n.label.trim())
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ESP32-C6 #{node_id}"))
+}
+
 fn node_linked_ap(env: &EnvironmentConfig, node_id: u8) -> Option<String> {
     configured_node(env, node_id)
         .map(|n| n.linked_ap.clone())
@@ -869,6 +899,30 @@ fn node_linked_ap(env: &EnvironmentConfig, node_id: u8) -> Option<String> {
                 .find(|l| l.node_id == node_id)
                 .map(|l| l.ap_id.clone())
         })
+}
+
+fn age_ms(now: std::time::Instant, instant: Option<std::time::Instant>) -> serde_json::Value {
+    instant
+        .map(|t| serde_json::json!(now.saturating_duration_since(t).as_millis() as u64))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn node_runtime_status(ns: &NodeState, now: std::time::Instant) -> &'static str {
+    if is_node_active(ns, now) {
+        "live"
+    } else if ns
+        .last_frame_time
+        .is_some_and(|t| now.saturating_duration_since(t) <= Duration::from_secs(60))
+    {
+        "stale"
+    } else if ns
+        .latest_sync_at
+        .is_some_and(|t| now.saturating_duration_since(t) <= Duration::from_secs(9))
+    {
+        "sync_only"
+    } else {
+        "offline"
+    }
 }
 
 fn node_summary_json(
@@ -885,14 +939,22 @@ fn node_summary_json(
     let sync = ns.sync_snapshot();
     let cfg = configured_node(env, id);
     let position_m = configured_node_position(env, id);
+    let label = node_display_label(env, id);
+    let status = node_runtime_status(ns, now);
     serde_json::json!({
         "node_id": id,
-        "label": cfg.map(|n| n.label.as_str()).unwrap_or("ESP32-C6"),
+        "label": label.as_str(),
+        "display_label": label.as_str(),
         "kind": cfg.map(|n| n.kind.as_str()).unwrap_or("esp32_c6"),
         "zone": cfg.map(|n| n.zone.as_str()).unwrap_or("unassigned"),
-        "status": if active { "active" } else { "stale" },
+        "status": status,
+        "health_status": status,
         "active": active,
         "last_seen_ms": last_seen_ms,
+        "last_csi_ms": age_ms(now, ns.last_csi_time),
+        "last_vitals_ms": age_ms(now, ns.last_vitals_time),
+        "last_sync_ms": age_ms(now, ns.latest_sync_at),
+        "remote_addr": ns.remote_addr.as_deref(),
         "rssi_dbm": ns.rssi_history.back().copied().unwrap_or(-90.0),
         "frame_rate_hz": ns.csi_fps_ema,
         "frame_rate_samples": ns.csi_fps_samples,
@@ -915,14 +977,25 @@ fn configured_offline_node_json(
     cfg: &EnvironmentNodeConfig,
     env: &EnvironmentConfig,
 ) -> serde_json::Value {
+    let label = if cfg.label.trim().is_empty() {
+        format!("ESP32-C6 #{}", cfg.node_id)
+    } else {
+        cfg.label.clone()
+    };
     serde_json::json!({
         "node_id": cfg.node_id,
-        "label": cfg.label.as_str(),
+        "label": label.as_str(),
+        "display_label": label.as_str(),
         "kind": cfg.kind.as_str(),
         "zone": cfg.zone.as_str(),
         "status": "offline",
+        "health_status": "offline",
         "active": false,
         "last_seen_ms": serde_json::Value::Null,
+        "last_csi_ms": serde_json::Value::Null,
+        "last_vitals_ms": serde_json::Value::Null,
+        "last_sync_ms": serde_json::Value::Null,
+        "remote_addr": serde_json::Value::Null,
         "rssi_dbm": serde_json::Value::Null,
         "frame_rate_hz": 0.0,
         "frame_rate_samples": 0,
@@ -1113,49 +1186,96 @@ fn topology_nodes_json(
     node_states: &HashMap<u8, NodeState>,
     now: std::time::Instant,
 ) -> Vec<serde_json::Value> {
-    let mut active: Vec<_> = node_states
-        .iter()
-        .filter(|(_, ns)| is_node_active(ns, now))
-        .collect();
-    active.sort_by_key(|(id, _)| **id);
-    let total = active.len();
-    active
-        .into_iter()
+    let mut ids: Vec<u8> = env.nodes.iter().map(|cfg| cfg.node_id).collect();
+    for id in node_states.keys().copied() {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    let total = ids.len().max(1);
+
+    ids.into_iter()
         .enumerate()
-        .map(|(idx, (&id, ns))| {
-            let last_seen_ms = ns
-                .last_frame_time
-                .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-                .unwrap_or(u64::MAX);
-            let sync = ns.sync_snapshot();
+        .map(|(idx, id)| {
             let cfg = configured_node(env, id);
+            let sync = node_states.get(&id).and_then(|ns| ns.sync_snapshot());
             let (position, position_source, position_confidence) =
                 topology_node_position(env, id, idx, total, sync.as_ref());
-            serde_json::json!({
-                "node_id": id,
-                "label": cfg.map(|n| n.label.as_str()).unwrap_or("ESP32-C6"),
-                "kind": cfg.map(|n| n.kind.as_str()).unwrap_or("esp32_c6"),
-                "zone": cfg.map(|n| n.zone.as_str()).unwrap_or("unassigned"),
-                "status": "active",
-                "active": true,
-                "last_seen_ms": last_seen_ms,
-                "rssi_dbm": ns.rssi_history.back().copied().unwrap_or(-90.0),
-                "frame_rate_hz": ns.csi_fps_ema,
-                "frame_rate_samples": ns.csi_fps_samples,
-                "motion_level": &ns.current_motion_level,
-                "presence": !matches!(ns.current_motion_level.as_str(), "absent"),
-                "person_count": ns.prev_person_count,
-                "sync_status": sync.as_ref().map(|s| if s.is_valid { "valid" } else { "stale" }).unwrap_or("no_sync"),
-                "sync": sync,
-                "position": position_json(position, position_source, position_confidence),
-                "position_confidence": position_confidence,
-                "position_source": position_source,
-                "tdm_slot": cfg.map(|n| n.tdm_slot),
-                "tdm_total": cfg.map(|n| n.tdm_total),
-                "linked_ap": node_linked_ap(env, id),
-                "coherence": ns.coherence_score,
-                "novelty_score": ns.last_novelty_score,
-            })
+            let label = node_display_label(env, id);
+
+            if let Some(ns) = node_states.get(&id) {
+                let last_seen_ms = ns
+                    .last_frame_time
+                    .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                let status = node_runtime_status(ns, now);
+                serde_json::json!({
+                    "node_id": id,
+                    "label": label.as_str(),
+                    "display_label": label.as_str(),
+                    "kind": cfg.map(|n| n.kind.as_str()).unwrap_or("esp32_c6"),
+                    "zone": cfg.map(|n| n.zone.as_str()).unwrap_or("unassigned"),
+                    "status": status,
+                    "health_status": status,
+                    "active": is_node_active(ns, now),
+                    "last_seen_ms": last_seen_ms,
+                    "last_csi_ms": age_ms(now, ns.last_csi_time),
+                    "last_vitals_ms": age_ms(now, ns.last_vitals_time),
+                    "last_sync_ms": age_ms(now, ns.latest_sync_at),
+                    "remote_addr": ns.remote_addr.as_deref(),
+                    "rssi_dbm": ns.rssi_history.back().copied().unwrap_or(-90.0),
+                    "frame_rate_hz": ns.csi_fps_ema,
+                    "frame_rate_samples": ns.csi_fps_samples,
+                    "motion_level": &ns.current_motion_level,
+                    "presence": !matches!(ns.current_motion_level.as_str(), "absent"),
+                    "person_count": ns.prev_person_count,
+                    "sync_status": sync.as_ref().map(|s| if s.is_valid { "valid" } else { "stale" }).unwrap_or("no_sync"),
+                    "sync": sync,
+                    "position": position_json(position, position_source, position_confidence),
+                    "position_m": position,
+                    "position_confidence": position_confidence,
+                    "position_source": position_source,
+                    "tdm_slot": cfg.map(|n| n.tdm_slot),
+                    "tdm_total": cfg.map(|n| n.tdm_total),
+                    "linked_ap": node_linked_ap(env, id),
+                    "coherence": ns.coherence_score,
+                    "novelty_score": ns.last_novelty_score,
+                })
+            } else {
+                serde_json::json!({
+                    "node_id": id,
+                    "label": label.as_str(),
+                    "display_label": label.as_str(),
+                    "kind": cfg.map(|n| n.kind.as_str()).unwrap_or("esp32_c6"),
+                    "zone": cfg.map(|n| n.zone.as_str()).unwrap_or("unassigned"),
+                    "status": "offline",
+                    "health_status": "offline",
+                    "active": false,
+                    "last_seen_ms": serde_json::Value::Null,
+                    "last_csi_ms": serde_json::Value::Null,
+                    "last_vitals_ms": serde_json::Value::Null,
+                    "last_sync_ms": serde_json::Value::Null,
+                    "remote_addr": serde_json::Value::Null,
+                    "rssi_dbm": serde_json::Value::Null,
+                    "frame_rate_hz": 0.0,
+                    "frame_rate_samples": 0,
+                    "motion_level": "unknown",
+                    "presence": false,
+                    "person_count": 0,
+                    "sync_status": "offline",
+                    "sync": serde_json::Value::Null,
+                    "position": position_json(position, position_source, position_confidence),
+                    "position_m": position,
+                    "position_confidence": position_confidence,
+                    "position_source": position_source,
+                    "tdm_slot": cfg.map(|n| n.tdm_slot),
+                    "tdm_total": cfg.map(|n| n.tdm_total),
+                    "linked_ap": node_linked_ap(env, id),
+                    "coherence": serde_json::Value::Null,
+                    "novelty_score": serde_json::Value::Null,
+                })
+            }
         })
         .collect()
 }
@@ -1304,6 +1424,17 @@ fn default_dedup_factor() -> f64 {
     3.0
 }
 
+const DEFAULT_ENABLED_MODULES: &[&str] = &[
+    "respiration_tracking",
+    "fall_detection",
+    "intrusion_detection",
+    "activity_classification",
+];
+
+fn default_enabled_modules() -> Vec<String> {
+    DEFAULT_ENABLED_MODULES.iter().map(|id| (*id).to_string()).collect()
+}
+
 /// Physical room profile used by the 3D console and calibration UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RoomConfig {
@@ -1390,6 +1521,8 @@ pub(crate) struct RuntimeConfig {
     pub dedup_factor: f64,
     #[serde(default)]
     pub environment: EnvironmentConfig,
+    #[serde(default = "default_enabled_modules")]
+    pub enabled_modules: Vec<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -1397,6 +1530,7 @@ impl Default for RuntimeConfig {
         Self {
             dedup_factor: default_dedup_factor(),
             environment: EnvironmentConfig::default(),
+            enabled_modules: default_enabled_modules(),
         }
     }
 }
@@ -1596,6 +1730,8 @@ struct AppStateInner {
     /// Configurable at runtime via `POST /api/v1/config/dedup-factor` and
     /// `POST /api/v1/config/ground-truth`. Persisted across restarts.
     pub(crate) dedup_factor: f64,
+    /// Persisted allowlist of business modules enabled in the live console.
+    pub(crate) enabled_modules: HashSet<String>,
     /// Minimum active ESP32 nodes required for the master to report ready.
     pub(crate) min_nodes: usize,
     /// Data directory for persisting runtime config (parent of `firmware_dir`).
@@ -1958,67 +2094,20 @@ mod issue_928_magic_collision_tests {
 // ── ESP32 UDP frame parser ───────────────────────────────────────────────────
 
 fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
-    if buf.len() < 20 {
-        return None;
-    }
-
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != 0xC511_0001 {
-        return None;
-    }
-
-    // Frame layout (must match firmware csi_collector.c):
-    //   [0..3]   magic (u32 LE)
-    //   [4]      node_id (u8)
-    //   [5]      n_antennas (u8)
-    //   [6..7]   n_subcarriers (u16 LE)
-    //   [8..11]  freq_mhz (u32 LE)
-    //   [12..15] sequence (u32 LE)
-    //   [16]     rssi (i8)
-    //   [17]     noise_floor (i8)
-    //   [18..19] reserved
-    //   [20..]   I/Q data
-    let node_id = buf[4];
-    let n_antennas = buf[5];
-    let n_subcarriers = buf[6];
-    let freq_mhz = u16::from_le_bytes([buf[8], buf[9]]);
-    let sequence = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let rssi_raw = buf[14] as i8;
-    // Fix RSSI sign: ensure it's always negative (dBm convention).
-    let rssi = if rssi_raw > 0 {
-        rssi_raw.saturating_neg()
-    } else {
-        rssi_raw
-    };
-    let noise_floor = buf[15] as i8;
-
-    let iq_start = 20;
-    let n_pairs = n_antennas as usize * n_subcarriers as usize;
-    let expected_len = iq_start + n_pairs * 2;
-
-    if buf.len() < expected_len {
-        return None;
-    }
-
-    let mut amplitudes = Vec::with_capacity(n_pairs);
-    let mut phases = Vec::with_capacity(n_pairs);
-
-    for k in 0..n_pairs {
-        let i_val = buf[iq_start + k * 2] as i8 as f64;
-        let q_val = buf[iq_start + k * 2 + 1] as i8 as f64;
-        amplitudes.push((i_val * i_val + q_val * q_val).sqrt());
-        phases.push(q_val.atan2(i_val));
-    }
+    let (frame, _consumed) = wifi_densepose_hardware::Esp32CsiParser::parse_frame(buf).ok()?;
+    let (amplitudes, phases) = frame.to_amplitude_phase();
+    let n_subcarriers = u8::try_from(frame.metadata.n_subcarriers).ok()?;
+    let freq_mhz = u16::try_from(frame.metadata.channel_freq_mhz).ok()?;
 
     Some(Esp32Frame {
-        magic,
-        node_id,
-        n_antennas,
+        magic: wifi_densepose_hardware::ESP32_CSI_MAGIC,
+        node_id: frame.metadata.node_id,
+        n_antennas: frame.metadata.n_antennas,
         n_subcarriers,
         freq_mhz,
-        sequence,
-        rssi,
-        noise_floor,
+        sequence: frame.metadata.sequence,
+        rssi: frame.metadata.rssi_dbm,
+        noise_floor: frame.metadata.noise_floor_dbm,
         amplitudes,
         phases,
     })
@@ -3088,11 +3177,12 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let tracked = tracker_bridge::tracker_update(
+        let mut tracked = tracker_bridge::tracker_update(
             &mut s.pose_tracker,
             &mut last_tracker_instant,
-            raw_persons,
+            raw_persons.clone(),
         );
+        carry_person_positions(&mut tracked, &raw_persons);
         s.last_tracker_instant = last_tracker_instant;
         if !tracked.is_empty() {
             update.persons = Some(tracked);
@@ -3243,8 +3333,12 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
 
     let raw_persons = derive_pose_from_sensing(&update);
     let mut last_tracker_instant = s.last_tracker_instant.take();
-    let tracked =
-        tracker_bridge::tracker_update(&mut s.pose_tracker, &mut last_tracker_instant, raw_persons);
+    let mut tracked = tracker_bridge::tracker_update(
+        &mut s.pose_tracker,
+        &mut last_tracker_instant,
+        raw_persons.clone(),
+    );
+    carry_person_positions(&mut tracked, &raw_persons);
     s.last_tracker_instant = last_tracker_instant;
     if !tracked.is_empty() {
         update.persons = Some(tracked);
@@ -3485,12 +3579,17 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                                 x: kp[0], y: kp[1], z: kp[2], confidence: kp[3],
                                             })
                                             .collect();
+                                        let (position_m, position_source) =
+                                            estimate_person_world_position(&sensing, 0, 1);
                                         vec![PersonDetection {
                                             id: 1,
                                             confidence: sensing.classification.confidence,
                                             bbox: BoundingBox { x: 260.0, y: 150.0, width: 120.0, height: 220.0 },
                                             keypoints,
                                             zone: "zone_1".into(),
+                                            position_m: Some(position_m),
+                                            position: Some(position_m),
+                                            position_source: Some(position_source.to_string()),
                                         }]
                                     }).unwrap_or_else(|| {
                                         // Prefer tracked persons from broadcast if available
@@ -4076,6 +4175,56 @@ mod aggregate_person_count_tests {
 ///
 /// `person_idx`: 0-based index of this person.
 /// `total_persons`: total number of detected persons (for spacing calculation).
+fn estimate_person_world_position(
+    update: &SensingUpdate,
+    person_idx: usize,
+    total_persons: usize,
+) -> ([f64; 3], &'static str) {
+    let nodes: Vec<&NodeInfo> = update.nodes.iter().filter(|node| node.position.iter().all(|v| v.is_finite())).collect();
+    if nodes.is_empty() {
+        return ([0.0, 0.9, 0.0], "fallback_origin");
+    }
+
+    let mut weight_sum = 0.0;
+    let mut centroid = [0.0, 0.0, 0.0];
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+
+    for node in &nodes {
+        let weight = ((node.rssi_dbm + 100.0) / 60.0).clamp(0.2, 1.0);
+        weight_sum += weight;
+        centroid[0] += node.position[0] * weight;
+        centroid[1] += node.position[1] * weight;
+        centroid[2] += node.position[2] * weight;
+        min_x = min_x.min(node.position[0]);
+        max_x = max_x.max(node.position[0]);
+        min_z = min_z.min(node.position[2]);
+        max_z = max_z.max(node.position[2]);
+    }
+
+    centroid[0] /= weight_sum.max(1e-9);
+    centroid[1] /= weight_sum.max(1e-9);
+    centroid[2] /= weight_sum.max(1e-9);
+
+    let half = (total_persons as f64 - 1.0) / 2.0;
+    let spread_index = person_idx as f64 - half;
+    let spread_x = ((max_x - min_x).abs() / (total_persons.max(1) as f64 + 1.0)).clamp(0.45, 1.2);
+    let spread_z = ((max_z - min_z).abs() * 0.08).clamp(0.0, 0.35);
+    let mut position = [
+        centroid[0] + spread_index * spread_x,
+        0.9,
+        centroid[2] + spread_index.signum() * spread_z,
+    ];
+
+    if nodes.len() == 1 {
+        position[2] += 0.8;
+    }
+
+    (position, "sensor_geometry")
+}
+
 fn derive_single_person_pose(
     update: &SensingUpdate,
     person_idx: usize,
@@ -4257,6 +4406,8 @@ fn derive_single_person_pose(
     let min_y = ys.iter().cloned().fold(f64::MAX, f64::min) - 10.0;
     let max_x = xs.iter().cloned().fold(f64::MIN, f64::max) + 10.0;
     let max_y = ys.iter().cloned().fold(f64::MIN, f64::max) + 10.0;
+    let (position_m, position_source) =
+        estimate_person_world_position(update, person_idx, total_persons);
 
     PersonDetection {
         id: (person_idx + 1) as u32,
@@ -4269,6 +4420,9 @@ fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
+        position_m: Some(position_m),
+        position: Some(position_m),
+        position_source: Some(position_source.to_string()),
     }
 }
 
@@ -4290,6 +4444,19 @@ fn derive_pose_from_sensing(update: &SensingUpdate) -> Vec<PersonDetection> {
 
 /// Expected bone lengths in pixel-space for the COCO-17 skeleton as used by
 /// `derive_single_person_pose`. Pairs are (parent_idx, child_idx).
+fn carry_person_positions(tracked: &mut [PersonDetection], raw: &[PersonDetection]) {
+    for (idx, person) in tracked.iter_mut().enumerate() {
+        if person.position_m.is_some() {
+            continue;
+        }
+        if let Some(source) = raw.get(idx) {
+            person.position_m = source.position_m;
+            person.position = source.position;
+            person.position_source = source.position_source.clone();
+        }
+    }
+}
+
 const POSE_BONE_PAIRS: &[(usize, usize)] = &[
     (5, 7),
     (7, 9),
@@ -5701,6 +5868,32 @@ fn validate_environment(env: &EnvironmentConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn configured_fuser_positions(env: &EnvironmentConfig) -> Vec<[f32; 3]> {
+    let mut nodes = env.nodes.clone();
+    nodes.sort_by_key(|node| node.node_id);
+    nodes
+        .into_iter()
+        .map(|node| {
+            [
+                node.position_m[0] as f32,
+                node.position_m[1] as f32,
+                node.position_m[2] as f32,
+            ]
+        })
+        .collect()
+}
+
+fn apply_environment_node_positions(fuser: &mut MultistaticFuser, env: &EnvironmentConfig) {
+    let positions = configured_fuser_positions(env);
+    if !positions.is_empty() {
+        info!(
+            "Applying {} configured environment node position(s) to multistatic fuser",
+            positions.len()
+        );
+        fuser.set_node_positions(positions);
+    }
+}
+
 async fn environment_update_endpoint(
     State(state): State<SharedState>,
     Json(environment): Json<EnvironmentConfig>,
@@ -5714,8 +5907,10 @@ async fn environment_update_endpoint(
 
     let mut s = state.write().await;
     s.environment = environment.clone();
+    apply_environment_node_positions(&mut s.multistatic_fuser, &environment);
     let data_dir = s.data_dir.clone();
     let dedup_factor = s.dedup_factor;
+    let enabled_modules = s.enabled_modules.iter().cloned().collect();
     drop(s);
 
     save_runtime_config(
@@ -5723,6 +5918,7 @@ async fn environment_update_endpoint(
         &RuntimeConfig {
             dedup_factor,
             environment: environment.clone(),
+            enabled_modules,
         },
     );
 
@@ -5752,7 +5948,7 @@ fn module_confidence(active_nodes: usize, required_nodes: usize) -> f64 {
     }
 }
 
-fn business_modules(active_nodes: usize) -> Vec<serde_json::Value> {
+fn business_modules(active_nodes: usize, enabled_modules: &HashSet<String>) -> Vec<serde_json::Value> {
     let modules: &[(&str, &str, &str, u16, usize, &[&str])] = &[
         (
             "fall_detection",
@@ -6004,12 +6200,22 @@ fn business_modules(active_nodes: usize) -> Vec<serde_json::Value> {
             } else {
                 None
             };
+            let capability_status = module_status(active_nodes, *required_nodes);
+            let enabled = enabled_modules.contains(*id);
+            let effective_status = if enabled {
+                capability_status
+            } else {
+                "disabled"
+            };
             serde_json::json!({
                 "id": id,
                 "category": category,
                 "name": name,
                 "size_kb": size_kb,
-                "status": module_status(active_nodes, *required_nodes),
+                "status": effective_status,
+                "enabled": enabled,
+                "effective_status": effective_status,
+                "capability_status": capability_status,
                 "confidence": module_confidence(active_nodes, *required_nodes),
                 "required_nodes": required_nodes,
                 "evidence_streams": streams,
@@ -6023,11 +6229,12 @@ async fn modules_endpoint(State(state): State<SharedState>) -> Json<serde_json::
     let s = state.read().await;
     let now = std::time::Instant::now();
     let active_nodes = active_node_count(&s, now);
-    let modules = business_modules(active_nodes);
+    let modules = business_modules(active_nodes, &s.enabled_modules);
     Json(serde_json::json!({
         "catalog": "ruvsense-edge",
         "active_nodes": active_nodes,
         "min_nodes": s.min_nodes,
+        "enabled_modules": s.enabled_modules.iter().cloned().collect::<Vec<_>>(),
         "categories": [
             "Health & Vitals",
             "Safety & Security",
@@ -6037,6 +6244,66 @@ async fn modules_endpoint(State(state): State<SharedState>) -> Json<serde_json::
         ],
         "modules": modules,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ModuleEnabledUpdate {
+    enabled: bool,
+}
+
+fn module_id_exists(id: &str) -> bool {
+    let empty = HashSet::new();
+    business_modules(0, &empty)
+        .iter()
+        .any(|module| module.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+async fn module_enabled_update_endpoint(
+    Path(id): Path<String>,
+    State(state): State<SharedState>,
+    Json(body): Json<ModuleEnabledUpdate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !module_id_exists(&id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("unknown module '{id}'"),
+            })),
+        ));
+    }
+
+    let mut s = state.write().await;
+    if body.enabled {
+        s.enabled_modules.insert(id.clone());
+    } else {
+        s.enabled_modules.remove(&id);
+    }
+    let active_nodes = active_node_count(&s, std::time::Instant::now());
+    let modules = business_modules(active_nodes, &s.enabled_modules);
+    let module = modules
+        .into_iter()
+        .find(|module| module.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        .unwrap_or_else(|| serde_json::json!({ "id": id, "enabled": body.enabled }));
+    let data_dir = s.data_dir.clone();
+    let dedup_factor = s.dedup_factor;
+    let environment = s.environment.clone();
+    let enabled_modules = s.enabled_modules.iter().cloned().collect();
+    drop(s);
+
+    save_runtime_config(
+        &data_dir,
+        &RuntimeConfig {
+            dedup_factor,
+            environment,
+            enabled_modules,
+        },
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "module": module,
+    })))
 }
 
 async fn calibration_overview_endpoint(
@@ -6203,7 +6470,9 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     // ── Per-node state for edge vitals (issue #249) ──────
                     let node_id = vitals.node_id;
                     let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
-                    ns.last_frame_time = Some(std::time::Instant::now());
+                    let now_arrival = std::time::Instant::now();
+                    ns.observe_edge_vitals_arrival(now_arrival);
+                    ns.observe_remote_addr(src);
                     ns.edge_vitals = Some(vitals.clone());
                     ns.rssi_history.push_back(vitals.rssi as f64);
                     if ns.rssi_history.len() > 60 {
@@ -6397,11 +6666,12 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let tracked = tracker_bridge::tracker_update(
+                    let mut tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker,
                         &mut last_tracker_instant,
-                        raw_persons,
+                        raw_persons.clone(),
                     );
+                    carry_person_positions(&mut tracked, &raw_persons);
                     s.last_tracker_instant = last_tracker_instant;
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
@@ -6435,6 +6705,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                                 let ns =
                                     s.node_states.entry(node_id).or_insert_with(NodeState::new);
                                 ns.apply_sync_packet(sync, std::time::Instant::now());
+                                ns.observe_remote_addr(src);
                                 continue;
                             }
                             Err(e) => {
@@ -6462,7 +6733,17 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         fused.mmwave_targets,
                         fused.fusion_confidence,
                     );
-                    let s = state.write().await;
+                    let mut s = state.write().await;
+                    let ns = s
+                        .node_states
+                        .entry(fused.node_id)
+                        .or_insert_with(NodeState::new);
+                    ns.observe_edge_vitals_arrival(std::time::Instant::now());
+                    ns.observe_remote_addr(src);
+                    ns.rssi_history.push_back(fused.rssi as f64);
+                    if ns.rssi_history.len() > 60 {
+                        ns.rssi_history.pop_front();
+                    }
                     if let Ok(json) = serde_json::to_string(&serde_json::json!({
                         "type": "edge_fused_vitals",
                         "node_id": fused.node_id,
@@ -6505,6 +6786,10 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     })) {
                         let _ = s.tx.send(json);
                     }
+                    s.node_states
+                        .entry(wasm_output.node_id)
+                        .or_insert_with(NodeState::new)
+                        .observe_remote_addr(src);
                     s.latest_wasm_events = Some(wasm_output);
                     continue;
                 }
@@ -6565,6 +6850,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     // CSI arrivals. The helper sets `last_frame_time` as a
                     // side effect, so the previous bare assignment is gone.
                     ns.observe_csi_frame_arrival(std::time::Instant::now());
+                    ns.observe_remote_addr(src);
 
                     // ADR-084 Pass 3: cluster-Pi novelty sensor.
                     // Score this frame's feature vector against the per-node
@@ -6773,11 +7059,12 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let tracked = tracker_bridge::tracker_update(
+                    let mut tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker,
                         &mut last_tracker_instant,
-                        raw_persons,
+                        raw_persons.clone(),
                     );
+                    carry_person_positions(&mut tracked, &raw_persons);
                     s.last_tracker_instant = last_tracker_instant;
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
@@ -6934,11 +7221,12 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let tracked = tracker_bridge::tracker_update(
+        let mut tracked = tracker_bridge::tracker_update(
             &mut s.pose_tracker,
             &mut last_tracker_instant,
-            raw_persons,
+            raw_persons.clone(),
         );
+        carry_person_positions(&mut tracked, &raw_persons);
         s.last_tracker_instant = last_tracker_instant;
         if !tracked.is_empty() {
             update.persons = Some(tracked);
@@ -7858,10 +8146,11 @@ async fn main() {
     // ADR-044 §5.3: load persisted runtime config from the data directory.
     let runtime_config = load_runtime_config(&data_dir);
     info!(
-        "Loaded runtime config: dedup_factor={:.2}, aps={}, nodes={}",
+        "Loaded runtime config: dedup_factor={:.2}, aps={}, nodes={}, enabled_modules={}",
         runtime_config.dedup_factor,
         runtime_config.environment.access_points.len(),
         runtime_config.environment.nodes.len(),
+        runtime_config.enabled_modules.len(),
     );
 
     // ADR-102: optional Edge Module Registry. None when --no-edge-registry
@@ -8014,7 +8303,14 @@ async fn main() {
                 min_nodes: 1, // single-node passthrough
                 ..Default::default()
             });
-            if let Some(ref pos_str) = args.node_positions {
+            let environment_positions = configured_fuser_positions(&runtime_config.environment);
+            if !environment_positions.is_empty() {
+                info!(
+                    "Configured {} environment node positions for multistatic fusion",
+                    environment_positions.len()
+                );
+                fuser.set_node_positions(environment_positions);
+            } else if let Some(ref pos_str) = args.node_positions {
                 let positions = field_bridge::parse_node_positions(pos_str);
                 if !positions.is_empty() {
                     info!(
@@ -8038,6 +8334,7 @@ async fn main() {
         p95_spectral_power: RollingP95::new(600, 60),
         // ADR-044 §5.3: runtime-configurable dedup factor (persisted).
         dedup_factor: runtime_config.dedup_factor,
+        enabled_modules: runtime_config.enabled_modules.iter().cloned().collect(),
         min_nodes: args.min_nodes.max(1),
         data_dir: data_dir.clone(),
         environment: runtime_config.environment.clone(),
@@ -8161,6 +8458,10 @@ async fn main() {
             get(environment_endpoint).put(environment_update_endpoint),
         )
         .route("/api/v1/modules", get(modules_endpoint))
+        .route(
+            "/api/v1/modules/:id/enabled",
+            put(module_enabled_update_endpoint),
+        )
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
         // ADR-110 iter 29 — per-node mesh sync state for HTTP clients.
@@ -8333,7 +8634,7 @@ mod topology_console_tests {
     }
 
     #[test]
-    fn topology_hides_stale_or_config_only_nodes() {
+    fn topology_keeps_stale_nodes_visible() {
         let now = Instant::now();
         let mut active = NodeState::new();
         active.last_frame_time = Some(now);
@@ -8349,9 +8650,13 @@ mod topology_console_tests {
 
         let nodes = topology_nodes_json(&EnvironmentConfig::default(), &node_states, now);
 
-        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0]["node_id"], serde_json::json!(1));
-        assert_eq!(nodes[0]["status"], serde_json::json!("active"));
+        assert_eq!(nodes[0]["status"], serde_json::json!("live"));
+        assert_eq!(nodes[0]["display_label"], serde_json::json!("ESP32-C6 #1"));
+        assert_eq!(nodes[1]["node_id"], serde_json::json!(2));
+        assert_eq!(nodes[1]["status"], serde_json::json!("stale"));
+        assert_eq!(nodes[1]["display_label"], serde_json::json!("ESP32-C6 #2"));
     }
 
     #[test]
@@ -8370,6 +8675,73 @@ mod topology_console_tests {
         assert_eq!(module_status(1, 2), "available");
         assert_eq!(module_status(1, 3), "available");
         assert_eq!(module_status(0, 1), "offline");
+    }
+
+    #[test]
+    fn business_modules_honor_enabled_set() {
+        let enabled = super::default_enabled_modules()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let modules = super::business_modules(3, &enabled);
+        let respiration = modules
+            .iter()
+            .find(|module| module["id"] == serde_json::json!("respiration_tracking"))
+            .expect("respiration module exists");
+        let sleep = modules
+            .iter()
+            .find(|module| module["id"] == serde_json::json!("sleep_apnea_screening"))
+            .expect("sleep module exists");
+
+        assert_eq!(respiration["enabled"], serde_json::json!(true));
+        assert_eq!(respiration["effective_status"], serde_json::json!("active"));
+        assert_eq!(sleep["enabled"], serde_json::json!(false));
+        assert_eq!(sleep["effective_status"], serde_json::json!("disabled"));
+    }
+}
+
+#[cfg(test)]
+mod esp32_parser_adapter_tests {
+    use super::parse_esp32_frame;
+
+    fn build_adr018_frame() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0xC511_0001u32.to_le_bytes());
+        buf.push(7);
+        buf.push(1);
+        buf.extend_from_slice(&56u16.to_le_bytes());
+        buf.extend_from_slice(&2437u32.to_le_bytes());
+        buf.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        buf.push((-50i8) as u8);
+        buf.push((-95i8) as u8);
+        buf.push(0);
+        buf.push(0);
+        for idx in 0..56 {
+            buf.push(idx as i8 as u8);
+            buf.push((idx as i8).wrapping_neg() as u8);
+        }
+        buf
+    }
+
+    #[test]
+    fn server_parser_uses_adr018_offsets() {
+        let frame = parse_esp32_frame(&build_adr018_frame()).expect("ADR-018 frame must parse");
+
+        assert_eq!(frame.node_id, 7);
+        assert_eq!(frame.n_antennas, 1);
+        assert_eq!(frame.n_subcarriers, 56);
+        assert_eq!(frame.freq_mhz, 2437);
+        assert_eq!(frame.sequence, 0x0102_0304);
+        assert_eq!(frame.rssi, -50);
+        assert_eq!(frame.noise_floor, -95);
+        assert_eq!(frame.amplitudes.len(), 56);
+    }
+
+    #[test]
+    fn server_parser_skips_sibling_vitals_magic() {
+        let mut buf = vec![0u8; 32];
+        buf[0..4].copy_from_slice(&0xC511_0002u32.to_le_bytes());
+
+        assert!(parse_esp32_frame(&buf).is_none());
     }
 }
 
@@ -8749,12 +9121,14 @@ async fn config_set_dedup_factor(
     s.dedup_factor = clamped;
     let data_dir = s.data_dir.clone();
     let environment = s.environment.clone();
+    let enabled_modules = s.enabled_modules.iter().cloned().collect();
     drop(s);
     save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor: clamped,
             environment,
+            enabled_modules,
         },
     );
     Json(serde_json::json!({
@@ -8797,12 +9171,14 @@ async fn config_set_ground_truth(
     s.dedup_factor = clamped;
     let data_dir = s.data_dir.clone();
     let environment = s.environment.clone();
+    let enabled_modules = s.enabled_modules.iter().cloned().collect();
     drop(s);
     save_runtime_config(
         &data_dir,
         &RuntimeConfig {
             dedup_factor: clamped,
             environment,
+            enabled_modules,
         },
     );
     Json(serde_json::json!({

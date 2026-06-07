@@ -21,6 +21,61 @@ pub const POSE_BONE_PAIRS: &[(usize, usize)] = &[
 const TORSO_KP: [usize; 4] = [5, 6, 11, 12];
 const EXTREMITY_KP: [usize; 4] = [9, 10, 15, 16];
 
+fn estimate_person_world_position(
+    update: &SensingUpdate,
+    person_idx: usize,
+    total_persons: usize,
+) -> ([f64; 3], &'static str) {
+    let nodes: Vec<&NodeInfo> = update
+        .nodes
+        .iter()
+        .filter(|node| node.position.iter().all(|v| v.is_finite()))
+        .collect();
+    if nodes.is_empty() {
+        return ([0.0, 0.9, 0.0], "fallback_origin");
+    }
+
+    let mut weight_sum = 0.0;
+    let mut centroid = [0.0, 0.0, 0.0];
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+
+    for node in &nodes {
+        let weight = ((node.rssi_dbm + 100.0) / 60.0).clamp(0.2, 1.0);
+        weight_sum += weight;
+        centroid[0] += node.position[0] * weight;
+        centroid[1] += node.position[1] * weight;
+        centroid[2] += node.position[2] * weight;
+        min_x = min_x.min(node.position[0]);
+        max_x = max_x.max(node.position[0]);
+        min_z = min_z.min(node.position[2]);
+        max_z = max_z.max(node.position[2]);
+    }
+
+    centroid[0] /= weight_sum.max(1e-9);
+    centroid[1] /= weight_sum.max(1e-9);
+    centroid[2] /= weight_sum.max(1e-9);
+
+    let half = (total_persons as f64 - 1.0) / 2.0;
+    let spread_index = person_idx as f64 - half;
+    let spread_x =
+        ((max_x - min_x).abs() / (total_persons.max(1) as f64 + 1.0)).clamp(0.45, 1.2);
+    let spread_z = ((max_z - min_z).abs() * 0.08).clamp(0.0, 0.35);
+    let mut position = [
+        centroid[0] + spread_index * spread_x,
+        0.9,
+        centroid[2] + spread_index.signum() * spread_z,
+    ];
+
+    if nodes.len() == 1 {
+        position[2] += 0.8;
+    }
+
+    (position, "sensor_geometry")
+}
+
 pub fn derive_single_person_pose(
     update: &SensingUpdate,
     person_idx: usize,
@@ -180,6 +235,8 @@ pub fn derive_single_person_pose(
     let min_y = ys.iter().cloned().fold(f64::MAX, f64::min) - 10.0;
     let max_x = xs.iter().cloned().fold(f64::MIN, f64::max) + 10.0;
     let max_y = ys.iter().cloned().fold(f64::MIN, f64::max) + 10.0;
+    let (position_m, position_source) =
+        estimate_person_world_position(update, person_idx, total_persons);
 
     PersonDetection {
         id: (person_idx + 1) as u32,
@@ -192,6 +249,9 @@ pub fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
+        position_m: Some(position_m),
+        position: Some(position_m),
+        position_source: Some(position_source.to_string()),
     }
 }
 
