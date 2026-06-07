@@ -62,28 +62,31 @@
 
       <div id="topology-stage" class="topology-stage" aria-label="Topologie des AP et nœuds ESP32-C6 détectés"></div>
 
+      <div class="placement-toolbar" aria-label="Node placement">
+        <div class="placement-detail">
+          <strong id="placement-selected">No node selected</strong>
+          <small id="placement-coordinates">X -- / Y -- / Z --</small>
+        </div>
+        <div class="placement-actions">
+          <span id="placement-state" class="badge">saved</span>
+          <button id="reset-placement" type="button">Reset</button>
+          <button id="save-placement" class="primary" type="button" disabled>Save</button>
+        </div>
+      </div>
+
       <div class="topology-legend">
         <span><i class="legend-dot legend-node"></i>ESP32-C6</span>
-        <span><i class="legend-line"></i>Lien estimé</span>
-        <span><i class="legend-hint"></i>Position estimée</span>
+        <span><i class="legend-line"></i>Distance</span>
+        <span><i class="legend-hint"></i>Manual X/Y</span>
       </div>
     </section>
 
     <aside class="side-panel" aria-label="Détails console">
-      <div class="panel-tabs">
-        <button class="is-active" type="button" data-panel="fleet">Parc</button>
-        <a href="/ui/observatory.html">3D</a>
-        <button type="button" data-panel="modules">Modules</button>
-        <button type="button" data-panel="vitals">Vitaux</button>
-        <button type="button" data-panel="calibration">Calibration</button>
-        <button type="button" data-panel="diagnostics">Diagnostics</button>
-      </div>
-
       <section class="panel-view is-active" data-view="fleet">
         <div class="section-head compact">
           <div>
             <p class="eyebrow">Raspberry Pi 4/5</p>
-            <h2>Parc live</h2>
+            <h2>System Control</h2>
           </div>
           <span id="fleet-summary" class="badge">0 live</span>
         </div>
@@ -107,6 +110,7 @@
           <input id="module-filter" type="search" placeholder="Filtrer les modules" autocomplete="off">
           <select id="module-category" aria-label="Catégorie module"></select>
         </div>
+        <div id="module-presets" class="preset-grid" aria-label="Module presets"></div>
         <div class="table-wrap">
           <table class="data-table">
             <thead>

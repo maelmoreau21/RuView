@@ -345,7 +345,10 @@ export class HudController {
     this._setText('motion-value', (feat.motion_band_power || 0).toFixed(3));
 
     // Mini person-count dots
-    const personCount = data.estimated_persons || 0;
+    const personCount = Math.max(
+      Number(data.estimated_persons || 0),
+      Array.isArray(data.persons) ? data.persons.length : 0,
+    );
     this._updatePersonDots(personCount);
 
     const presEl = document.getElementById('presence-indicator');

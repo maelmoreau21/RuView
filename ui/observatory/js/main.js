@@ -29,6 +29,8 @@ const C = {
   bgDeep:     0x080c14,
 };
 
+const MAX_SCENE_PERSONS = 8;
+
 // SCENARIO_NAMES, DEFAULTS, SETTINGS_VERSION, PRESETS imported from hud-controller.js
 
 // ---- Main Class ----
@@ -95,10 +97,12 @@ class Observatory {
     this._sensorOrigin = [0, 0, 0];
     this._sensorBounds = { width: 12, height: 4, depth: 10 };
     this._sensorTargetY = 1.2;
+    this._sceneTarget = new THREE.Vector3(0, 1.2, 0);
     this._roomSize = { width: 12, height: 4, depth: 10 };
     this._cameraFramedToSensors = false;
     this._wsReconnectTimer = null;
     this._lastLiveAt = 0;
+    this._lastEdgeVitals = null;
 
     // Build scene
     this._setupLighting();
@@ -290,9 +294,12 @@ class Observatory {
   _buildTopologyDevices() {
     this._topologyGroup = new THREE.Group();
     this._linkGroup = new THREE.Group();
+    this._coverageGroup = new THREE.Group();
     this._deviceMeshes = new Map();
     this._linkMeshes = new Map();
+    this._coverageMeshes = new Map();
     this._wifiWaves = [];
+    this._scene.add(this._coverageGroup);
     this._scene.add(this._linkGroup);
     this._scene.add(this._topologyGroup);
   }
@@ -381,6 +388,7 @@ class Observatory {
   _clearTopology() {
     for (const [, entry] of this._deviceMeshes) entry.group.visible = false;
     for (const [, line] of this._linkMeshes) line.visible = false;
+    for (const [, entry] of this._coverageMeshes) entry.group.visible = false;
     for (const waves of this._wifiWaves) {
       waves.active = false;
       for (const shell of waves.shells) shell.mesh.visible = false;
@@ -428,6 +436,7 @@ class Observatory {
       this._sensorOrigin = [0, 0, 0];
       this._sensorBounds = { width: room.width, height: room.height, depth: room.depth };
       this._sensorTargetY = Math.min(Math.max(room.height * 0.5, 0.8), room.height);
+      this._sceneTarget.set(0, this._sensorTargetY, 0);
       return;
     }
 
@@ -452,6 +461,7 @@ class Observatory {
       depth: Math.max(maxZ - minZ, room.depth, 2),
     };
     this._sensorTargetY = Math.min(Math.max(avgY, 0.8), Math.max(room.height, 0.8));
+    this._sceneTarget.set(0, this._sensorTargetY, 0);
   }
 
   _frameCameraToSensors(force = false) {
@@ -461,27 +471,173 @@ class Observatory {
     const targetY = this._sensorTargetY || 1.2;
     const cameraY = targetY + Math.max(2.8, this._sensorBounds.height * 0.6, span * 0.35);
     this._camera.position.set(distance * 0.72, cameraY, distance);
-    this._controls.target.set(0, targetY, 0);
+    this._controls.target.copy(this._sceneTarget);
     this._controls.maxDistance = Math.max(25, distance * 2.2);
     this._controls.update();
     this._cameraFramedToSensors = true;
   }
 
+  _sensingTypeOf(frame) {
+    return String(frame?.type || frame?.msg_type || '').toLowerCase();
+  }
+
+  _numberOrNull(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  _integerOrZero(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  }
+
+  _edgeVitalsFromFrame(frame) {
+    if (!frame || typeof frame !== 'object') return null;
+    const br = this._numberOrNull(frame.breathing_rate_bpm ?? frame.breathing_bpm);
+    const hr = this._numberOrNull(frame.heart_rate_bpm ?? frame.heartrate_bpm ?? frame.hr_proxy_bpm);
+    const confidence = this._numberOrNull(frame.presence_score ?? frame.signal_quality ?? frame.confidence);
+    if (br == null && hr == null && confidence == null) return null;
+    return {
+      ...(br != null && br > 0 ? { breathing_rate_bpm: br } : {}),
+      ...(hr != null && hr > 0 ? { heart_rate_bpm: hr } : {}),
+      breathing_confidence: confidence ?? 0,
+      heartbeat_confidence: confidence ?? 0,
+      signal_quality: confidence ?? 0,
+    };
+  }
+
+  _mergeEdgeVitals(frame, edgeFrame) {
+    const edgeVitals = this._edgeVitalsFromFrame(edgeFrame);
+    if (!edgeVitals) return frame;
+    return {
+      ...frame,
+      vital_signs: {
+        ...(frame?.vital_signs || {}),
+        ...edgeVitals,
+      },
+    };
+  }
+
+  _ingestSocketFrame(frame) {
+    const type = this._sensingTypeOf(frame);
+    if (type === 'sensing_update') {
+      const normalized = this._normalizeSensingFrame(frame);
+      if (!normalized) return;
+      this._liveData = normalized;
+      this._lastLiveAt = performance.now();
+      this._syncTopology(normalized);
+      return;
+    }
+
+    if (type === 'edge_vitals' || type === 'edge_fused_vitals') {
+      this._lastEdgeVitals = frame;
+      if (this._liveData) {
+        this._liveData = this._mergeEdgeVitals(this._liveData, frame);
+      }
+    }
+  }
+
+  _keypointObjects(source) {
+    if (!Array.isArray(source) || source.length < 17) return null;
+    const names = [
+      'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+      'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+      'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+      'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
+    ];
+    const points = [];
+    for (let i = 0; i < 17; i++) {
+      const kp = source[i];
+      const x = Array.isArray(kp) ? Number(kp[0]) : Number(kp?.x);
+      const y = Array.isArray(kp) ? Number(kp[1]) : Number(kp?.y);
+      const z = Array.isArray(kp) ? Number(kp[2] ?? 0) : Number(kp?.z ?? 0);
+      const confidence = Array.isArray(kp) ? Number(kp[3] ?? 0.8) : Number(kp?.confidence ?? 0.8);
+      if (![x, y, z, confidence].every(Number.isFinite)) return null;
+      points.push({ name: names[i], x, y, z, confidence });
+    }
+    return points;
+  }
+
+  _fallbackPersonPosition(index, total) {
+    const count = Math.max(1, total);
+    const spacing = Math.min(Math.max(this._sensorBounds.width * 0.18, 0.65), 1.25);
+    const half = (count - 1) / 2;
+    const zJitter = count > 1 ? ((index % 2) - 0.5) * Math.min(this._sensorBounds.depth * 0.12, 0.7) : 0;
+    return [(index - half) * spacing, 0, zJitter];
+  }
+
+  _normalizeSensingFrame(rawFrame) {
+    if (!rawFrame || typeof rawFrame !== 'object') return null;
+    const frame = this._lastEdgeVitals ? this._mergeEdgeVitals(rawFrame, this._lastEdgeVitals) : { ...rawFrame };
+    const rawPersons = Array.isArray(frame.persons) ? frame.persons : [];
+    const persons = rawPersons.slice(0, MAX_SCENE_PERSONS).map((person, index) => ({
+      ...person,
+      id: person?.id ?? person?.track_id ?? `person_${index + 1}`,
+    }));
+
+    if (!persons.length) {
+      const keypoints = this._keypointObjects(frame.pose_keypoints);
+      if (keypoints) {
+        const confidence = this._numberOrNull(frame.classification?.confidence) ?? 0.5;
+        persons.push({
+          id: 'pose_1',
+          confidence,
+          keypoints,
+          position: this._fallbackPersonPosition(0, 1),
+          position_source: 'observatory_layout',
+          pose_source: 'pose_keypoints',
+        });
+      }
+    }
+
+    const estimatedPersons = Math.max(this._integerOrZero(frame.estimated_persons), persons.length);
+    const classification = {
+      ...(frame.classification || {}),
+    };
+    if (persons.length && !classification.presence) {
+      classification.presence = true;
+      classification.motion_level = classification.motion_level || 'present';
+      classification.confidence = classification.confidence ?? persons[0]?.confidence ?? 0.5;
+    }
+
+    return {
+      ...frame,
+      type: 'sensing_update',
+      msg_type: frame.msg_type || 'sensing_update',
+      persons,
+      estimated_persons: estimatedPersons,
+      classification,
+    };
+  }
+
   _sceneFrameData(data) {
     if (!data) return data;
-    const persons = (data.persons || []).map(person => {
-      if (String(person?.position_source || '').toLowerCase() === 'unlocalized') return null;
-      const position = this._positionOf(person, { requirePositionM: true });
-      if (!position) return null;
+    const inputPersons = Array.isArray(data.persons) ? data.persons.slice(0, MAX_SCENE_PERSONS) : [];
+    const persons = inputPersons.map((person, index) => {
+      const layoutPosition = String(person?.position_source || '').toLowerCase() === 'observatory_layout'
+        ? this._parseVector3(person.position)
+        : null;
+      const position = layoutPosition
+        || this._positionOf(person)
+        || this._fallbackPersonPosition(index, inputPersons.length);
       const keypointsM = this._transformMetricKeypoints(person.keypoints_m);
       return {
         ...person,
         position,
-        position_m: position,
+        ...(person.position_m ? { position_m: position } : {}),
         ...(keypointsM ? { keypoints_m: keypointsM } : {}),
       };
     }).filter(Boolean);
-    return { ...data, persons };
+    const estimatedPersons = Math.max(this._integerOrZero(data.estimated_persons), persons.length);
+    return {
+      ...data,
+      persons,
+      estimated_persons: estimatedPersons,
+      classification: {
+        ...(data.classification || {}),
+        presence: Boolean(data.classification?.presence || persons.length),
+      },
+    };
   }
 
   _transformMetricKeypoints(source) {
@@ -563,6 +719,72 @@ class Observatory {
     line.visible = true;
   }
 
+  _coverageBand(node, apById, env) {
+    const ownBand = String(node.band || node.frequency_band || '').trim();
+    if (ownBand) return ownBand;
+    const linkedAp = node.linked_ap || env?.links?.find(link => Number(link.node_id) === Number(node.node_id))?.ap_id;
+    const ap = linkedAp ? apById.get(linkedAp) : null;
+    if (ap?.band) return String(ap.band);
+    const channel = Number(node.channel || ap?.channel);
+    if (Number.isFinite(channel) && channel > 14) return '5GHz';
+    return '2.4GHz';
+  }
+
+  _coverageRadiusForBand(band) {
+    const normalized = String(band || '').toLowerCase();
+    const roomSpan = Math.max(this._roomSize.width, this._roomSize.depth, 2);
+    let radius = 4.5;
+    if (normalized.includes('6')) radius = 2.8;
+    else if (normalized.includes('5')) radius = 3.4;
+    else if (normalized.includes('2.4') || normalized.includes('2g')) radius = 4.8;
+    return Math.min(radius, Math.max(1.2, roomSpan * 0.55));
+  }
+
+  _upsertCoverage(key, position, active, visible, band) {
+    let entry = this._coverageMeshes.get(key);
+    const radius = this._coverageRadiusForBand(band);
+    const heightScale = Math.min(0.45, Math.max(0.22, this._roomSize.height / Math.max(radius * 5, 1)));
+    if (!entry) {
+      const domeGeo = new THREE.SphereGeometry(1, 40, 16, 0, Math.PI * 2, 0, Math.PI * 0.54);
+      const domeMat = new THREE.MeshBasicMaterial({
+        color: C.blueSignal,
+        transparent: true,
+        opacity: 0,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const dome = new THREE.Mesh(domeGeo, domeMat);
+
+      const ringGeo = new THREE.RingGeometry(0.96, 1, 80);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: C.blueSignal,
+        transparent: true,
+        opacity: 0,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.y = 0.025;
+
+      const group = new THREE.Group();
+      group.add(dome);
+      group.add(ring);
+      this._coverageGroup.add(group);
+      entry = { group, dome, domeMat, ring, ringMat };
+      this._coverageMeshes.set(key, entry);
+    }
+
+    const opacity = active ? 0.16 : 0.04;
+    entry.group.position.set(position[0], 0.02, position[2]);
+    entry.group.scale.set(radius, radius * heightScale, radius);
+    entry.domeMat.opacity = opacity;
+    entry.ringMat.opacity = active ? 0.28 : 0.08;
+    entry.group.visible = visible;
+  }
+
   _syncTopology(liveData) {
     const env = this._environment;
     if (!env) {
@@ -576,6 +798,7 @@ class Observatory {
     const apById = new Map((env.access_points || []).map(ap => [ap.ap_id, ap]));
     const visibleDevices = new Set();
     const visibleLinks = new Set();
+    const visibleCoverage = new Set();
 
     for (const ap of env.access_points || []) {
       const position = this._positionOf(ap);
@@ -594,7 +817,11 @@ class Observatory {
       const key = `node:${node.node_id}`;
       visibleDevices.add(key);
       this._upsertDevice(key, 'node', node.display_label || node.label || `C6-${node.node_id}`, position, active);
-      if (active) this._ensureWaveSource(key, position, true, 0.55);
+      visibleCoverage.add(key);
+      const band = this._coverageBand(node, apById, env);
+      const coverageVisible = active || ['stale', 'sync_only'].includes(status);
+      this._upsertCoverage(key, position, active, coverageVisible, band);
+      this._ensureWaveSource(key, position, active, 0.55);
     }
 
     for (const link of env.links || []) {
@@ -616,6 +843,9 @@ class Observatory {
     }
     for (const [key, line] of this._linkMeshes) {
       if (!visibleLinks.has(key)) line.visible = false;
+    }
+    for (const [key, entry] of this._coverageMeshes) {
+      if (!visibleCoverage.has(key)) entry.group.visible = false;
     }
   }
 
@@ -827,9 +1057,7 @@ class Observatory {
       };
       this._ws.onmessage = (evt) => {
         try {
-          this._liveData = JSON.parse(evt.data);
-          this._lastLiveAt = performance.now();
-          this._syncTopology(this._liveData);
+          this._ingestSocketFrame(JSON.parse(evt.data));
         } catch {}
       };
       this._ws.onclose = () => {
@@ -906,13 +1134,12 @@ class Observatory {
     if (this._autopilot) {
       this._autoAngle += dt * this.settings.orbitSpeed;
       const r = Math.min(Math.max(Math.max(this._sensorBounds.width, this._sensorBounds.depth) * 1.2, 8), 36);
-      const targetY = this._sensorTargetY || 1.2;
       this._camera.position.set(
         Math.sin(this._autoAngle) * r,
-        targetY + Math.max(2.4, this._sensorBounds.height * 0.5) + Math.sin(this._autoAngle * 0.5),
+        this._sceneTarget.y + Math.max(2.4, this._sensorBounds.height * 0.5) + Math.sin(this._autoAngle * 0.5),
         Math.cos(this._autoAngle) * r
       );
-      this._controls.target.set(0, targetY, 0);
+      this._controls.target.copy(this._sceneTarget);
       this._controls.update();
     }
     this._controls.update();

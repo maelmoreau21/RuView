@@ -1629,6 +1629,58 @@ const DEFAULT_ENABLED_MODULES: &[&str] = &[
 
 const MODULE_CONFIG_VERSION: u8 = 1;
 
+#[derive(Debug, Clone, Copy)]
+struct ModulePreset {
+    id: &'static str,
+    label: &'static str,
+    module_ids: &'static [&'static str],
+}
+
+const MODULE_PRESETS: &[ModulePreset] = &[
+    ModulePreset {
+        id: "disaster_recovery_mat",
+        label: "Disaster Recovery MAT",
+        module_ids: &[
+            "fall_detection",
+            "respiration_tracking",
+            "panic_motion",
+            "confined_space_monitor",
+            "people_counting",
+            "dwell_heatmap",
+            "path_analytics",
+        ],
+    },
+    ModulePreset {
+        id: "intrusion_detection",
+        label: "Intrusion Detection",
+        module_ids: &[
+            "intrusion_detection",
+            "loitering_alert",
+            "exclusion_zone_breach",
+            "occupancy_based_access",
+            "door_open_detection",
+            "path_analytics",
+        ],
+    },
+    ModulePreset {
+        id: "daily_vital_monitoring",
+        label: "Daily Vital Monitoring",
+        module_ids: &[
+            "respiration_tracking",
+            "fall_detection",
+            "sleep_apnea_screening",
+            "cardiac_arrhythmia",
+            "sleep_staging",
+            "seizure_detection",
+        ],
+    },
+    ModulePreset {
+        id: "development_failsafe",
+        label: "Development Failsafe",
+        module_ids: DEFAULT_ENABLED_MODULES,
+    },
+];
+
 fn default_enabled_modules() -> Vec<String> {
     DEFAULT_ENABLED_MODULES.iter().map(|id| (*id).to_string()).collect()
 }
@@ -2095,10 +2147,14 @@ fn validate_cargo_metadata(manifest_path: &StdPath) -> Result<(), String> {
     }
 }
 
+fn runtime_config_path_for_data_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("config.json")
+}
+
 /// Load persisted runtime config from `<data_dir>/config.json`.
 /// Falls back to [`RuntimeConfig::default`] only when the file is absent.
 pub(crate) fn load_runtime_config(data_dir: &std::path::Path) -> Result<RuntimeConfig, String> {
-    let path = data_dir.join("config.json");
+    let path = runtime_config_path_for_data_dir(data_dir);
     match std::fs::read_to_string(&path) {
         Ok(json) => parse_runtime_config_text(&path, &json),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RuntimeConfig::default()),
@@ -2106,23 +2162,42 @@ pub(crate) fn load_runtime_config(data_dir: &std::path::Path) -> Result<RuntimeC
     }
 }
 
-/// Persist runtime config to `<data_dir>/config.json`.
-pub(crate) fn save_runtime_config(
-    data_dir: &std::path::Path,
+pub(crate) fn save_runtime_config_file(
+    path: &std::path::Path,
     config: &RuntimeConfig,
 ) -> Result<(), String> {
     validate_runtime_config(config)?;
-    let path = data_dir.join("config.json");
-    std::fs::create_dir_all(data_dir)
-        .map_err(|e| format!("failed to create {}: {e}", data_dir.display()))?;
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("failed to serialize runtime config: {e}"))?;
-    let tmp_path = data_dir.join("config.json.tmp");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let text = match ext.as_str() {
+        "json" => serde_json::to_string_pretty(config)
+            .map_err(|e| format!("failed to serialize runtime config as JSON: {e}"))?,
+        "toml" => toml::to_string_pretty(config)
+            .map_err(|e| format!("failed to serialize runtime config as TOML: {e}"))?,
+        "yaml" | "yml" => serde_yaml::to_string(config)
+            .map_err(|e| format!("failed to serialize runtime config as YAML: {e}"))?,
+        _ => {
+            return Err(format!(
+                "{}: unsupported runtime config extension; expected .json, .toml, .yaml, or .yml",
+                path.display()
+            ));
+        }
+    };
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
     {
         let mut file = std::fs::File::create(&tmp_path)
             .map_err(|e| format!("failed to create {}: {e}", tmp_path.display()))?;
         use std::io::Write as _;
-        file.write_all(json.as_bytes())
+        file.write_all(text.as_bytes())
             .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
         file.write_all(b"\n")
             .map_err(|e| format!("failed to finalize {}: {e}", tmp_path.display()))?;
@@ -2138,6 +2213,14 @@ pub(crate) fn save_runtime_config(
     }
     info!("Runtime config saved to {}", path.display());
     Ok(())
+}
+
+/// Persist runtime config to `<data_dir>/config.json`.
+pub(crate) fn save_runtime_config(
+    data_dir: &std::path::Path,
+    config: &RuntimeConfig,
+) -> Result<(), String> {
+    save_runtime_config_file(&runtime_config_path_for_data_dir(data_dir), config)
 }
 
 async fn init_sqlite_store(data_dir: &std::path::Path) -> anyhow::Result<()> {
@@ -2329,6 +2412,8 @@ struct AppStateInner {
     pub(crate) min_nodes: usize,
     /// Data directory for persisting runtime config (parent of `firmware_dir`).
     pub(crate) data_dir: std::path::PathBuf,
+    /// Runtime config file currently owned by runtime mutations.
+    pub(crate) runtime_config_path: std::path::PathBuf,
     /// Persisted room/AP/node topology consumed by the RuvSense Console.
     pub(crate) environment: EnvironmentConfig,
 }
@@ -6945,6 +7030,68 @@ fn apply_environment_node_positions(fuser: &mut MultistaticFuser, env: &Environm
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct NodePositionUpdate {
+    node_id: u8,
+    position_m: [f64; 3],
+}
+
+#[derive(Debug, Deserialize)]
+struct NodePositionsUpdate {
+    nodes: Vec<NodePositionUpdate>,
+}
+
+fn validate_node_position_updates(updates: &[NodePositionUpdate]) -> Result<(), String> {
+    if updates.is_empty() {
+        return Err("nodes must include at least one position".to_string());
+    }
+    let mut seen = HashSet::new();
+    for update in updates {
+        if update.node_id == 0 {
+            return Err("node_id 0 is reserved for WiFi scan aggregate data".to_string());
+        }
+        if !seen.insert(update.node_id) {
+            return Err(format!("duplicate node_id {}", update.node_id));
+        }
+        if update.position_m.iter().any(|value| !value.is_finite()) {
+            return Err(format!("node {} has invalid position", update.node_id));
+        }
+    }
+    Ok(())
+}
+
+fn upsert_environment_node_positions(
+    env: &mut EnvironmentConfig,
+    updates: &[NodePositionUpdate],
+    known_live_nodes: &HashSet<u8>,
+) -> Result<(), String> {
+    validate_node_position_updates(updates)?;
+    for update in updates {
+        if let Some(existing) = env.nodes.iter_mut().find(|node| node.node_id == update.node_id) {
+            existing.position_m = update.position_m;
+            continue;
+        }
+        if !known_live_nodes.contains(&update.node_id) {
+            return Err(format!(
+                "node {} is not configured or live",
+                update.node_id
+            ));
+        }
+        env.nodes.push(EnvironmentNodeConfig {
+            node_id: update.node_id,
+            label: format!("ESP32-C6 #{}", update.node_id),
+            kind: "esp32_c6".to_string(),
+            zone: "manual".to_string(),
+            position_m: update.position_m,
+            tdm_slot: 0,
+            tdm_total: 1,
+            linked_ap: String::new(),
+        });
+    }
+    env.nodes.sort_by_key(|node| node.node_id);
+    validate_environment(env)
+}
+
 async fn environment_update_endpoint(
     State(state): State<SharedState>,
     Json(environment): Json<EnvironmentConfig>,
@@ -6957,13 +7104,58 @@ async fn environment_update_endpoint(
     }
 
     let s = state.read().await;
-    let data_dir = s.data_dir.clone();
+    let runtime_config_path = s.runtime_config_path.clone();
     let dedup_factor = s.dedup_factor;
-    let enabled_modules = s.enabled_modules.iter().cloned().collect();
+    let enabled_modules = sorted_module_ids(&s.enabled_modules);
     drop(s);
 
-    if let Err(message) = save_runtime_config(
-        &data_dir,
+    if let Err(message) = save_runtime_config_file(
+        &runtime_config_path,
+        &RuntimeConfig {
+            dedup_factor,
+            environment: environment.clone(),
+            module_config_version: MODULE_CONFIG_VERSION,
+            enabled_modules,
+        },
+    ) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        ));
+    }
+
+    let mut s = state.write().await;
+    s.environment = environment.clone();
+    apply_environment_node_positions(&mut s.multistatic_fuser, &environment);
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "environment": environment,
+    })))
+}
+
+async fn environment_node_positions_update_endpoint(
+    State(state): State<SharedState>,
+    Json(body): Json<NodePositionsUpdate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s = state.read().await;
+    let mut environment = s.environment.clone();
+    let known_live_nodes = s.node_states.keys().copied().collect::<HashSet<_>>();
+    if let Err(message) =
+        upsert_environment_node_positions(&mut environment, &body.nodes, &known_live_nodes)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        ));
+    }
+    let runtime_config_path = s.runtime_config_path.clone();
+    let dedup_factor = s.dedup_factor;
+    let enabled_modules = sorted_module_ids(&s.enabled_modules);
+    drop(s);
+
+    if let Err(message) = save_runtime_config_file(
+        &runtime_config_path,
         &RuntimeConfig {
             dedup_factor,
             environment: environment.clone(),
@@ -7005,6 +7197,25 @@ fn module_confidence(active_nodes: usize, required_nodes: usize) -> f64 {
     } else {
         0.0
     }
+}
+
+fn sorted_module_ids(enabled_modules: &HashSet<String>) -> Vec<String> {
+    let mut ids = enabled_modules.iter().cloned().collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn module_presets_json() -> Vec<serde_json::Value> {
+    MODULE_PRESETS
+        .iter()
+        .map(|preset| {
+            serde_json::json!({
+                "id": preset.id,
+                "label": preset.label,
+                "module_ids": preset.module_ids,
+            })
+        })
+        .collect()
 }
 
 fn business_modules(active_nodes: usize, enabled_modules: &HashSet<String>) -> Vec<serde_json::Value> {
@@ -7285,16 +7496,17 @@ fn business_modules(active_nodes: usize, enabled_modules: &HashSet<String>) -> V
         .collect()
 }
 
-async fn modules_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let s = state.read().await;
-    let now = std::time::Instant::now();
-    let active_nodes = active_node_count(&s, now);
-    let modules = business_modules(active_nodes, &s.enabled_modules);
-    Json(serde_json::json!({
+fn modules_catalog_json(
+    active_nodes: usize,
+    min_nodes: usize,
+    enabled_modules: &HashSet<String>,
+) -> serde_json::Value {
+    serde_json::json!({
         "catalog": "ruvsense-edge",
         "active_nodes": active_nodes,
-        "min_nodes": s.min_nodes,
-        "enabled_modules": s.enabled_modules.iter().cloned().collect::<Vec<_>>(),
+        "min_nodes": min_nodes,
+        "enabled_modules": sorted_module_ids(enabled_modules),
+        "presets": module_presets_json(),
         "categories": [
             "Health & Vitals",
             "Safety & Security",
@@ -7302,8 +7514,19 @@ async fn modules_endpoint(State(state): State<SharedState>) -> Json<serde_json::
             "Analytics",
             "Interaction"
         ],
-        "modules": modules,
-    }))
+        "modules": business_modules(active_nodes, enabled_modules),
+    })
+}
+
+async fn modules_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let active_nodes = active_node_count(&s, now);
+    Json(modules_catalog_json(
+        active_nodes,
+        s.min_nodes,
+        &s.enabled_modules,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7311,11 +7534,69 @@ struct ModuleEnabledUpdate {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModulesEnabledUpdate {
+    enabled_modules: Vec<String>,
+}
+
 fn module_id_exists(id: &str) -> bool {
     let empty = HashSet::new();
     business_modules(0, &empty)
         .iter()
         .any(|module| module.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+fn enabled_module_set_from_ids(ids: &[String]) -> Result<HashSet<String>, String> {
+    let mut set = HashSet::new();
+    for id in ids {
+        if !module_id_exists(id) {
+            return Err(format!("unknown module '{id}'"));
+        }
+        set.insert(id.clone());
+    }
+    Ok(set)
+}
+
+async fn modules_enabled_update_endpoint(
+    State(state): State<SharedState>,
+    Json(body): Json<ModulesEnabledUpdate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let next_enabled_modules = enabled_module_set_from_ids(&body.enabled_modules).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        )
+    })?;
+
+    let s = state.read().await;
+    let runtime_config_path = s.runtime_config_path.clone();
+    let dedup_factor = s.dedup_factor;
+    let environment = s.environment.clone();
+    let enabled_modules = sorted_module_ids(&next_enabled_modules);
+    drop(s);
+
+    if let Err(message) = save_runtime_config_file(
+        &runtime_config_path,
+        &RuntimeConfig {
+            dedup_factor,
+            environment,
+            module_config_version: MODULE_CONFIG_VERSION,
+            enabled_modules,
+        },
+    ) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        ));
+    }
+
+    let mut s = state.write().await;
+    s.enabled_modules = next_enabled_modules;
+    let active_nodes = active_node_count(&s, std::time::Instant::now());
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "catalog": modules_catalog_json(active_nodes, s.min_nodes, &s.enabled_modules),
+    })))
 }
 
 async fn module_enabled_update_endpoint(
@@ -7346,14 +7627,14 @@ async fn module_enabled_update_endpoint(
         .into_iter()
         .find(|module| module.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
         .unwrap_or_else(|| serde_json::json!({ "id": id, "enabled": body.enabled }));
-    let data_dir = s.data_dir.clone();
+    let runtime_config_path = s.runtime_config_path.clone();
     let dedup_factor = s.dedup_factor;
     let environment = s.environment.clone();
-    let enabled_modules = next_enabled_modules.iter().cloned().collect();
+    let enabled_modules = sorted_module_ids(&next_enabled_modules);
     drop(s);
 
-    if let Err(message) = save_runtime_config(
-        &data_dir,
+    if let Err(message) = save_runtime_config_file(
+        &runtime_config_path,
         &RuntimeConfig {
             dedup_factor,
             environment,
@@ -10116,6 +10397,10 @@ async fn main() {
     );
 
     // ADR-044 §5.3: load persisted runtime config from the data directory.
+    let runtime_config_path = args
+        .config_file
+        .clone()
+        .unwrap_or_else(|| runtime_config_path_for_data_dir(&data_dir));
     let runtime_config_result = if let Some(path) = args.config_file.as_ref() {
         load_runtime_config_file(path)
     } else {
@@ -10325,6 +10610,7 @@ async fn main() {
         enabled_modules: runtime_config.enabled_modules.iter().cloned().collect(),
         min_nodes: args.min_nodes.max(1),
         data_dir: data_dir.clone(),
+        runtime_config_path: runtime_config_path.clone(),
         environment: runtime_config.environment.clone(),
     }));
 
@@ -10455,7 +10741,15 @@ async fn main() {
             "/api/v1/environment",
             get(environment_endpoint).put(environment_update_endpoint),
         )
+        .route(
+            "/api/v1/environment/node-positions",
+            put(environment_node_positions_update_endpoint),
+        )
         .route("/api/v1/modules", get(modules_endpoint))
+        .route(
+            "/api/v1/modules/enabled",
+            put(modules_enabled_update_endpoint),
+        )
         .route(
             "/api/v1/modules/:id/enabled",
             put(module_enabled_update_endpoint),
@@ -10617,17 +10911,54 @@ async fn main() {
 #[cfg(test)]
 mod topology_console_tests {
     use super::{
-        business_modules, default_dedup_factor, default_enabled_modules, load_runtime_config,
-        load_runtime_config_file, module_status, normalize_runtime_config, parse_log_format,
-        runtime_config_schema, save_runtime_config, schema_for_config_kind, topology_nodes_json,
-        topology_readiness_json, validate_config_file, validate_runtime_config, AccessPointConfig,
-        ConfigSchemaKind, EnvironmentConfig, EnvironmentLinkConfig, EnvironmentNodeConfig,
-        LogFormat, NodeState, RoomConfig, RuntimeConfig, ESP32_OFFLINE_TIMEOUT,
-        MODULE_CONFIG_VERSION,
+        business_modules, default_dedup_factor, default_enabled_modules, enabled_module_set_from_ids,
+        load_runtime_config, load_runtime_config_file, module_status, normalize_runtime_config,
+        parse_log_format, runtime_config_schema, save_runtime_config, save_runtime_config_file,
+        schema_for_config_kind, topology_nodes_json, topology_readiness_json,
+        upsert_environment_node_positions, validate_config_file, validate_runtime_config,
+        AccessPointConfig, ConfigSchemaKind, EnvironmentConfig, EnvironmentLinkConfig,
+        EnvironmentNodeConfig, LogFormat, NodePositionUpdate, NodeState, RoomConfig, RuntimeConfig,
+        ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION, MODULE_PRESETS,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::time::{Duration, Instant};
+
+    fn configured_test_environment() -> EnvironmentConfig {
+        EnvironmentConfig {
+            room: RoomConfig {
+                name: "test".to_string(),
+                dimensions_m: [4.0, 3.0, 2.8],
+                coordinate_system: "x_right_y_up_z_depth".to_string(),
+            },
+            access_points: vec![AccessPointConfig {
+                ap_id: "ap1".to_string(),
+                label: "AP 1".to_string(),
+                ssid: "lab".to_string(),
+                bssid: None,
+                role: "mesh".to_string(),
+                position_m: [0.0, 2.0, 0.0],
+                channel: Some(6),
+                band: "2.4GHz".to_string(),
+                active: true,
+            }],
+            nodes: vec![EnvironmentNodeConfig {
+                node_id: 1,
+                label: "node 1".to_string(),
+                kind: "esp32-c6".to_string(),
+                zone: "zone_1".to_string(),
+                position_m: [1.0, 1.0, 1.0],
+                tdm_slot: 0,
+                tdm_total: 1,
+                linked_ap: "ap1".to_string(),
+            }],
+            links: vec![EnvironmentLinkConfig {
+                link_id: "ap1-node-1".to_string(),
+                ap_id: "ap1".to_string(),
+                node_id: 1,
+            }],
+        }
+    }
 
     #[test]
     fn default_environment_does_not_invent_hardware() {
@@ -10701,6 +11032,36 @@ mod topology_console_tests {
         assert_eq!(respiration["effective_status"], serde_json::json!("active"));
         assert_eq!(sleep["enabled"], serde_json::json!(false));
         assert_eq!(sleep["effective_status"], serde_json::json!("disabled"));
+    }
+
+    #[test]
+    fn module_presets_reference_known_modules() {
+        let valid = super::valid_module_ids();
+
+        for preset in MODULE_PRESETS {
+            assert!(!preset.module_ids.is_empty(), "preset must not be empty");
+            for id in preset.module_ids {
+                assert!(valid.contains(*id), "preset references unknown module {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_enabled_module_set_replaces_and_validates() {
+        let ids = vec![
+            "intrusion_detection".to_string(),
+            "intrusion_detection".to_string(),
+            "door_open_detection".to_string(),
+        ];
+        let enabled = enabled_module_set_from_ids(&ids).expect("known module ids");
+
+        assert_eq!(enabled.len(), 2);
+        assert!(enabled.contains("intrusion_detection"));
+        assert!(enabled.contains("door_open_detection"));
+
+        let bad = enabled_module_set_from_ids(&["not_real".to_string()])
+            .expect_err("unknown modules must be rejected");
+        assert!(bad.contains("unknown module"));
     }
 
     #[test]
@@ -10822,6 +11183,30 @@ enabled_modules:
     }
 
     #[test]
+    fn save_runtime_config_file_round_trips_json_toml_and_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = RuntimeConfig {
+            dedup_factor: 2.0,
+            environment: configured_test_environment(),
+            module_config_version: MODULE_CONFIG_VERSION,
+            enabled_modules: vec![
+                "fall_detection".to_string(),
+                "respiration_tracking".to_string(),
+            ],
+        };
+
+        for name in ["runtime.json", "runtime.toml", "runtime.yaml"] {
+            let path = dir.path().join(name);
+            save_runtime_config_file(&path, &config).expect("config should save");
+            let loaded = load_runtime_config_file(&path).expect("saved config should load");
+
+            assert_eq!(loaded.dedup_factor, 2.0);
+            assert_eq!(loaded.environment.nodes[0].position_m, [1.0, 1.0, 1.0]);
+            assert_eq!(loaded.enabled_modules, config.enabled_modules);
+        }
+    }
+
+    #[test]
     fn runtime_config_file_rejects_toml_unknown_fields() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("runtime.toml");
@@ -10902,43 +11287,81 @@ surprise = true
     #[test]
     fn runtime_config_rejects_invalid_topology_links() {
         let mut config = RuntimeConfig::default();
-        config.environment = EnvironmentConfig {
-            room: RoomConfig {
-                name: "test".to_string(),
-                dimensions_m: [4.0, 3.0, 2.8],
-                coordinate_system: "x_right_y_up_z_depth".to_string(),
-            },
-            access_points: vec![AccessPointConfig {
-                ap_id: "ap1".to_string(),
-                label: "AP 1".to_string(),
-                ssid: "lab".to_string(),
-                bssid: None,
-                role: "mesh".to_string(),
-                position_m: [0.0, 2.0, 0.0],
-                channel: Some(6),
-                band: "2.4GHz".to_string(),
-                active: true,
-            }],
-            nodes: vec![EnvironmentNodeConfig {
-                node_id: 1,
-                label: "node 1".to_string(),
-                kind: "esp32-c6".to_string(),
-                zone: "zone_1".to_string(),
-                position_m: [1.0, 1.0, 1.0],
-                tdm_slot: 0,
-                tdm_total: 1,
-                linked_ap: "ap1".to_string(),
-            }],
-            links: vec![EnvironmentLinkConfig {
-                link_id: "bad-link".to_string(),
-                ap_id: "missing-ap".to_string(),
-                node_id: 1,
-            }],
-        };
+        config.environment = configured_test_environment();
+        config.environment.links[0].ap_id = "missing-ap".to_string();
+        config.environment.links[0].link_id = "bad-link".to_string();
 
         let err = validate_runtime_config(&config).expect_err("bad topology must fail");
 
         assert!(err.contains("unknown AP"));
+    }
+
+    #[test]
+    fn node_position_update_changes_configured_node() {
+        let mut env = configured_test_environment();
+        let live = std::collections::HashSet::new();
+        upsert_environment_node_positions(
+            &mut env,
+            &[NodePositionUpdate {
+                node_id: 1,
+                position_m: [1.5, 2.0, 0.25],
+            }],
+            &live,
+        )
+        .expect("configured node position should update");
+
+        assert_eq!(env.nodes[0].position_m, [1.5, 2.0, 0.25]);
+        assert_eq!(env.links.len(), 1, "links are preserved, not invented");
+    }
+
+    #[test]
+    fn node_position_update_upserts_live_unconfigured_node() {
+        let mut env = configured_test_environment();
+        let live = [2_u8].into_iter().collect::<std::collections::HashSet<_>>();
+        upsert_environment_node_positions(
+            &mut env,
+            &[NodePositionUpdate {
+                node_id: 2,
+                position_m: [-0.5, 1.25, 0.75],
+            }],
+            &live,
+        )
+        .expect("live unconfigured node should upsert");
+
+        let node = env.nodes.iter().find(|node| node.node_id == 2).unwrap();
+        assert_eq!(node.position_m, [-0.5, 1.25, 0.75]);
+        assert_eq!(node.kind, "esp32_c6");
+        assert_eq!(node.zone, "manual");
+        assert!(node.linked_ap.is_empty());
+        assert_eq!(env.links.len(), 1, "manual upsert must not create fake links");
+    }
+
+    #[test]
+    fn node_position_update_rejects_invalid_or_unknown_node() {
+        let mut env = configured_test_environment();
+        let live = std::collections::HashSet::new();
+
+        let err = upsert_environment_node_positions(
+            &mut env,
+            &[NodePositionUpdate {
+                node_id: 2,
+                position_m: [0.0, 0.0, 0.0],
+            }],
+            &live,
+        )
+        .expect_err("unknown non-live node must be rejected");
+        assert!(err.contains("not configured or live"));
+
+        let err = upsert_environment_node_positions(
+            &mut env,
+            &[NodePositionUpdate {
+                node_id: 1,
+                position_m: [f64::NAN, 0.0, 0.0],
+            }],
+            &live,
+        )
+        .expect_err("non-finite coordinates must be rejected");
+        assert!(err.contains("invalid position"));
     }
 
     #[test]
@@ -11413,12 +11836,12 @@ async fn config_set_dedup_factor(
     let value = body.get("value").and_then(|v| v.as_f64()).unwrap_or(3.0);
     let clamped = value.clamp(1.0, 10.0);
     let s = state.read().await;
-    let data_dir = s.data_dir.clone();
+    let runtime_config_path = s.runtime_config_path.clone();
     let environment = s.environment.clone();
-    let enabled_modules = s.enabled_modules.iter().cloned().collect();
+    let enabled_modules = sorted_module_ids(&s.enabled_modules);
     drop(s);
-    if let Err(message) = save_runtime_config(
-        &data_dir,
+    if let Err(message) = save_runtime_config_file(
+        &runtime_config_path,
         &RuntimeConfig {
             dedup_factor: clamped,
             environment,
@@ -11470,12 +11893,12 @@ async fn config_set_ground_truth(
         3.0
     };
     let clamped = optimal.clamp(1.0, 10.0);
-    let data_dir = s.data_dir.clone();
+    let runtime_config_path = s.runtime_config_path.clone();
     let environment = s.environment.clone();
-    let enabled_modules = s.enabled_modules.iter().cloned().collect();
+    let enabled_modules = sorted_module_ids(&s.enabled_modules);
     drop(s);
-    if let Err(message) = save_runtime_config(
-        &data_dir,
+    if let Err(message) = save_runtime_config_file(
+        &runtime_config_path,
         &RuntimeConfig {
             dedup_factor: clamped,
             environment,

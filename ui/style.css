@@ -314,8 +314,7 @@ h3 {
   text-decoration: none;
 }
 
-.rail-button.is-active,
-.panel-tabs button.is-active {
+.rail-button.is-active {
   border-color: var(--green);
   background: rgba(57, 209, 143, 0.12);
   color: var(--text);
@@ -323,7 +322,7 @@ h3 {
 
 .topology-pane {
   display: grid;
-  grid-template-rows: auto minmax(320px, 1fr) auto;
+  grid-template-rows: auto minmax(320px, 1fr) auto auto;
   gap: 10px;
   padding: 12px;
   overflow: hidden;
@@ -409,6 +408,28 @@ h3 {
   border-top: 1px dashed rgba(227, 180, 71, 0.62);
 }
 
+.node-distance-line {
+  position: absolute;
+  height: 2px;
+  transform-origin: 0 50%;
+  background: rgba(92, 200, 255, 0.44);
+  pointer-events: none;
+}
+
+.node-distance-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(92, 200, 255, 0.45);
+  border-radius: 999px;
+  background: rgba(7, 17, 15, 0.88);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 900;
+  padding: 2px 6px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
 .topology-marker {
   position: absolute;
   transform: translate(-50%, -50%);
@@ -423,6 +444,7 @@ h3 {
   padding: 5px 7px;
   font-size: 11px;
   white-space: nowrap;
+  z-index: 2;
 }
 
 .topology-marker i {
@@ -449,6 +471,20 @@ h3 {
 
 .topology-marker.node i {
   background: var(--green);
+}
+
+.topology-marker.node {
+  cursor: grab;
+  touch-action: none;
+}
+
+.topology-marker.node:active {
+  cursor: grabbing;
+}
+
+.topology-marker.is-selected {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(57, 209, 143, 0.16);
 }
 
 .topology-marker.estimated {
@@ -509,35 +545,45 @@ h3 {
   display: inline-block;
 }
 
-.side-panel {
+.placement-toolbar {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  overflow: hidden;
-}
-
-.panel-tabs {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
-  border-bottom: 1px solid var(--line-soft);
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--bg-1);
   padding: 8px;
 }
 
-.panel-tabs button,
-.panel-tabs a {
+.placement-detail {
   min-width: 0;
-  min-height: 34px;
-  display: inline-grid;
-  place-items: center;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #0b1512;
-  padding: 6px;
+  display: grid;
+  gap: 2px;
+}
+
+.placement-detail strong,
+.placement-detail small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.placement-detail small {
   color: var(--muted);
   font-size: 11px;
-  font-weight: 800;
-  text-align: center;
-  text-decoration: none;
+}
+
+.placement-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.side-panel {
+  overflow: hidden;
 }
 
 .panel-view {
@@ -650,6 +696,40 @@ h3 {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(112px, 0.4fr);
   gap: 8px;
+}
+
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.preset-button {
+  min-width: 0;
+  min-height: 54px;
+  display: grid;
+  justify-items: start;
+  align-content: center;
+  gap: 3px;
+  text-align: left;
+}
+
+.preset-button.is-active {
+  border-color: var(--green);
+  background: rgba(57, 209, 143, 0.12);
+}
+
+.preset-button strong,
+.preset-button small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preset-button small {
+  color: var(--muted);
+  font-size: 10px;
 }
 
 input,
@@ -1051,7 +1131,7 @@ select {
   }
 
   .topology-pane {
-    grid-template-rows: auto 420px auto;
+    grid-template-rows: auto 420px auto auto;
   }
 
   .section-head,
@@ -1067,8 +1147,9 @@ select {
     justify-content: flex-start;
   }
 
-  .panel-tabs {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .placement-toolbar,
+  .preset-grid {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -1084,7 +1165,7 @@ select {
   }
 
   .topology-pane {
-    grid-template-rows: auto 360px auto;
+    grid-template-rows: auto 360px auto auto;
   }
 
   .dense-row,

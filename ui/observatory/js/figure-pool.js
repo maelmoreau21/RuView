@@ -106,7 +106,7 @@ const OVERSHOOT = [
   0.06, // 16 right ankle
 ];
 
-const MAX_FIGURES = 4;
+const MAX_FIGURES = 8;
 
 // Reusable vectors to avoid per-frame allocation
 const _vecFrom = new THREE.Vector3();
@@ -240,6 +240,23 @@ export class FigurePool {
     personLight.position.y = 1;
     group.add(personLight);
 
+    const labelCanvas = document.createElement('canvas');
+    labelCanvas.width = 320;
+    labelCanvas.height = 128;
+    const labelCtx = labelCanvas.getContext('2d');
+    const labelTexture = new THREE.CanvasTexture(labelCanvas);
+    if ('colorSpace' in labelTexture) labelTexture.colorSpace = THREE.SRGBColorSpace;
+    const labelMat = new THREE.SpriteMaterial({
+      map: labelTexture,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const label = new THREE.Sprite(labelMat);
+    label.scale.set(1.15, 0.46, 1);
+    group.add(label);
+
     // Interpolation state: previous positions for smooth lerp and secondary motion
     const prevPositions = [];
     const velocities = [];
@@ -250,11 +267,13 @@ export class FigurePool {
 
     return {
       group, joints, bones, bodySegments, aura, auraMat, personLight,
+      label, labelMat, labelCtx, labelTexture,
       visible: false,
       prevPositions,
       velocities,
       _initialized: false,
       _lastPose: null,
+      _labelText: '',
     };
   }
 
@@ -300,6 +319,124 @@ export class FigurePool {
     ]);
   }
 
+  _firstFinite(...values) {
+    for (const value of values) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  }
+
+  _personVitals(person, data) {
+    const own = person?.vital_signs || person?.vitals || {};
+    const frame = data?.vital_signs || {};
+    const heart = this._firstFinite(
+      own.heart_rate_bpm,
+      own.heartrate_bpm,
+      own.hr_proxy_bpm,
+      own.heart_rate,
+      own.hr,
+      frame.heart_rate_bpm,
+      frame.heartrate_bpm,
+      frame.hr_proxy_bpm,
+      frame.heart_rate,
+      frame.hr,
+    );
+    const breathing = this._firstFinite(
+      own.breathing_rate_bpm,
+      own.breathing_bpm,
+      own.breathing_rate,
+      own.br,
+      frame.breathing_rate_bpm,
+      frame.breathing_bpm,
+      frame.breathing_rate,
+      frame.br,
+    );
+    const confidence = this._firstFinite(
+      person?.confidence,
+      person?.tracking_confidence,
+      own.confidence,
+      own.signal_quality,
+      data?.classification?.confidence,
+    );
+    return { heart, breathing, confidence };
+  }
+
+  _formatRate(value) {
+    return value != null && value > 0 ? String(Math.round(value)) : '--';
+  }
+
+  _formatConfidence(value) {
+    if (value == null) return '--';
+    const pct = value <= 1 ? value * 100 : value;
+    return `${Math.round(Math.max(0, Math.min(100, pct)))}%`;
+  }
+
+  _roundedRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  _drawVitalsBillboard(fig, person, vitals) {
+    const label = `P${person?.id ?? '?'} HR ${this._formatRate(vitals.heart)} BR ${this._formatRate(vitals.breathing)} C ${this._formatConfidence(vitals.confidence)}`;
+    if (fig._labelText === label) return;
+
+    const ctx = fig.labelCtx;
+    const w = ctx.canvas.width;
+    const h = ctx.canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.shadowColor = 'rgba(0, 216, 120, 0.45)';
+    ctx.shadowBlur = 18;
+    this._roundedRect(ctx, 10, 18, w - 20, h - 34, 18);
+    ctx.fillStyle = 'rgba(5, 13, 19, 0.84)';
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(62, 255, 138, 0.72)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = '#b8ffd2';
+    ctx.font = '700 24px Inter, system-ui, sans-serif';
+    ctx.fillText(`P${person?.id ?? '?'}`, 30, 50);
+
+    ctx.font = '600 22px Inter, system-ui, sans-serif';
+    ctx.fillStyle = '#ff6a82';
+    ctx.fillText(`HR ${this._formatRate(vitals.heart)}`, 88, 50);
+    ctx.fillStyle = '#51dcff';
+    ctx.fillText(`BR ${this._formatRate(vitals.breathing)}`, 180, 50);
+
+    ctx.font = '600 20px Inter, system-ui, sans-serif';
+    ctx.fillStyle = '#d8f7ff';
+    ctx.fillText(`Conf ${this._formatConfidence(vitals.confidence)}`, 30, 86);
+    ctx.restore();
+
+    fig._labelText = label;
+    fig.labelTexture.needsUpdate = true;
+  }
+
+  _updateVitalsBillboard(fig, person, data, position) {
+    const vitals = this._personVitals(person, data);
+    this._drawVitalsBillboard(fig, person, vitals);
+    const head = fig.joints[0]?.position;
+    const maxY = fig.joints.reduce((highest, joint) => Math.max(highest, joint.position.y), position[1] + 1.7);
+    fig.label.position.set(
+      head?.x ?? position[0],
+      maxY + 0.34,
+      head?.z ?? position[2],
+    );
+    fig.labelMat.opacity = 0.94;
+  }
+
   /**
    * Update all figures based on current data frame.
    * @param {object} data - Current sensing data with persons[], vital_signs, classification
@@ -309,7 +446,7 @@ export class FigurePool {
     const persons = data?.persons || [];
     const vs = data?.vital_signs || {};
     const isPresent = data?.classification?.presence || false;
-    const breathBpm = vs.breathing_rate_bpm || 0;
+    const breathBpm = this._firstFinite(vs.breathing_rate_bpm, vs.breathing_bpm, 0) || 0;
     const breathPulse = breathBpm > 0
       ? Math.sin(elapsed * Math.PI * 2 * (breathBpm / 60)) * 0.012
       : 0;
@@ -329,6 +466,7 @@ export class FigurePool {
         const kps = this._liveKeypoints(p, position)
           || this._poseSystem.generateKeypoints({ ...p, position }, elapsed, breathPulse);
         this.applyKeypoints(fig, kps, breathPulse, position, elapsed, p.pose);
+        this._updateVitalsBillboard(fig, p, data, position);
         fig.visible = true;
       } else {
         if (fig.visible) {
@@ -525,6 +663,8 @@ export class FigurePool {
     for (const seg of fig.bodySegments) seg.mat.opacity = 0;
     fig.auraMat.opacity = 0;
     fig.personLight.intensity = 0;
+    fig.labelMat.opacity = 0;
+    fig._labelText = '';
     fig._initialized = false;
   }
 

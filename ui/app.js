@@ -9,8 +9,14 @@ const state = {
   reconnectTimer: null,
   moduleFilter: '',
   moduleCategory: 'All',
+  modulePresets: [],
   activePanel: 'fleet',
   logSeen: new Set(),
+  placementDraft: new Map(),
+  placementOriginal: new Map(),
+  placementSelectedId: null,
+  placementDirty: false,
+  draggingNodeId: null,
 };
 
 const VALID_PANELS = new Set(['fleet', 'modules', 'vitals', 'calibration', 'diagnostics']);
@@ -97,6 +103,22 @@ async function setModuleEnabled(id, enabled) {
   });
 }
 
+async function setEnabledModules(enabledModules) {
+  return fetchJson('/api/v1/modules/enabled', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled_modules: enabledModules }),
+  });
+}
+
+async function saveNodePositions(nodes) {
+  return fetchJson('/api/v1/environment/node-positions', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodes }),
+  });
+}
+
 function topologyRoom() {
   return state.topology?.room || { name: 'primary', dimensions_m: [5.2, 2.6, 4.8] };
 }
@@ -122,12 +144,74 @@ function positionOf(item) {
   };
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function clonePosition(pos) {
+  return {
+    x: Number(pos?.x) || 0,
+    y: Number(pos?.y) || 0,
+    z: Number(pos?.z) || 0,
+    source: text(pos?.source, 'manual'),
+    confidence: Number(pos?.confidence ?? 0.95),
+  };
+}
+
+function nodeIdOf(node) {
+  return Number(node?.node_id);
+}
+
+function currentNodePosition(node) {
+  const id = nodeIdOf(node);
+  return state.placementDraft.get(id) || clonePosition(positionOf(node));
+}
+
 function pointToStage(pos) {
-  const [width, , depth] = roomDims();
+  const [width, height] = roomDims();
   return {
     left: Math.max(4, Math.min(96, ((pos.x / width) + 0.5) * 100)),
-    top: Math.max(4, Math.min(96, ((pos.z / depth) + 0.5) * 100)),
+    top: Math.max(4, Math.min(96, (0.5 - (pos.y / height)) * 100)),
   };
+}
+
+function stageToPosition(stage, clientX, clientY, current) {
+  const rect = stage.getBoundingClientRect();
+  const [width, height] = roomDims();
+  const leftPct = clamp((clientX - rect.left) / Math.max(1, rect.width), 0.04, 0.96);
+  const topPct = clamp((clientY - rect.top) / Math.max(1, rect.height), 0.04, 0.96);
+  return {
+    ...clonePosition(current),
+    x: (leftPct - 0.5) * width,
+    y: (0.5 - topPct) * height,
+    source: 'manual',
+    confidence: 1,
+  };
+}
+
+function syncPlacementState(force = false) {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const liveIds = new Set(nodes.map(nodeIdOf));
+  for (const node of nodes) {
+    const id = nodeIdOf(node);
+    const pos = clonePosition(positionOf(node));
+    if (force || !state.placementDirty || !state.placementDraft.has(id)) {
+      state.placementDraft.set(id, pos);
+      state.placementOriginal.set(id, clonePosition(pos));
+    }
+  }
+  for (const id of [...state.placementDraft.keys()]) {
+    if (!liveIds.has(id)) {
+      state.placementDraft.delete(id);
+      state.placementOriginal.delete(id);
+      if (state.placementSelectedId === id) state.placementSelectedId = null;
+    }
+  }
+}
+
+function markPlacementDirty() {
+  state.placementDirty = true;
+  renderPlacementControls();
 }
 
 function renderStatus() {
@@ -159,18 +243,22 @@ function renderStatus() {
 }
 
 function marker(kind, item, compact) {
-  const pos = positionOf(item);
+  const pos = kind === 'node' ? currentNodePosition(item) : positionOf(item);
   const p = pointToStage(pos);
   const label = kind === 'ap'
     ? text(item.ssid || item.label || item.bssid, 'Hidden AP')
     : text(item.display_label || item.label || `C6-${item.node_id}`, `C6-${item.node_id}`);
   const detail = kind === 'ap'
     ? `${fmtDbm(item.rssi_dbm)} / ch ${text(item.channel)}`
-    : `${text(item.health_status || item.status, 'offline')} / ${fmtDbm(item.rssi_dbm)}`;
-  const el = create('div', `topology-marker ${kind} ${statusClass(item.health_status || item.status || pos.source)} ${statusClass(pos.source)}${compact ? ' compact' : ''}`);
+    : `${pos.x.toFixed(2)} / ${pos.y.toFixed(2)} / z ${pos.z.toFixed(2)}`;
+  const selected = kind === 'node' && nodeIdOf(item) === state.placementSelectedId;
+  const el = create('div', `topology-marker ${kind} ${statusClass(item.health_status || item.status || pos.source)} ${statusClass(pos.source)}${compact ? ' compact' : ''}${selected ? ' is-selected' : ''}`);
   el.style.left = `${p.left}%`;
   el.style.top = `${p.top}%`;
-  el.title = `${label} / ${pos.source} / confidence ${fmtPct(pos.confidence)}`;
+  el.title = kind === 'node'
+    ? `${label} / X ${pos.x.toFixed(2)} / Y ${pos.y.toFixed(2)} / Z ${pos.z.toFixed(2)}`
+    : `${label} / ${pos.source} / confidence ${fmtPct(pos.confidence)}`;
+  if (kind === 'node') el.dataset.nodeId = String(item.node_id);
   el.append(create('i'), create('strong', '', label), create('small', '', detail));
   return el;
 }
@@ -192,14 +280,55 @@ function renderLink(stage, link, apsByBssid, nodesById) {
   stage.append(line);
 }
 
+function distanceBetween(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+function renderDistance(stage, aNode, bNode) {
+  const aPos = currentNodePosition(aNode);
+  const bPos = currentNodePosition(bNode);
+  const a = pointToStage(aPos);
+  const b = pointToStage(bPos);
+  const dx = b.left - a.left;
+  const dy = b.top - a.top;
+  const line = create('div', 'node-distance-line');
+  line.style.left = `${a.left}%`;
+  line.style.top = `${a.top}%`;
+  line.style.width = `${Math.hypot(dx, dy)}%`;
+  line.style.transform = `rotate(${Math.atan2(dy, dx)}rad)`;
+  const label = create('span', 'node-distance-label', `${distanceBetween(aPos, bPos).toFixed(2)} m`);
+  label.style.left = `${(a.left + b.left) / 2}%`;
+  label.style.top = `${(a.top + b.top) / 2}%`;
+  stage.append(line, label);
+}
+
+function renderNodeDistances(stage, nodes) {
+  if (nodes.length < 2) return;
+  const selectedId = state.placementSelectedId;
+  if (selectedId && nodes.length > 8) {
+    const selected = nodes.find((node) => nodeIdOf(node) === selectedId);
+    if (!selected) return;
+    for (const node of nodes) {
+      if (nodeIdOf(node) !== selectedId) renderDistance(stage, selected, node);
+    }
+    return;
+  }
+  if (nodes.length > 8) return;
+  for (let i = 0; i < nodes.length; i += 1) {
+    for (let j = i + 1; j < nodes.length; j += 1) {
+      renderDistance(stage, nodes[i], nodes[j]);
+    }
+  }
+}
+
 function renderTopology() {
   const stage = $('#topology-stage');
   if (!stage) return;
   stage.replaceChildren();
+  syncPlacementState();
 
   const aps = Array.isArray(state.topology?.access_points) ? state.topology.access_points : [];
   const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
-  const links = Array.isArray(state.topology?.links) ? state.topology.links : [];
   const compact = nodes.length > 24 || window.innerWidth < 520;
 
   if (!aps.length && !nodes.length) {
@@ -207,11 +336,27 @@ function renderTopology() {
     return;
   }
 
-  const apsByBssid = new Map(aps.map((ap) => [String(ap.bssid || '').toLowerCase(), ap]));
-  const nodesById = new Map(nodes.map((node) => [Number(node.node_id), node]));
-  for (const link of links) renderLink(stage, link, apsByBssid, nodesById);
+  renderNodeDistances(stage, nodes);
   for (const ap of aps) stage.append(marker('ap', ap, compact && (aps.length > 12 || window.innerWidth < 520)));
   for (const node of nodes) stage.append(marker('node', node, compact));
+}
+
+function renderPlacementControls() {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const selected = nodes.find((node) => nodeIdOf(node) === state.placementSelectedId);
+  const selectedLabel = selected
+    ? text(selected.display_label || selected.label, `ESP32-C6 #${selected.node_id}`)
+    : 'No node selected';
+  const pos = selected ? currentNodePosition(selected) : null;
+  setText('placement-selected', selectedLabel);
+  setText('placement-coordinates', pos
+    ? `X ${pos.x.toFixed(2)} m / Y ${pos.y.toFixed(2)} m / Z ${pos.z.toFixed(2)} m`
+    : 'X -- / Y -- / Z --');
+  setText('placement-state', state.placementDirty ? 'unsaved' : 'saved');
+  const save = $('#save-placement');
+  if (save) save.disabled = !state.placementDirty || !nodes.length;
+  const reset = $('#reset-placement');
+  if (reset) reset.disabled = !state.placementDirty;
 }
 
 function denseRow(title, subtitle, meta, status) {
@@ -237,11 +382,11 @@ function renderFleet() {
     nodeList?.append(emptyRow('Aucun ESP32-C6 vu par le master'));
   } else {
     for (const node of nodes) {
-      const pos = positionOf(node);
+      const pos = currentNodePosition(node);
       const status = text(node.health_status || node.status, node.active ? 'live' : 'offline');
       nodeList?.append(denseRow(
         text(node.display_label || node.label, `ESP32-C6 #${node.node_id}`),
-        `node_id ${node.node_id} / ${text(node.remote_addr, 'no addr')} / pos ${pos.source}`,
+        `node_id ${node.node_id} / ${text(node.remote_addr, 'no addr')} / X ${pos.x.toFixed(2)} Y ${pos.y.toFixed(2)}`,
         [fmtHz(node.frame_rate_hz), `CSI ${fmtAge(node.last_csi_ms ?? node.last_seen_ms)}`, fmtPct(pos.confidence)],
         status
       ));
@@ -277,8 +422,28 @@ function renderModuleControls() {
   }));
 }
 
+function renderModulePresets() {
+  const container = $('#module-presets');
+  if (!container) return;
+  clear(container);
+  const enabled = new Set(state.modules.filter((mod) => mod.enabled !== false).map((mod) => mod.id));
+  for (const preset of state.modulePresets) {
+    const moduleIds = preset.module_ids || preset.modules || [];
+    const active = moduleIds.length === enabled.size && moduleIds.every((id) => enabled.has(id));
+    const button = create('button', `preset-button${active ? ' is-active' : ''}`);
+    button.type = 'button';
+    button.dataset.presetId = preset.id;
+    button.append(
+      create('strong', '', text(preset.label, preset.id)),
+      create('small', '', `${moduleIds.length} modules`)
+    );
+    container.append(button);
+  }
+}
+
 function renderModules() {
   renderModuleControls();
+  renderModulePresets();
   const body = $('#module-table');
   clear(body);
   const q = state.moduleFilter.trim().toLowerCase();
@@ -389,6 +554,7 @@ function renderCalibration() {
 function renderAll() {
   renderStatus();
   renderTopology();
+  renderPlacementControls();
   renderFleet();
   renderModules();
   renderVitals();
@@ -425,7 +591,10 @@ async function refreshRest() {
     state.topology = null;
     logEvent(topologyResult.reason.message, 'warn');
   }
-  if (modulesResult.status === 'fulfilled') state.modules = modulesResult.value.modules || [];
+  if (modulesResult.status === 'fulfilled') {
+    state.modules = modulesResult.value.modules || [];
+    state.modulePresets = modulesResult.value.presets || [];
+  }
   if (vitalsResult.status === 'fulfilled') state.vitals = vitalsResult.value;
   if (edgeVitalsResult.status === 'fulfilled') state.edgeVitals = edgeVitalsResult.value;
   if (calibrationResult.status === 'fulfilled') state.calibration = calibrationResult.value;
@@ -458,6 +627,73 @@ function connectWs() {
   ws.onerror = () => ws.close();
 }
 
+function selectNode(nodeId) {
+  state.placementSelectedId = nodeId;
+  renderTopology();
+  renderPlacementControls();
+}
+
+function beginNodeDrag(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  const markerEl = target?.closest('.topology-marker.node');
+  if (!markerEl) return;
+  const nodeId = Number(markerEl.dataset.nodeId);
+  if (!Number.isFinite(nodeId)) return;
+  event.preventDefault();
+  state.draggingNodeId = nodeId;
+  selectNode(nodeId);
+}
+
+function updateNodeDrag(event) {
+  if (!state.draggingNodeId) return;
+  const stage = $('#topology-stage');
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const node = nodes.find((item) => nodeIdOf(item) === state.draggingNodeId);
+  if (!stage || !node) return;
+  const next = stageToPosition(stage, event.clientX, event.clientY, currentNodePosition(node));
+  state.placementDraft.set(state.draggingNodeId, next);
+  markPlacementDirty();
+  renderTopology();
+  renderFleet();
+}
+
+function endNodeDrag() {
+  state.draggingNodeId = null;
+}
+
+function resetPlacement() {
+  state.placementDirty = false;
+  state.placementDraft.clear();
+  state.placementOriginal.clear();
+  syncPlacementState(true);
+  renderAll();
+}
+
+async function persistPlacement() {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  if (!nodes.length) return;
+  const payload = nodes.map((node) => {
+    const pos = currentNodePosition(node);
+    return {
+      node_id: nodeIdOf(node),
+      position_m: [pos.x, pos.y, pos.z],
+    };
+  });
+  const save = $('#save-placement');
+  if (save) save.disabled = true;
+  try {
+    await saveNodePositions(payload);
+    state.placementDirty = false;
+    state.placementOriginal.clear();
+    state.placementDraft.clear();
+    logEvent('Node positions saved');
+    await refreshRest();
+  } catch (error) {
+    logEvent(error.message, 'warn');
+    renderPlacementControls();
+  }
+}
+
 function bindActions() {
   for (const button of $$('[data-panel]')) {
     button.addEventListener('click', () => activatePanel(button.dataset.panel, true));
@@ -474,6 +710,23 @@ function bindActions() {
   $('#module-category')?.addEventListener('change', (event) => {
     state.moduleCategory = event.target.value;
     renderModules();
+  });
+  $('#module-presets')?.addEventListener('click', async (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest('button[data-preset-id]');
+    if (!button) return;
+    const preset = state.modulePresets.find((item) => item.id === button.dataset.presetId);
+    if (!preset) return;
+    button.disabled = true;
+    try {
+      await setEnabledModules(preset.module_ids || preset.modules || []);
+      logEvent(`${text(preset.label, preset.id)} preset applied`);
+      await refreshRest();
+    } catch (error) {
+      logEvent(error.message, 'warn');
+    } finally {
+      button.disabled = false;
+    }
   });
   $('#module-table')?.addEventListener('change', async (event) => {
     const input = event.target;
@@ -508,6 +761,12 @@ function bindActions() {
       logEvent(error.message, 'warn');
     }
   });
+  $('#topology-stage')?.addEventListener('pointerdown', beginNodeDrag);
+  window.addEventListener('pointermove', updateNodeDrag);
+  window.addEventListener('pointerup', endNodeDrag);
+  window.addEventListener('pointercancel', endNodeDrag);
+  $('#reset-placement')?.addEventListener('click', resetPlacement);
+  $('#save-placement')?.addEventListener('click', persistPlacement);
 }
 
 function fixtureTopology(count = 3) {
