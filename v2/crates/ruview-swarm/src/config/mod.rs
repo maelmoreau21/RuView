@@ -1,8 +1,10 @@
 //! TOML-based swarm configuration with mission profiles.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SwarmConfig {
     pub swarm: SwarmParams,
     pub formation: FormationConfig,
@@ -12,7 +14,8 @@ pub struct SwarmConfig {
     pub demo: Option<DemoConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SwarmParams {
     pub max_agents: usize,
     pub cluster_size: usize,
@@ -21,7 +24,8 @@ pub struct SwarmParams {
     pub gossip_fanout: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FormationConfig {
     /// "virtual_structure" | "leader_follower" | "reynolds"
     pub mode: String,
@@ -29,7 +33,8 @@ pub struct FormationConfig {
     pub grid_spacing_m: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlanningConfig {
     pub flight_altitude_m: f64,
     pub max_speed_ms: f64,
@@ -40,7 +45,8 @@ pub struct PlanningConfig {
     pub convergence_threshold: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     pub mavlink_signing: bool,
     pub uwb_antispoofing: bool,
@@ -51,7 +57,8 @@ pub struct SecurityConfig {
     pub remote_id_broadcast_hz: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MissionConfig {
     /// "sar" | "inspection" | "agriculture" | "mine" | "relay"
     pub profile: String,
@@ -61,7 +68,8 @@ pub struct MissionConfig {
     pub max_flight_time_mins: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DemoConfig {
     pub synthetic_csi: bool,
     /// Victim positions in NED [x, y, z].
@@ -75,6 +83,88 @@ pub struct DemoConfig {
 impl SwarmConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
+    }
+
+    pub fn schema() -> schemars::schema::RootSchema {
+        schemars::schema_for!(SwarmConfig)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.swarm.max_agents == 0 {
+            return Err("swarm.max_agents must be at least 1".to_string());
+        }
+        if self.swarm.cluster_size == 0 {
+            return Err("swarm.cluster_size must be at least 1".to_string());
+        }
+        if self.swarm.cluster_size > self.swarm.max_agents {
+            return Err("swarm.cluster_size cannot exceed swarm.max_agents".to_string());
+        }
+        if self.swarm.raft_heartbeat_ms == 0 || self.swarm.raft_election_timeout_ms == 0 {
+            return Err("swarm raft timeouts must be positive".to_string());
+        }
+        if self.swarm.raft_election_timeout_ms <= self.swarm.raft_heartbeat_ms {
+            return Err(
+                "swarm.raft_election_timeout_ms must exceed swarm.raft_heartbeat_ms".to_string(),
+            );
+        }
+        if self.swarm.gossip_fanout == 0 {
+            return Err("swarm.gossip_fanout must be at least 1".to_string());
+        }
+
+        const FORMATION_MODES: &[&str] = &["virtual_structure", "leader_follower", "reynolds"];
+        if !FORMATION_MODES.contains(&self.formation.mode.as_str()) {
+            return Err(format!("formation.mode '{}' is unsupported", self.formation.mode));
+        }
+        require_positive("formation.min_separation_m", self.formation.min_separation_m)?;
+        require_positive("formation.grid_spacing_m", self.formation.grid_spacing_m)?;
+
+        require_positive("planning.flight_altitude_m", self.planning.flight_altitude_m)?;
+        require_positive("planning.max_speed_ms", self.planning.max_speed_ms)?;
+        require_positive("planning.csi_scan_width_m", self.planning.csi_scan_width_m)?;
+        require_range(
+            "planning.lateral_overlap_pct",
+            self.planning.lateral_overlap_pct,
+            0.0,
+            100.0,
+        )?;
+        require_range(
+            "planning.convergence_threshold",
+            self.planning.convergence_threshold as f64,
+            0.0,
+            1.0,
+        )?;
+
+        require_non_negative("security.uwb_tolerance_m", self.security.uwb_tolerance_m)?;
+        require_non_negative(
+            "security.geofence_hard_margin_m",
+            self.security.geofence_hard_margin_m,
+        )?;
+        require_non_negative(
+            "security.geofence_soft_margin_m",
+            self.security.geofence_soft_margin_m,
+        )?;
+        require_positive(
+            "security.remote_id_broadcast_hz",
+            self.security.remote_id_broadcast_hz,
+        )?;
+
+        const MISSION_PROFILES: &[&str] = &["sar", "inspection", "agriculture", "mine", "relay"];
+        if !MISSION_PROFILES.contains(&self.mission.profile.as_str()) {
+            return Err(format!("mission.profile '{}' is unsupported", self.mission.profile));
+        }
+        require_positive("mission.area_width_m", self.mission.area_width_m)?;
+        require_positive("mission.area_height_m", self.mission.area_height_m)?;
+        require_positive("mission.grid_resolution_m", self.mission.grid_resolution_m)?;
+        require_positive("mission.max_flight_time_mins", self.mission.max_flight_time_mins)?;
+
+        if let Some(demo) = &self.demo {
+            require_non_negative("demo.wind_noise_ms", demo.wind_noise_ms)?;
+            require_non_negative("demo.csi_noise_std", demo.csi_noise_std)?;
+            require_range("demo.packet_loss_pct", demo.packet_loss_pct, 0.0, 100.0)?;
+            require_positive("demo.replay_speed", demo.replay_speed)?;
+        }
+
+        Ok(())
     }
 
     pub fn sar_default() -> Self {
@@ -170,6 +260,30 @@ impl SwarmConfig {
             replay_speed: 1.0,
         });
         cfg
+    }
+}
+
+fn require_positive(field: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(format!("{field} must be a finite positive value"))
+    }
+}
+
+fn require_non_negative(field: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(format!("{field} must be a finite non-negative value"))
+    }
+}
+
+fn require_range(field: &str, value: f64, min: f64, max: f64) -> Result<(), String> {
+    if value.is_finite() && (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{field} must be a finite value in [{min}, {max}]"))
     }
 }
 

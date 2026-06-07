@@ -436,6 +436,7 @@ pub struct CalibrationDeviationScore {
 /// Phase precondition: the caller must pass frames processed by
 /// `PhaseSanitizer` and `phase_align.rs`. Unsanitised phase produces
 /// inflated `phase_dispersion` values.
+#[derive(Debug, Clone)]
 pub struct CalibrationRecorder {
     config: CalibrationConfig,
     started_at_unix_s: i64,

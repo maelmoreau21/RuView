@@ -33,6 +33,7 @@ wifi-densepose-core = { path = "../wifi-densepose-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 toml = "0.8"
+schemars = { workspace = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

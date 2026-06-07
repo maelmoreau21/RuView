@@ -54,6 +54,26 @@ impl CompressedHeartbeatSpectrogram {
         self.frame_count
     }
 
+    /// Number of encoded bytes retained across all frequency bins.
+    pub fn encoded_bytes(&self) -> usize {
+        self.encoded.iter().map(Vec::len).sum()
+    }
+
+    /// Number of raw bytes represented by pushed `f32` spectrogram columns.
+    pub fn raw_bytes(&self) -> usize {
+        self.frame_count as usize * self.n_freq_bins * std::mem::size_of::<f32>()
+    }
+
+    /// Raw-to-encoded size ratio. Returns `0.0` before the compressor flushes.
+    pub fn compression_ratio(&self) -> f64 {
+        let encoded = self.encoded_bytes();
+        if encoded == 0 {
+            0.0
+        } else {
+            self.raw_bytes() as f64 / encoded as f64
+        }
+    }
+
     /// Extract mean squared power in a frequency band (indices `low_bin..=high_bin`).
     ///
     /// Decodes only the bins in the requested range and returns the mean of

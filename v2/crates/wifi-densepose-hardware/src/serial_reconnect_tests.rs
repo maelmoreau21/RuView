@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::{
     FakeSerialPort, FakeSerialPortFactory, SerialReconnectConfig, SerialReconnectEvent,
-    SerialReconnectError, SerialReconnectSupervisor,
+    SerialReconnectError, SerialReconnectSupervisor, DEFAULT_BAUD_CANDIDATES,
 };
 
 fn test_config() -> SerialReconnectConfig {
@@ -34,7 +34,54 @@ fn open_failures_use_exponential_backoff_until_cap() {
     }
 
     assert_eq!(supervisor.next_reconnect_delay(), Duration::from_millis(40));
-    assert_eq!(supervisor.stats().open_attempts, 3);
+    assert_eq!(supervisor.stats().open_attempts, 9);
+    let expected_baud_attempts = DEFAULT_BAUD_CANDIDATES.as_slice().repeat(3);
+    assert_eq!(
+        supervisor.factory().baud_attempts(),
+        expected_baud_attempts.as_slice()
+    );
+}
+
+#[test]
+fn open_probes_default_baud_candidates_until_one_connects() {
+    let mut port = FakeSerialPort::new();
+    port.push_bytes(b"ok");
+
+    let mut factory = FakeSerialPortFactory::new();
+    factory.push_open_error(io::ErrorKind::InvalidInput, "unsupported baud");
+    factory.push_port(port);
+
+    let mut supervisor =
+        SerialReconnectSupervisor::new(test_config(), factory).expect("valid config");
+
+    assert_eq!(
+        supervisor.config().baud_candidates,
+        DEFAULT_BAUD_CANDIDATES.to_vec()
+    );
+    assert!(matches!(
+        supervisor.poll_once(),
+        SerialReconnectEvent::Connected { attempt: 2, .. }
+    ));
+    assert_eq!(supervisor.config().baud_rate, 460_800);
+    assert_eq!(supervisor.factory().baud_attempts(), &[115_200, 460_800]);
+    assert_eq!(supervisor.next_reconnect_delay(), Duration::from_millis(10));
+    assert_eq!(
+        supervisor.poll_once(),
+        SerialReconnectEvent::Data {
+            bytes: b"ok".to_vec()
+        }
+    );
+}
+
+#[test]
+fn configured_default_baud_is_probed_first_even_when_in_default_list() {
+    let config = SerialReconnectConfig::new("COM12", 460_800);
+    assert_eq!(config.baud_candidates(), &[460_800, 115_200, 921_600]);
+
+    let supervisor =
+        SerialReconnectSupervisor::new(config, FakeSerialPortFactory::new()).expect("valid config");
+    assert_eq!(supervisor.current_baud_rate(), 460_800);
+    assert_eq!(supervisor.baud_candidates(), &[460_800, 115_200, 921_600]);
 }
 
 #[test]
@@ -183,4 +230,25 @@ fn invalid_port_names_are_rejected_before_events_can_expose_them() {
             ..
         }
     ));
+}
+
+#[test]
+fn invalid_baud_candidates_are_rejected() {
+    for candidates in [Vec::new(), vec![115_200, 0]] {
+        let err = match SerialReconnectSupervisor::new(
+            test_config().with_baud_candidates(candidates),
+            FakeSerialPortFactory::new(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("invalid baud candidates must fail"),
+        };
+
+        assert!(matches!(
+            err,
+            SerialReconnectError::InvalidConfig {
+                field: "baud_candidates",
+                ..
+            }
+        ));
+    }
 }

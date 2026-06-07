@@ -84,11 +84,23 @@ impl UdpJitterBuffer {
         }
     }
 
+    pub(crate) fn max_hold(&self) -> Duration {
+        self.config.max_hold
+    }
+
     pub(crate) fn push(&mut self, frame: Esp32Frame, now: Instant) -> Vec<DeliveredFrame> {
         self.nodes
             .entry(frame.node_id)
             .or_insert_with(|| NodeJitter::new(self.config))
             .push(frame, now)
+    }
+
+    pub(crate) fn flush_due(&mut self, now: Instant) -> Vec<DeliveredFrame> {
+        let mut out = Vec::new();
+        for node in self.nodes.values_mut() {
+            out.extend(node.flush_due(now));
+        }
+        out
     }
 
     pub(crate) fn snapshot(&self, node_id: u8) -> Option<NodeJitterSnapshot> {
@@ -225,6 +237,14 @@ impl NodeJitter {
         let mut out = Vec::new();
         if gap <= self.config.max_interpolate_gap {
             if let Some(prev) = self.last_emitted.clone() {
+                if !can_interpolate(&prev, &head.frame) {
+                    self.stats.missing_dropped_total =
+                        self.stats.missing_dropped_total.saturating_add(gap as u64);
+                    out.push(self.emit_buffered(head, now));
+                    out.extend(self.drain_contiguous(now));
+                    self.stats.buffer_depth = self.buffered.len();
+                    return out;
+                }
                 for offset in 0..gap {
                     let seq = expected.wrapping_add(offset);
                     let frac = (offset + 1) as f64 / (gap + 1) as f64;
@@ -265,9 +285,20 @@ fn interpolate_frame(prev: &Esp32Frame, next: &Esp32Frame, sequence: u32, frac: 
     frame.rssi = lerp_i8(prev.rssi, next.rssi, frac);
     frame.noise_floor = lerp_i8(prev.noise_floor, next.noise_floor, frac);
     frame.amplitudes = lerp_vec(&prev.amplitudes, &next.amplitudes, frac);
-    frame.phases = lerp_vec(&prev.phases, &next.phases, frac);
+    frame.phases = lerp_phase_vec(&prev.phases, &next.phases, frac);
     frame.n_subcarriers = frame.amplitudes.len().min(u8::MAX as usize) as u8;
     frame
+}
+
+fn can_interpolate(prev: &Esp32Frame, next: &Esp32Frame) -> bool {
+    prev.node_id == next.node_id
+        && prev.n_antennas == next.n_antennas
+        && prev.freq_mhz == next.freq_mhz
+        && prev.n_subcarriers == next.n_subcarriers
+        && !prev.amplitudes.is_empty()
+        && prev.amplitudes.len() == next.amplitudes.len()
+        && prev.phases.len() == next.phases.len()
+        && prev.amplitudes.len() == prev.phases.len()
 }
 
 fn lerp_i8(a: i8, b: i8, frac: f64) -> i8 {
@@ -283,6 +314,31 @@ fn lerp_vec(a: &[f64], b: &[f64], frac: f64) -> Vec<f64> {
             av + (bv - av) * frac
         })
         .collect()
+}
+
+fn lerp_phase_vec(a: &[f64], b: &[f64], frac: f64) -> Vec<f64> {
+    let len = a.len().max(b.len());
+    (0..len)
+        .map(|idx| {
+            let av = a.get(idx).copied().unwrap_or_else(|| b[idx]);
+            let bv = b.get(idx).copied().unwrap_or(av);
+            wrap_phase(av + shortest_phase_delta(av, bv) * frac)
+        })
+        .collect()
+}
+
+fn shortest_phase_delta(a: f64, b: f64) -> f64 {
+    wrap_phase(b - a)
+}
+
+fn wrap_phase(mut phase: f64) -> f64 {
+    let two_pi = std::f64::consts::TAU;
+    phase = (phase + std::f64::consts::PI).rem_euclid(two_pi) - std::f64::consts::PI;
+    if phase == -std::f64::consts::PI {
+        std::f64::consts::PI
+    } else {
+        phase
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +425,72 @@ mod tests {
         let _ = b.push(frame(u32::MAX), t);
         let out = b.push(frame(0), t);
         assert_eq!(out[0].frame.sequence, 0);
+    }
+
+    #[test]
+    fn timer_flush_emits_due_buffered_gap_without_new_packet() {
+        let mut b = UdpJitterBuffer::new(UdpJitterConfig {
+            max_hold: Duration::from_millis(10),
+            ..UdpJitterConfig::default()
+        });
+        let t = Instant::now();
+        let _ = b.push(frame(20), t);
+        assert!(b.push(frame(22), t).is_empty());
+
+        let out = b.flush_due(t + Duration::from_millis(11));
+        let seqs: Vec<(u32, FrameKind)> = out.iter().map(|f| (f.frame.sequence, f.kind)).collect();
+        assert_eq!(seqs, vec![(21, FrameKind::Interpolated), (22, FrameKind::Live)]);
+        assert_eq!(b.snapshot(7).unwrap().buffer_depth, 0);
+    }
+
+    #[test]
+    fn timer_flush_waits_until_hold_expires() {
+        let mut b = UdpJitterBuffer::new(UdpJitterConfig {
+            max_hold: Duration::from_millis(10),
+            ..UdpJitterConfig::default()
+        });
+        let t = Instant::now();
+        let _ = b.push(frame(20), t);
+        assert!(b.push(frame(22), t).is_empty());
+
+        assert!(b.flush_due(t + Duration::from_millis(9)).is_empty());
+        let snap = b.snapshot(7).unwrap();
+        assert_eq!(snap.buffer_depth, 1);
+        assert_eq!(snap.interpolated_total, 0);
+    }
+
+    #[test]
+    fn metadata_mismatch_drops_gap_without_interpolation() {
+        let mut b = UdpJitterBuffer::new(UdpJitterConfig {
+            max_hold: Duration::from_millis(10),
+            ..UdpJitterConfig::default()
+        });
+        let t = Instant::now();
+        let _ = b.push(frame(20), t);
+        let mut changed_channel = frame(22);
+        changed_channel.freq_mhz = 5180;
+        assert!(b.push(changed_channel, t).is_empty());
+
+        let out = b.flush_due(t + Duration::from_millis(11));
+        let seqs: Vec<(u32, FrameKind)> = out.iter().map(|f| (f.frame.sequence, f.kind)).collect();
+        assert_eq!(seqs, vec![(22, FrameKind::Live)]);
+        let snap = b.snapshot(7).unwrap();
+        assert_eq!(snap.interpolated_total, 0);
+        assert_eq!(snap.missing_dropped_total, 1);
+    }
+
+    #[test]
+    fn phase_interpolation_uses_shortest_arc_across_wrap() {
+        let mut prev = frame(1);
+        let mut next = frame(3);
+        prev.phases = vec![3.10];
+        next.phases = vec![-3.10];
+
+        let interp = interpolate_frame(&prev, &next, 2, 0.5);
+        assert!(
+            interp.phases[0].abs() > 3.0,
+            "phase should stay near +/-pi across wrap, got {}",
+            interp.phases[0]
+        );
     }
 }

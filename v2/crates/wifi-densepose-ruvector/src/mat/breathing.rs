@@ -65,6 +65,26 @@ impl CompressedBreathingBuffer {
         self.frame_count
     }
 
+    /// Number of encoded bytes retained by the compressed segment store.
+    pub fn encoded_bytes(&self) -> usize {
+        self.segments.iter().map(Vec::len).sum()
+    }
+
+    /// Number of raw bytes represented by pushed `f32` amplitude frames.
+    pub fn raw_bytes(&self) -> usize {
+        self.frame_count as usize * self.n_subcarriers * std::mem::size_of::<f32>()
+    }
+
+    /// Raw-to-encoded size ratio. Returns `0.0` before the compressor flushes.
+    pub fn compression_ratio(&self) -> f64 {
+        let encoded = self.encoded_bytes();
+        if encoded == 0 {
+            0.0
+        } else {
+            self.raw_bytes() as f64 / encoded as f64
+        }
+    }
+
     /// Decode all compressed frames to a flat `f32` vec.
     ///
     /// Concatenates decoded segments in order. The resulting length may be

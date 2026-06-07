@@ -75,7 +75,9 @@ pub use ruvsense::calibration::{
 };
 pub use ruvsense::calibration_drift;
 pub use ruvsense::calibration_drift::{
-    CalibrationDriftConfig, CalibrationDriftDecision, CalibrationDriftDetector,
+    AdaptiveCalibrationConfig, AdaptiveCalibrationDecision, AdaptiveCalibrationMonitor,
+    AdaptiveCalibrationSnapshot, AdaptiveCalibrationStatus, CalibrationDriftConfig,
+    CalibrationDriftDecision, CalibrationDriftDetector,
 };
 
 /// Library version

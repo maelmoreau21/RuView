@@ -26,6 +26,7 @@
 //! assert_eq!(mesh.native_subcarriers, 168);
 //! ```
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -40,7 +41,8 @@ use crate::error::ConfigError;
 /// All fields have documented defaults that match the paper's experimental
 /// setup. Use [`TrainingConfig::default()`] as a starting point, then override
 /// individual fields as needed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TrainingConfig {
     // -----------------------------------------------------------------------
     // Data / Signal
@@ -143,9 +145,11 @@ pub struct TrainingConfig {
     pub early_stopping_patience: usize,
 
     /// Directory where model checkpoints are saved.
+    #[schemars(with = "String")]
     pub checkpoint_dir: PathBuf,
 
     /// Directory where TensorBoard / CSV logs are written.
+    #[schemars(with = "String")]
     pub log_dir: PathBuf,
 
     /// Keep only the top-K best checkpoints by validation metric. Default: **3**.
@@ -217,21 +221,57 @@ impl Default for TrainingConfig {
 }
 
 impl TrainingConfig {
-    /// Load a [`TrainingConfig`] from a JSON file at `path`.
+    /// Generate a JSON Schema for external validators and operator tooling.
+    #[must_use]
+    pub fn schema() -> schemars::schema::RootSchema {
+        schemars::schema_for!(TrainingConfig)
+    }
+
+    /// Load a [`TrainingConfig`] from JSON, TOML, or YAML based on extension.
+    ///
+    /// Supported extensions are `.json`, `.toml`, `.yaml`, and `.yml`.
+    pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
+        let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::FileRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let cfg: TrainingConfig = match ext.as_str() {
+            "json" => serde_json::from_str(&contents).map_err(|e| {
+                ConfigError::invalid_value("config_file", format!("{}: {e}", path.display()))
+            })?,
+            "toml" => toml::from_str(&contents).map_err(|e| {
+                ConfigError::invalid_value("config_file", format!("{}: {e}", path.display()))
+            })?,
+            "yaml" | "yml" => serde_yaml::from_str(&contents).map_err(|e| {
+                ConfigError::invalid_value("config_file", format!("{}: {e}", path.display()))
+            })?,
+            _ => {
+                return Err(ConfigError::invalid_value(
+                    "config_file",
+                    format!(
+                        "{}: unsupported config extension; expected .json, .toml, .yaml, or .yml",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Load a [`TrainingConfig`] from a JSON, TOML, or YAML file at `path`.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::FileRead`] if the file cannot be opened and
     /// [`ConfigError::InvalidValue`] if the JSON is malformed.
     pub fn from_json(path: &Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::FileRead {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let cfg: TrainingConfig = serde_json::from_str(&contents)
-            .map_err(|e| ConfigError::invalid_value("(file)", e.to_string()))?;
-        cfg.validate()?;
-        Ok(cfg)
+        Self::from_path(path)
     }
 
     /// Serialize this configuration to pretty-printed JSON and write it to
@@ -477,6 +517,41 @@ mod tests {
         assert_eq!(loaded.batch_size, original.batch_size);
         assert_eq!(loaded.seed, original.seed);
         assert_eq!(loaded.lr_milestones, original.lr_milestones);
+    }
+
+    #[test]
+    fn from_path_loads_toml_and_yaml() {
+        let tmp = tempdir().unwrap();
+        let toml_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &toml_path,
+            toml::to_string(&TrainingConfig::default()).expect("toml"),
+        )
+        .expect("write toml");
+        let toml = TrainingConfig::from_path(&toml_path).expect("TOML should load");
+        assert_eq!(toml.num_subcarriers, TrainingConfig::default().num_subcarriers);
+
+        let yaml_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &yaml_path,
+            serde_yaml::to_string(&TrainingConfig::default()).expect("yaml"),
+        )
+        .expect("write yaml");
+        let yaml = TrainingConfig::from_path(&yaml_path).expect("YAML should load");
+        assert_eq!(yaml.batch_size, TrainingConfig::default().batch_size);
+    }
+
+    #[test]
+    fn from_path_rejects_unknown_fields() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut text = toml::to_string(&TrainingConfig::default()).expect("toml");
+        text.push_str("\nsurprise = true\n");
+        std::fs::write(&path, text).expect("write");
+
+        let err = TrainingConfig::from_path(&path).expect_err("unknown fields must fail");
+
+        assert!(err.to_string().contains("config_file"));
     }
 
     #[test]

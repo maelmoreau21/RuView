@@ -107,7 +107,7 @@ fn main() {
 
     let mut config = if let Some(ref cfg_path) = args.config {
         info!("Loading configuration from {}", cfg_path.display());
-        match TrainingConfig::from_json(cfg_path) {
+        match TrainingConfig::from_path(cfg_path) {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to load config: {e}");

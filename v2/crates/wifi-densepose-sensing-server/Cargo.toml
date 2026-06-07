@@ -34,8 +34,11 @@ ruvector-mincut = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json.workspace = true
+serde_yaml.workspace = true
 schemars.workspace = true
 sqlx = { workspace = true }
+toml = "0.8"
+prometheus.workspace = true
 
 # Logging
 tracing.workspace = true
@@ -56,6 +59,10 @@ wifi-densepose-wifiscan = { version = "0.3.0", path = "../wifi-densepose-wifisca
 # `--no-default-features` at the workspace root can produce a Windows-friendly
 # build without vcpkg/openblas (issue #366, #415).
 wifi-densepose-signal = { version = "0.3.1", path = "../wifi-densepose-signal", default-features = false }
+wifi-densepose-core = { version = "0.3.1", path = "../wifi-densepose-core" }
+wifi-densepose-ruvector = { version = "0.3.1", path = "../wifi-densepose-ruvector", default-features = false }
+wifi-densepose-train = { version = "0.3.1", path = "../wifi-densepose-train", default-features = false }
+ruview-swarm = { path = "../ruview-swarm", default-features = false }
 
 # Hardware crate — SyncPacket decoder for ADR-110 §A0.12 mesh-aligned timestamps.
 wifi-densepose-hardware = { version = "0.3.0", path = "../wifi-densepose-hardware" }
@@ -74,6 +81,8 @@ midstreamer-attractor        = "0.2"   # Lyapunov + regime classification
 ureq      = { version = "2", default-features = false, features = ["tls", "json"] }
 sha2      = "0.10"
 thiserror = "1"
+ndarray = { workspace = true }
+num-complex = { workspace = true }
 
 # ADR-115 §3.8 — MQTT publisher (HA-DISCO).
 # Gated behind the `mqtt` feature so the default binary stays small for users

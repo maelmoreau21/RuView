@@ -62,7 +62,7 @@ pub use esp32_parser::{
 pub use serial_reconnect::{
     SerialPortFactory, SerialPortHandle, SerialReconnectConfig, SerialReconnectError,
     SerialReconnectEvent, SerialReconnectStats, SerialReconnectSupervisor,
-    SystemSerialPortFactory,
+    SystemSerialPortFactory, DEFAULT_BAUD_CANDIDATES,
 };
 #[cfg(all(feature = "serial-reconnect", feature = "serial-reconnect-testkit"))]
 pub use serial_reconnect::{

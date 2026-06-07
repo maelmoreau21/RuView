@@ -91,6 +91,7 @@ impl SerialPortHandle for FakeSerialPort {
 pub struct FakeSerialPortFactory {
     opens: VecDeque<FakeOpenAction>,
     open_attempts: u64,
+    baud_attempts: Vec<u32>,
 }
 
 impl FakeSerialPortFactory {
@@ -116,13 +117,19 @@ impl FakeSerialPortFactory {
     pub fn open_attempts(&self) -> u64 {
         self.open_attempts
     }
+
+    /// Baud rates observed for each open attempt.
+    pub fn baud_attempts(&self) -> &[u32] {
+        &self.baud_attempts
+    }
 }
 
 impl SerialPortFactory for FakeSerialPortFactory {
     type Port = FakeSerialPort;
 
-    fn open(&mut self, _config: &SerialReconnectConfig) -> io::Result<Self::Port> {
+    fn open(&mut self, config: &SerialReconnectConfig) -> io::Result<Self::Port> {
         self.open_attempts += 1;
+        self.baud_attempts.push(config.baud_rate);
         match self.opens.pop_front() {
             Some(FakeOpenAction::Port(port)) => Ok(port),
             Some(FakeOpenAction::Error { kind, message }) => Err(io::Error::new(kind, message)),

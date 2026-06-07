@@ -318,6 +318,35 @@ curl http://localhost:3000/api/v1/info
 
 Open `http://localhost:3000/ui/index.html` for the RuvSense Console. All endpoints return JSON. In production, values are derived from live ESP32 CSI frames, and absent APs/nodes stay absent instead of being simulated.
 
+### Production Config and Observability
+
+Runtime config defaults to `data/config.json` and still falls back to safe defaults when that file is absent. For deployment-managed config, pass an explicit JSON, TOML, or YAML file:
+
+```bash
+ruvsense-master --config-file /etc/ruvsense/runtime.toml
+RUVSENSE_CONFIG_FILE=/etc/ruvsense/runtime.yaml ruvsense-master
+```
+
+Explicit config files fail closed with exit code `2` when malformed, when unknown fields are present, or when semantic checks fail. Before packaging a deployment, validate checked-in `v2/` TOML/YAML artifacts:
+
+```bash
+ruvsense-master --validate-config-root v2
+ruvsense-master --print-config-schema runtime
+curl http://localhost:3000/api/v1/config/schema
+```
+
+Prometheus scrapes use the single `/metrics` endpoint. The registry includes per-node CSI FPS, UDP drop/reorder counters, active tracking zone count, DSP and neural inference latency in milliseconds, and breathing/heartbeat tensor compression ratios:
+
+```bash
+curl http://localhost:3000/metrics
+```
+
+Text logs remain the default and keep existing `RUST_LOG` filtering. Set `LOG_FORMAT=json` for Loki/ELK ingestion:
+
+```bash
+RUST_LOG=info,tower_http=debug LOG_FORMAT=json ruvsense-master --source esp32
+```
+
 ---
 
 ## Data Sources
@@ -529,6 +558,7 @@ Base URL: `http://localhost:3000` (Docker) or `http://localhost:8080` (binary de
 | `GET` | `/api/v1/vital-signs` | Breathing rate + heart rate + confidence | `{"breathing_bpm":16.2,"heart_bpm":72.1,"confidence":0.87}` |
 | `GET` | `/api/v1/pose/current` | 17 COCO keypoints (x, y, z, confidence) | Array of 17 joint positions |
 | `GET` | `/api/v1/info` | Server version, build info, uptime | JSON metadata |
+| `GET` | `/api/v1/config/schema` | Runtime config JSON Schema for operator tooling | JSON Schema |
 | `GET` | `/api/v1/bssid` | Multi-BSSID WiFi registry | List of detected access points |
 | `GET` | `/api/v1/model/layers` | Progressive model loading status | Layer A/B/C load state |
 | `GET` | `/api/v1/model/sona/profiles` | SONA adaptation profiles | List of environment profiles |

@@ -28,7 +28,7 @@ use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, train
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +42,9 @@ use axum::{
     routing::{delete, get, post, put},
     Extension, Router,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use ndarray::Array2;
+use num_complex::Complex64;
 
 use axum::http::HeaderValue;
 use schemars::JsonSchema;
@@ -64,9 +66,17 @@ use wifi_densepose_wifiscan::LinuxIwScanner;
 use wifi_densepose_wifiscan::{BssidObservation, BssidRegistry, WindowsWifiPipeline};
 
 // Accuracy sprint: Kalman tracker, multistatic fusion, field model
+use wifi_densepose_core::types::{
+    AntennaConfig as CoreAntennaConfig, CsiFrame as CoreCsiFrame,
+    CsiMetadata as CoreCsiMetadata, DeviceId as CoreDeviceId, FrequencyBand as CoreFrequencyBand,
+};
 use wifi_densepose_signal::ruvsense::field_model::{CalibrationStatus, FieldModel};
 use wifi_densepose_signal::ruvsense::multistatic::{MultistaticConfig, MultistaticFuser};
 use wifi_densepose_signal::ruvsense::pose_tracker::PoseTracker;
+use wifi_densepose_signal::ruvsense::{
+    AdaptiveCalibrationConfig, AdaptiveCalibrationDecision, AdaptiveCalibrationMonitor,
+    AdaptiveCalibrationSnapshot,
+};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -88,6 +98,38 @@ struct Args {
     #[arg(long, default_value = "5005")]
     udp_port: u16,
 
+    /// Maximum UDP jitter-buffer hold time before flushing an out-of-order CSI gap.
+    #[arg(
+        long,
+        default_value_t = 75,
+        env = "RUVSENSE_UDP_JITTER_HOLD_MS"
+    )]
+    udp_jitter_hold_ms: u64,
+
+    /// Maximum sequence gap to keep buffered for out-of-order UDP CSI packets.
+    #[arg(
+        long,
+        default_value_t = 8,
+        env = "RUVSENSE_UDP_JITTER_MAX_REORDER_GAP"
+    )]
+    udp_jitter_max_reorder_gap: u32,
+
+    /// Maximum missing CSI sequence gap to bridge with linear interpolation.
+    #[arg(
+        long,
+        default_value_t = 3,
+        env = "RUVSENSE_UDP_JITTER_MAX_INTERPOLATE_GAP"
+    )]
+    udp_jitter_max_interpolate_gap: u32,
+
+    /// Maximum queued CSI frames per node before the jitter buffer flushes.
+    #[arg(
+        long,
+        default_value_t = 12,
+        env = "RUVSENSE_UDP_JITTER_MAX_BUFFERED_FRAMES"
+    )]
+    udp_jitter_max_buffered_frames: usize,
+
     /// Minimum active ESP32 nodes required before readiness is green.
     #[arg(long, default_value = "1", env = "RUVSENSE_MIN_NODES")]
     min_nodes: usize,
@@ -103,6 +145,18 @@ struct Args {
     /// Persistent data directory for runtime config, recordings, and SQLite state.
     #[arg(long, default_value = "data", env = "RUVSENSE_DATA_DIR")]
     data_dir: PathBuf,
+
+    /// Explicit runtime configuration file (JSON, TOML, YAML).
+    #[arg(long, value_name = "PATH", env = "RUVSENSE_CONFIG_FILE")]
+    config_file: Option<PathBuf>,
+
+    /// Validate all TOML/YAML configuration artifacts under a root and exit.
+    #[arg(long, value_name = "PATH")]
+    validate_config_root: Option<PathBuf>,
+
+    /// Print a JSON Schema for a supported configuration shape and exit.
+    #[arg(long, value_enum, value_name = "KIND")]
+    print_config_schema: Option<ConfigSchemaKind>,
 
     /// Path to UI static files (repo `ui/`; from `v2/` use `../ui` or rely on auto-detect)
     #[arg(long, default_value = "../ui")]
@@ -242,6 +296,15 @@ struct Args {
     /// `GET /api/v1/edge/registry`. Use for air-gapped deployments.
     #[arg(long, env = "RUVIEW_NO_EDGE_REGISTRY")]
     no_edge_registry: bool,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum ConfigSchemaKind {
+    Runtime,
+    Swarm,
+    Training,
+    HomecoreAutomation,
+    BfldBlueprint,
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -481,6 +544,12 @@ struct NodeState {
     /// Most recent novelty score in [0.0, 1.0] (0 = exact-match in bank,
     /// 1 = no overlap). Consumed by the model-wake gate downstream.
     pub(crate) last_novelty_score: Option<f32>,
+    breathing_compressor: wifi_densepose_ruvector::mat::CompressedBreathingBuffer,
+    heartbeat_compressor: wifi_densepose_ruvector::mat::CompressedHeartbeatSpectrogram,
+    latest_breathing_compression_ratio: f64,
+    latest_heartbeat_compression_ratio: f64,
+    /// ADR-135 adaptive empty-room baseline monitor. Live CSI only.
+    adaptive_calibration: Option<AdaptiveCalibrationMonitor>,
 }
 
 /// Default EMA alpha for temporal keypoint smoothing (RuVector Phase 2).
@@ -665,6 +734,10 @@ impl NodeState {
     }
 
     pub(crate) fn new() -> Self {
+        Self::new_for_node(0)
+    }
+
+    pub(crate) fn new_for_node(node_id: u8) -> Self {
         Self {
             frame_history: VecDeque::new(),
             smoothed_person_score: 0.0,
@@ -705,7 +778,37 @@ impl NodeState {
                 ),
             ),
             last_novelty_score: None,
+            breathing_compressor: wifi_densepose_ruvector::mat::CompressedBreathingBuffer::new(
+                NOVELTY_VECTOR_DIM,
+                node_id as u32,
+            ),
+            heartbeat_compressor: wifi_densepose_ruvector::mat::CompressedHeartbeatSpectrogram::new(
+                NOVELTY_VECTOR_DIM,
+            ),
+            latest_breathing_compression_ratio: 0.0,
+            latest_heartbeat_compression_ratio: 0.0,
+            adaptive_calibration: None,
         }
+    }
+
+    pub(crate) fn update_tensor_compression(&mut self, amplitudes: &[f64], phases: &[f64]) {
+        let mut breathing_frame: Vec<f32> = amplitudes
+            .iter()
+            .take(NOVELTY_VECTOR_DIM)
+            .map(|&value| value as f32)
+            .collect();
+        breathing_frame.resize(NOVELTY_VECTOR_DIM, 0.0);
+        self.breathing_compressor.push_frame(&breathing_frame);
+        self.latest_breathing_compression_ratio = self.breathing_compressor.compression_ratio();
+
+        let mut heartbeat_column: Vec<f32> = phases
+            .iter()
+            .take(NOVELTY_VECTOR_DIM)
+            .map(|&value| value as f32)
+            .collect();
+        heartbeat_column.resize(NOVELTY_VECTOR_DIM, 0.0);
+        self.heartbeat_compressor.push_column(&heartbeat_column);
+        self.latest_heartbeat_compression_ratio = self.heartbeat_compressor.compression_ratio();
     }
 
     /// ADR-084 cluster-Pi novelty step. Truncates / zero-pads the
@@ -771,6 +874,82 @@ impl NodeState {
             TEMPORAL_EMA_ALPHA_LOW_COHERENCE
         } else {
             TEMPORAL_EMA_ALPHA_DEFAULT
+        }
+    }
+}
+
+fn adaptive_calibration_config_for_frame(frame: &Esp32Frame) -> AdaptiveCalibrationConfig {
+    let n_subcarriers = frame.amplitudes.len().max(1);
+    let mut calibration = wifi_densepose_signal::calibration::CalibrationConfig::ht20();
+    calibration.num_active = n_subcarriers;
+    calibration.num_subcarriers = n_subcarriers;
+    calibration.min_frames = 600;
+    AdaptiveCalibrationConfig {
+        calibration,
+        ..AdaptiveCalibrationConfig::default()
+    }
+}
+
+fn esp32_frame_to_core_csi_frame(frame: &Esp32Frame) -> Option<CoreCsiFrame> {
+    let n = frame.amplitudes.len().min(frame.phases.len());
+    if n == 0 {
+        return None;
+    }
+    let data = Array2::from_shape_vec(
+        (1, n),
+        (0..n)
+            .map(|idx| Complex64::from_polar(frame.amplitudes[idx], frame.phases[idx]))
+            .collect(),
+    )
+    .ok()?;
+    let band = if frame.freq_mhz < 3_000 {
+        CoreFrequencyBand::Band2_4GHz
+    } else if frame.freq_mhz < 5_925 {
+        CoreFrequencyBand::Band5GHz
+    } else {
+        CoreFrequencyBand::Band6GHz
+    };
+    let mut meta = CoreCsiMetadata::new(
+        CoreDeviceId::new(format!("esp32-node-{}", frame.node_id)),
+        band,
+        6,
+    );
+    meta.bandwidth_mhz = 20;
+    meta.antenna_config = CoreAntennaConfig::new(1, frame.n_antennas.max(1));
+    meta.rssi_dbm = frame.rssi;
+    meta.noise_floor_dbm = frame.noise_floor;
+    meta.sequence_number = frame.sequence;
+    Some(CoreCsiFrame::new(meta, data))
+}
+
+fn update_node_adaptive_calibration(
+    ns: &mut NodeState,
+    frame: &Esp32Frame,
+    classification: &ClassificationInfo,
+    features: &FeatureInfo,
+    is_live_frame: bool,
+) {
+    if !is_live_frame {
+        return;
+    }
+    let Some(core_frame) = esp32_frame_to_core_csi_frame(frame) else {
+        return;
+    };
+    let monitor = ns
+        .adaptive_calibration
+        .get_or_insert_with(|| AdaptiveCalibrationMonitor::new(adaptive_calibration_config_for_frame(frame)));
+    match monitor.update(&core_frame, classification.presence, features.variance as f32) {
+        Ok(AdaptiveCalibrationDecision::InitialBaselinePromoted)
+        | Ok(AdaptiveCalibrationDecision::CandidatePromoted) => {
+            debug!(
+                "Adaptive calibration promoted for node {}: {:?}",
+                frame.node_id,
+                monitor.snapshot()
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            debug!("Adaptive calibration skipped for node {}: {err}", frame.node_id);
         }
     }
 }
@@ -865,6 +1044,12 @@ fn record_pose_latency(s: &mut AppStateInner, started: std::time::Instant) {
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     s.latest_pose_latency_ms = elapsed_ms;
     s.pose_latency_p95_ms.push(elapsed_ms);
+}
+
+fn record_dsp_latency(s: &mut AppStateInner, started: std::time::Instant) {
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    s.latest_dsp_latency_ms = elapsed_ms;
+    s.dsp_latency_p95_ms.push(elapsed_ms);
 }
 
 fn fleet_ready(s: &AppStateInner, now: std::time::Instant) -> bool {
@@ -1608,18 +1793,314 @@ fn runtime_config_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(RuntimeConfig)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HomecoreAutomationYamlSchema {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    trigger: serde_json::Value,
+    action: serde_json::Value,
+    #[serde(default)]
+    condition: Option<serde_json::Value>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BfldBlueprintYamlSchema {
+    blueprint: BfldBlueprintMetadataSchema,
+    trigger: Vec<serde_json::Value>,
+    action: Vec<serde_json::Value>,
+    mode: String,
+    #[serde(default)]
+    variables: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BfldBlueprintMetadataSchema {
+    name: String,
+    description: String,
+    domain: String,
+    source_url: String,
+    input: HashMap<String, serde_json::Value>,
+}
+
+fn schema_for_config_kind(kind: ConfigSchemaKind) -> schemars::schema::RootSchema {
+    match kind {
+        ConfigSchemaKind::Runtime => runtime_config_schema(),
+        ConfigSchemaKind::Swarm => ruview_swarm::config::SwarmConfig::schema(),
+        ConfigSchemaKind::Training => wifi_densepose_train::config::TrainingConfig::schema(),
+        ConfigSchemaKind::HomecoreAutomation => {
+            schemars::schema_for!(HomecoreAutomationYamlSchema)
+        }
+        ConfigSchemaKind::BfldBlueprint => schemars::schema_for!(BfldBlueprintYamlSchema),
+    }
+}
+
+fn parse_runtime_config_text(path: &Path, text: &str) -> Result<RuntimeConfig, String> {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let parsed = match ext.as_str() {
+        "json" => serde_json::from_str(text)
+            .map_err(|e| format!("{}: JSON schema parse error: {e}", path.display()))?,
+        "toml" => toml::from_str(text)
+            .map_err(|e| format!("{}: TOML schema parse error: {e}", path.display()))?,
+        "yaml" | "yml" => serde_yaml::from_str(text)
+            .map_err(|e| format!("{}: YAML schema parse error: {e}", path.display()))?,
+        _ => {
+            return Err(format!(
+                "{}: unsupported runtime config extension; expected .json, .toml, .yaml, or .yml",
+                path.display()
+            ));
+        }
+    };
+    validate_runtime_config(&parsed)
+        .map_err(|e| format!("{}: invalid runtime config: {e}", path.display()))?;
+    Ok(normalize_runtime_config(parsed))
+}
+
+pub(crate) fn load_runtime_config_file(path: &Path) -> Result<RuntimeConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("{}: failed to read runtime config: {e}", path.display()))?;
+    parse_runtime_config_text(path, &text)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfigValidationReport {
+    files_checked: usize,
+    cargo_metadata_checked: bool,
+}
+
+impl ConfigValidationReport {
+    fn summary(self) -> String {
+        let cargo = if self.cargo_metadata_checked {
+            "cargo metadata checked"
+        } else {
+            "cargo metadata skipped"
+        };
+        format!("validated {} config artifact(s); {cargo}", self.files_checked)
+    }
+}
+
+fn validate_config_root(root: &Path) -> Result<ConfigValidationReport, String> {
+    if !root.is_dir() {
+        return Err(format!("{}: validation root is not a directory", root.display()));
+    }
+    let mut files = Vec::new();
+    collect_config_files(root, &mut files)?;
+    files.sort();
+
+    for path in &files {
+        validate_config_file(path)?;
+    }
+
+    let manifest = root.join("Cargo.toml");
+    let cargo_metadata_checked = if manifest.is_file() {
+        validate_cargo_metadata(&manifest)?;
+        true
+    } else {
+        false
+    };
+
+    Ok(ConfigValidationReport {
+        files_checked: files.len(),
+        cargo_metadata_checked,
+    })
+}
+
+fn collect_config_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("{}: failed to read dir: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: failed to read dir entry: {e}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("{}: failed to inspect file type: {e}", path.display()))?;
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), "target" | ".git" | "node_modules") {
+                continue;
+            }
+            collect_config_files(&path, files)?;
+        } else if file_type.is_file() && is_supported_config_artifact(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_config_artifact(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("toml" | "yaml" | "yml")
+    )
+}
+
+fn validate_config_file(path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("{}: failed to read config artifact: {e}", path.display()))?;
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "toml" => validate_toml_config_file(path, &text),
+        "yaml" | "yml" => validate_yaml_config_file(path, &text),
+        _ => Ok(()),
+    }
+}
+
+fn validate_toml_config_file(path: &Path, text: &str) -> Result<(), String> {
+    let value: toml::Value = toml::from_str(text)
+        .map_err(|e| format!("{}: TOML parse error: {e}", path.display()))?;
+    if value.get("swarm").is_some() {
+        let cfg: ruview_swarm::config::SwarmConfig = toml::from_str(text)
+            .map_err(|e| format!("{}: swarm config parse error: {e}", path.display()))?;
+        cfg.validate()
+            .map_err(|e| format!("{}: invalid swarm config: {e}", path.display()))?;
+    } else if value.get("dedup_factor").is_some() || value.get("environment").is_some() {
+        parse_runtime_config_text(path, text)?;
+    } else if value.get("num_epochs").is_some() || value.get("batch_size").is_some() {
+        let cfg: wifi_densepose_train::config::TrainingConfig = toml::from_str(text)
+            .map_err(|e| format!("{}: training config parse error: {e}", path.display()))?;
+        cfg.validate()
+            .map_err(|e| format!("{}: invalid training config: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_yaml_config_file(path: &Path, text: &str) -> Result<(), String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(text)
+        .map_err(|e| format!("{}: YAML parse error: {e}", path.display()))?;
+    let Some(root) = value.as_mapping() else {
+        return Err(format!("{}: YAML config root must be a mapping", path.display()));
+    };
+    if yaml_get(root, "blueprint").is_some() {
+        validate_bfld_blueprint_yaml(path, root)?;
+    } else if yaml_get(root, "trigger").is_some() && yaml_get(root, "action").is_some() {
+        validate_homecore_automation_yaml(path, root)?;
+    } else if yaml_get(root, "dedup_factor").is_some() || yaml_get(root, "environment").is_some() {
+        parse_runtime_config_text(path, text)?;
+    }
+    Ok(())
+}
+
+fn validate_homecore_automation_yaml(
+    path: &Path,
+    root: &serde_yaml::Mapping,
+) -> Result<(), String> {
+    require_yaml_string(path, root, "name")?;
+    require_yaml_sequence(path, root, "trigger")?;
+    require_yaml_sequence(path, root, "action")?;
+    if let Some(mode) = yaml_get(root, "mode") {
+        if mode.as_str().is_none() {
+            return Err(format!("{}: mode must be a string", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bfld_blueprint_yaml(path: &Path, root: &serde_yaml::Mapping) -> Result<(), String> {
+    let blueprint = yaml_get(root, "blueprint")
+        .and_then(serde_yaml::Value::as_mapping)
+        .ok_or_else(|| format!("{}: blueprint must be a mapping", path.display()))?;
+    require_yaml_string(path, blueprint, "name")?;
+    require_yaml_string(path, blueprint, "description")?;
+    require_yaml_string(path, blueprint, "source_url")?;
+    let domain = require_yaml_string(path, blueprint, "domain")?;
+    if domain != "automation" {
+        return Err(format!(
+            "{}: blueprint.domain must be automation, got {domain}",
+            path.display()
+        ));
+    }
+    yaml_get(blueprint, "input")
+        .and_then(serde_yaml::Value::as_mapping)
+        .filter(|input| !input.is_empty())
+        .ok_or_else(|| format!("{}: blueprint.input must be a non-empty mapping", path.display()))?;
+    require_yaml_sequence(path, root, "trigger")?;
+    require_yaml_sequence(path, root, "action")?;
+    require_yaml_string(path, root, "mode")?;
+    Ok(())
+}
+
+fn yaml_get<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    mapping.get(&serde_yaml::Value::String(key.to_string()))
+}
+
+fn require_yaml_string(
+    path: &Path,
+    mapping: &serde_yaml::Mapping,
+    key: &str,
+) -> Result<String, String> {
+    yaml_get(mapping, key)
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{}: {key} must be a non-empty string", path.display()))
+}
+
+fn require_yaml_sequence(
+    path: &Path,
+    mapping: &serde_yaml::Mapping,
+    key: &str,
+) -> Result<(), String> {
+    yaml_get(mapping, key)
+        .and_then(serde_yaml::Value::as_sequence)
+        .filter(|value| !value.is_empty())
+        .map(|_| ())
+        .ok_or_else(|| format!("{}: {key} must be a non-empty sequence", path.display()))
+}
+
+fn validate_cargo_metadata(manifest_path: &Path) -> Result<(), String> {
+    let manifest = manifest_path.display().to_string();
+    let output = std::process::Command::new("cargo")
+        .args([
+            "metadata",
+            "--manifest-path",
+            manifest.as_str(),
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .map_err(|e| {
+            format!(
+                "{}: failed to execute cargo metadata: {e}",
+                manifest_path.display()
+            )
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "{}: cargo metadata failed: {}",
+            manifest_path.display(),
+            stderr.trim()
+        ))
+    }
+}
+
 /// Load persisted runtime config from `<data_dir>/config.json`.
 /// Falls back to [`RuntimeConfig::default`] only when the file is absent.
 pub(crate) fn load_runtime_config(data_dir: &std::path::Path) -> Result<RuntimeConfig, String> {
     let path = data_dir.join("config.json");
     match std::fs::read_to_string(&path) {
-        Ok(json) => {
-            let parsed: RuntimeConfig = serde_json::from_str(&json)
-                .map_err(|e| format!("{}: JSON schema parse error: {e}", path.display()))?;
-            validate_runtime_config(&parsed)
-                .map_err(|e| format!("{}: invalid runtime config: {e}", path.display()))?;
-            Ok(normalize_runtime_config(parsed))
-        }
+        Ok(json) => parse_runtime_config_text(&path, &json),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RuntimeConfig::default()),
         Err(e) => Err(format!("{}: failed to read runtime config: {e}", path.display())),
     }
@@ -1832,6 +2313,10 @@ struct AppStateInner {
     latest_pose_latency_ms: f64,
     /// Rolling P95 of pose/model processing latency.
     pose_latency_p95_ms: RollingP95,
+    /// Latest DSP feature/vitals processing latency observed in the live update path.
+    latest_dsp_latency_ms: f64,
+    /// Rolling P95 of DSP feature/vitals processing latency.
+    dsp_latency_p95_ms: RollingP95,
     // ── ADR-044 §5.3: runtime-configurable dedup factor ───────────────────────
     /// Divisor for multi-node person-count deduplication (sum / factor).
     /// Default 3.0 (one body visible to ~3 nodes on average).
@@ -2783,6 +3268,75 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
+#[cfg(test)]
+mod adaptive_calibration_tests {
+    use super::*;
+
+    fn raw_info(raw_motion: f64) -> ClassificationInfo {
+        ClassificationInfo {
+            motion_level: raw_classify(raw_motion),
+            presence: raw_motion > 0.04,
+            confidence: 1.0,
+        }
+    }
+
+    fn apply_node_frame(ns: &mut NodeState, raw_motion: f64) -> ClassificationInfo {
+        let mut raw = raw_info(raw_motion);
+        smooth_and_classify_node(ns, &mut raw, raw_motion);
+        raw
+    }
+
+    fn quiet_room_node(raw_motion: f64, frames: usize) -> (NodeState, ClassificationInfo) {
+        let mut ns = NodeState::new();
+        let mut last = raw_info(raw_motion);
+        for _ in 0..frames {
+            last = apply_node_frame(&mut ns, raw_motion);
+        }
+        (ns, last)
+    }
+
+    #[test]
+    fn quiet_room_baseline_auto_calibrates_without_promoting_presence() {
+        let quiet_raw_motion = 0.08;
+        assert_eq!(raw_classify(quiet_raw_motion), "present_still");
+
+        let (ns, classification) = quiet_room_node(quiet_raw_motion, 80);
+
+        assert_eq!(ns.baseline_frames, 80);
+        assert!(
+            ns.baseline_motion > 0.07,
+            "quiet-room baseline should learn the ambient floor, got {}",
+            ns.baseline_motion
+        );
+        assert!(
+            ns.smoothed_motion < 0.03,
+            "baseline-subtracted quiet room should stay below presence, got {}",
+            ns.smoothed_motion
+        );
+        assert_eq!(classification.motion_level, "absent");
+        assert!(!classification.presence);
+    }
+
+    #[test]
+    fn sustained_motion_after_quiet_room_baseline_promotes_presence() {
+        let (mut ns, quiet_classification) = quiet_room_node(0.08, 80);
+        assert_eq!(quiet_classification.motion_level, "absent");
+
+        let baseline_before_motion = ns.baseline_motion;
+        let mut classification = raw_info(0.30);
+        for _ in 0..12 {
+            classification = apply_node_frame(&mut ns, 0.30);
+        }
+
+        assert_ne!(classification.motion_level, "absent");
+        assert!(classification.presence);
+        assert!(
+            (ns.baseline_motion - baseline_before_motion).abs() < 0.005,
+            "motion should not be folded into the quiet-room baseline"
+        );
+    }
+}
+
 /// If an adaptive model is loaded, override the classification with the
 /// model's prediction.  Uses the full 15-feature vector for higher accuracy.
 fn adaptive_override(
@@ -3166,11 +3720,13 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         if s_write_pre.frame_history.len() > FRAME_HISTORY_CAPACITY {
             s_write_pre.frame_history.pop_front();
         }
+        let dsp_started = std::time::Instant::now();
         let sample_rate_hz = 1000.0 / tick_ms as f64;
         let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
             extract_features_from_frame(&frame, &s_write_pre.frame_history, sample_rate_hz);
         smooth_and_classify(&mut s_write_pre, &mut classification, raw_motion);
         adaptive_override(&s_write_pre, &features, &mut classification);
+        record_dsp_latency(&mut s_write_pre, dsp_started);
         drop(s_write_pre);
 
         // ── Step 5: Build enhanced fields from pipeline result ───────
@@ -3353,11 +3909,13 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
     if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
         s.frame_history.pop_front();
     }
+    let dsp_started = std::time::Instant::now();
     let sample_rate_hz = 2.0_f64; // fallback tick ~ 500 ms => 2 Hz
     let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
         extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
     smooth_and_classify(&mut s, &mut classification, raw_motion);
     adaptive_override(&s, &features, &mut classification);
+    record_dsp_latency(&mut s, dsp_started);
 
     s.source = format!("wifi:{ssid}");
     s.rssi_history.push_back(rssi_dbm);
@@ -6818,6 +7376,37 @@ async fn module_enabled_update_endpoint(
     })))
 }
 
+fn adaptive_calibration_snapshot_json(
+    node_id: u8,
+    snapshot: AdaptiveCalibrationSnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": node_id,
+        "status": format!("{:?}", snapshot.status),
+        "last_decision": format!("{:?}", snapshot.last_decision),
+        "frames_observed": snapshot.frames_observed,
+        "candidate_frames": snapshot.candidate_frames,
+        "confirmed_drift_windows": snapshot.confirmed_drift_windows,
+        "last_window_drift_score": snapshot.last_window_drift_score,
+        "promotions": snapshot.promotions,
+        "rejections": snapshot.rejections,
+        "active_baseline_frames": snapshot.active_baseline_frames,
+    })
+}
+
+fn adaptive_calibration_nodes_json(
+    node_states: &HashMap<u8, NodeState>,
+) -> Vec<serde_json::Value> {
+    node_states
+        .iter()
+        .filter_map(|(&node_id, ns)| {
+            ns.adaptive_calibration
+                .as_ref()
+                .map(|monitor| adaptive_calibration_snapshot_json(node_id, monitor.snapshot()))
+        })
+        .collect()
+}
+
 async fn calibration_overview_endpoint(
     State(state): State<SharedState>,
 ) -> Json<serde_json::Value> {
@@ -6833,6 +7422,7 @@ async fn calibration_overview_endpoint(
         "active_nodes": active_node_count(&s, std::time::Instant::now()),
         "min_nodes": s.min_nodes,
         "dedup_factor": s.dedup_factor,
+        "adaptive": adaptive_calibration_nodes_json(&s.node_states),
         "actions": {
             "start": "/api/v1/calibration/start",
             "stop": "/api/v1/calibration/stop",
@@ -6936,81 +7526,399 @@ fn append_udp_jitter_prometheus_metrics(
     }
 }
 
-async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl IntoResponse {
+fn append_adaptive_calibration_prometheus_metrics(
+    body: &mut String,
+    node_states: &HashMap<u8, NodeState>,
+) {
     use std::fmt::Write;
 
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_adaptive_calibration_promotions_total Adaptive baseline promotions per ESP32 node"
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE ruvsense_adaptive_calibration_promotions_total counter"
+    );
+    for (&id, ns) in node_states {
+        if let Some(ref monitor) = ns.adaptive_calibration {
+            let snapshot = monitor.snapshot();
+            let _ = writeln!(
+                body,
+                "ruvsense_adaptive_calibration_promotions_total{{node=\"{id}\"}} {}",
+                snapshot.promotions
+            );
+        }
+    }
+
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_adaptive_calibration_rejections_total Adaptive baseline candidate rejections per ESP32 node"
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE ruvsense_adaptive_calibration_rejections_total counter"
+    );
+    for (&id, ns) in node_states {
+        if let Some(ref monitor) = ns.adaptive_calibration {
+            let snapshot = monitor.snapshot();
+            let _ = writeln!(
+                body,
+                "ruvsense_adaptive_calibration_rejections_total{{node=\"{id}\"}} {}",
+                snapshot.rejections
+            );
+        }
+    }
+
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_adaptive_calibration_candidate_frames Current adaptive calibration candidate frames"
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE ruvsense_adaptive_calibration_candidate_frames gauge"
+    );
+    for (&id, ns) in node_states {
+        if let Some(ref monitor) = ns.adaptive_calibration {
+            let snapshot = monitor.snapshot();
+            let _ = writeln!(
+                body,
+                "ruvsense_adaptive_calibration_candidate_frames{{node=\"{id}\"}} {}",
+                snapshot.candidate_frames
+            );
+        }
+    }
+
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_adaptive_calibration_status Adaptive calibration status label; value is always 1 for the current status"
+    );
+    let _ = writeln!(body, "# TYPE ruvsense_adaptive_calibration_status gauge");
+    for (&id, ns) in node_states {
+        if let Some(ref monitor) = ns.adaptive_calibration {
+            let snapshot = monitor.snapshot();
+            let _ = writeln!(
+                body,
+                "ruvsense_adaptive_calibration_status{{node=\"{id}\",status=\"{:?}\"}} 1",
+                snapshot.status
+            );
+        }
+    }
+}
+
+async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.read().await;
     let now = std::time::Instant::now();
-    let active_nodes = active_node_count(&s, now);
-    let ready = if active_nodes >= s.min_nodes { 1 } else { 0 };
-    let mut body = String::with_capacity(2048);
-
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_master_ready Master readiness based on active node quorum"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_master_ready gauge");
-    let _ = writeln!(body, "ruvsense_master_ready {ready}");
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_active_nodes Active ESP32 nodes seen within readiness timeout"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_active_nodes gauge");
-    let _ = writeln!(body, "ruvsense_active_nodes {active_nodes}");
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_min_nodes Minimum active nodes required for ready"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_min_nodes gauge");
-    let _ = writeln!(body, "ruvsense_min_nodes {}", s.min_nodes);
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_ticks_total Sensing update ticks processed"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_ticks_total counter");
-    let _ = writeln!(body, "ruvsense_ticks_total {}", s.tick);
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_ws_clients Current WebSocket subscriber count"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_ws_clients gauge");
-    let _ = writeln!(body, "ruvsense_ws_clients {}", s.tx.receiver_count());
-
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_node_frame_rate_hz Per-node CSI frame-rate EMA"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_node_frame_rate_hz gauge");
-    for (&id, ns) in &s.node_states {
-        let _ = writeln!(
+    match render_prometheus_metrics(&s, now) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
             body,
-            "ruvsense_node_frame_rate_hz{{node=\"{id}\"}} {:.3}",
-            ns.csi_fps_ema
-        );
+        )
+            .into_response(),
+        Err(message) => {
+            error!("Failed to render Prometheus metrics: {message}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                format!("metrics render error: {message}\n"),
+            )
+                .into_response()
+        }
     }
-    let _ = writeln!(body, "# HELP ruvsense_node_active Per-node active status");
-    let _ = writeln!(body, "# TYPE ruvsense_node_active gauge");
+}
+
+fn render_prometheus_metrics(s: &AppStateInner, now: std::time::Instant) -> Result<String, String> {
+    use prometheus::{
+        Encoder, GaugeVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+        TextEncoder,
+    };
+
+    fn register<M: prometheus::core::Collector + Clone + 'static>(
+        registry: &Registry,
+        metric: &M,
+    ) -> Result<(), String> {
+        registry
+            .register(Box::new(metric.clone()))
+            .map_err(|e| format!("register metric: {e}"))
+    }
+
+    let registry = Registry::new();
+    let active_nodes = active_node_count(s, now) as i64;
+    let ready = if (active_nodes as usize) >= s.min_nodes {
+        1
+    } else {
+        0
+    };
+
+    let master_ready = IntGauge::with_opts(Opts::new(
+        "ruvsense_master_ready",
+        "Master readiness based on active node quorum",
+    ))
+    .map_err(|e| e.to_string())?;
+    register(&registry, &master_ready)?;
+    master_ready.set(ready);
+
+    let active_nodes_gauge = IntGauge::with_opts(Opts::new(
+        "ruvsense_active_nodes",
+        "Active ESP32 nodes seen within readiness timeout",
+    ))
+    .map_err(|e| e.to_string())?;
+    register(&registry, &active_nodes_gauge)?;
+    active_nodes_gauge.set(active_nodes);
+
+    let min_nodes = IntGauge::with_opts(Opts::new(
+        "ruvsense_min_nodes",
+        "Minimum active nodes required for ready",
+    ))
+    .map_err(|e| e.to_string())?;
+    register(&registry, &min_nodes)?;
+    min_nodes.set(s.min_nodes as i64);
+
+    let ticks = IntCounter::with_opts(Opts::new(
+        "ruvsense_ticks_total",
+        "Sensing update ticks processed",
+    ))
+    .map_err(|e| e.to_string())?;
+    register(&registry, &ticks)?;
+    ticks.inc_by(s.tick);
+
+    let ws_clients = IntGauge::with_opts(Opts::new(
+        "ruvsense_ws_clients",
+        "Current WebSocket subscriber count",
+    ))
+    .map_err(|e| e.to_string())?;
+    register(&registry, &ws_clients)?;
+    ws_clients.set(s.tx.receiver_count() as i64);
+
+    let frame_rate = GaugeVec::new(
+        Opts::new(
+            "ruvsense_node_frame_rate_hz",
+            "Per-node CSI frame-rate EMA",
+        ),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &frame_rate)?;
+
+    let node_active = IntGaugeVec::new(
+        Opts::new("ruvsense_node_active", "Per-node active status"),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &node_active)?;
+
+    let tensor_compression = GaugeVec::new(
+        Opts::new(
+            "ruvsense_tensor_compression_ratio",
+            "Raw-to-encoded tensor compression ratio by node and buffer",
+        ),
+        &["node", "buffer"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &tensor_compression)?;
+
     for (&id, ns) in &s.node_states {
-        let active = if is_node_active(ns, now) { 1 } else { 0 };
-        let _ = writeln!(body, "ruvsense_node_active{{node=\"{id}\"}} {active}");
+        let id_label = id.to_string();
+        frame_rate
+            .with_label_values(&[id_label.as_str()])
+            .set(ns.csi_fps_ema);
+        node_active
+            .with_label_values(&[id_label.as_str()])
+            .set(if is_node_active(ns, now) { 1 } else { 0 });
+        tensor_compression
+            .with_label_values(&[id_label.as_str(), "breathing"])
+            .set(ns.latest_breathing_compression_ratio);
+        tensor_compression
+            .with_label_values(&[id_label.as_str(), "heartbeat"])
+            .set(ns.latest_heartbeat_compression_ratio);
     }
-    append_udp_jitter_prometheus_metrics(&mut body, &s.udp_jitter_stats);
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_neural_inference_latency_ms Latest and P95 pose/model processing latency"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_neural_inference_latency_ms gauge");
-    let _ = writeln!(
-        body,
-        "ruvsense_neural_inference_latency_ms{{quantile=\"latest\"}} {:.3}",
-        s.latest_pose_latency_ms
-    );
-    let p95 = s.pose_latency_p95_ms.current().unwrap_or(0.0);
-    let _ = writeln!(
-        body,
-        "ruvsense_neural_inference_latency_ms{{quantile=\"p95\"}} {:.3}",
-        p95
-    );
+
+    let csi_frames = IntCounterVec::new(
+        Opts::new(
+            "ruvsense_csi_frames_total",
+            "CSI frames emitted by the UDP jitter buffer",
+        ),
+        &["node", "kind"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &csi_frames)?;
+
+    let udp_dropped = IntCounterVec::new(
+        Opts::new(
+            "ruvsense_udp_packets_dropped_total",
+            "CSI packet gaps or stale duplicates dropped by the UDP jitter buffer",
+        ),
+        &["node", "reason"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &udp_dropped)?;
+
+    let dropped_ratio = GaugeVec::new(
+        Opts::new(
+            "ruvsense_node_dropped_packet_ratio",
+            "Dropped CSI packet ratio per ESP32 node",
+        ),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &dropped_ratio)?;
+
+    let reordered = IntCounterVec::new(
+        Opts::new(
+            "ruvsense_udp_reordered_frames_total",
+            "Out-of-order CSI frames recovered by the UDP jitter buffer",
+        ),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &reordered)?;
+
+    let jitter_depth = IntGaugeVec::new(
+        Opts::new(
+            "ruvsense_udp_jitter_buffer_depth",
+            "Current queued CSI frames in the UDP jitter buffer",
+        ),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &jitter_depth)?;
+
+    let jitter_hold = IntGaugeVec::new(
+        Opts::new(
+            "ruvsense_udp_jitter_hold_ms",
+            "Latest and max jitter-buffer hold time",
+        ),
+        &["node", "kind"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &jitter_hold)?;
+
+    for (&id, stats) in &s.udp_jitter_stats {
+        let id_label = id.to_string();
+        csi_frames
+            .with_label_values(&[id_label.as_str(), "live"])
+            .inc_by(stats.emitted_live_total);
+        csi_frames
+            .with_label_values(&[id_label.as_str(), "interpolated"])
+            .inc_by(stats.interpolated_total);
+        udp_dropped
+            .with_label_values(&[id_label.as_str(), "missing_gap"])
+            .inc_by(stats.missing_dropped_total);
+        udp_dropped
+            .with_label_values(&[id_label.as_str(), "late_or_duplicate"])
+            .inc_by(stats.late_or_duplicate_total);
+        dropped_ratio
+            .with_label_values(&[id_label.as_str()])
+            .set(stats.dropped_ratio());
+        reordered
+            .with_label_values(&[id_label.as_str()])
+            .inc_by(stats.reordered_total);
+        jitter_depth
+            .with_label_values(&[id_label.as_str()])
+            .set(stats.buffer_depth as i64);
+        jitter_hold
+            .with_label_values(&[id_label.as_str(), "latest"])
+            .set(stats.last_hold_ms as i64);
+        jitter_hold
+            .with_label_values(&[id_label.as_str(), "max"])
+            .set(stats.max_hold_ms as i64);
+    }
+
+    let adaptive_promotions = IntCounterVec::new(
+        Opts::new(
+            "ruvsense_adaptive_calibration_promotions_total",
+            "Adaptive baseline promotions per ESP32 node",
+        ),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &adaptive_promotions)?;
+    let adaptive_rejections = IntCounterVec::new(
+        Opts::new(
+            "ruvsense_adaptive_calibration_rejections_total",
+            "Adaptive baseline candidate rejections per ESP32 node",
+        ),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &adaptive_rejections)?;
+    let adaptive_candidate_frames = IntGaugeVec::new(
+        Opts::new(
+            "ruvsense_adaptive_calibration_candidate_frames",
+            "Current adaptive calibration candidate frames",
+        ),
+        &["node"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &adaptive_candidate_frames)?;
+    let adaptive_status = IntGaugeVec::new(
+        Opts::new(
+            "ruvsense_adaptive_calibration_status",
+            "Adaptive calibration status label; value is always 1 for the current status",
+        ),
+        &["node", "status"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &adaptive_status)?;
+    for (&id, ns) in &s.node_states {
+        if let Some(ref monitor) = ns.adaptive_calibration {
+            let snapshot = monitor.snapshot();
+            let id_label = id.to_string();
+            adaptive_promotions
+                .with_label_values(&[id_label.as_str()])
+                .inc_by(snapshot.promotions);
+            adaptive_rejections
+                .with_label_values(&[id_label.as_str()])
+                .inc_by(snapshot.rejections);
+            adaptive_candidate_frames
+                .with_label_values(&[id_label.as_str()])
+                .set(snapshot.candidate_frames as i64);
+            let status_label = format!("{:?}", snapshot.status);
+            adaptive_status
+                .with_label_values(&[id_label.as_str(), status_label.as_str()])
+                .set(1);
+        }
+    }
+
+    let neural_latency = GaugeVec::new(
+        Opts::new(
+            "ruvsense_neural_inference_latency_ms",
+            "Latest and P95 pose/model processing latency",
+        ),
+        &["quantile"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &neural_latency)?;
+    neural_latency
+        .with_label_values(&["latest"])
+        .set(s.latest_pose_latency_ms);
+    neural_latency
+        .with_label_values(&["p95"])
+        .set(s.pose_latency_p95_ms.current().unwrap_or(0.0));
+
+    let dsp_latency = GaugeVec::new(
+        Opts::new(
+            "ruvsense_dsp_latency_ms",
+            "Latest and P95 DSP feature/vitals processing latency",
+        ),
+        &["quantile"],
+    )
+    .map_err(|e| e.to_string())?;
+    register(&registry, &dsp_latency)?;
+    dsp_latency
+        .with_label_values(&["latest"])
+        .set(s.latest_dsp_latency_ms);
+    dsp_latency
+        .with_label_values(&["p95"])
+        .set(s.dsp_latency_p95_ms.current().unwrap_or(0.0));
+
     let active_tracking_zones = s
         .latest_update
         .as_ref()
@@ -7024,20 +7932,25 @@ async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl I
                 .len()
         })
         .unwrap_or(0);
-    let _ = writeln!(
-        body,
-        "# HELP ruvsense_active_tracking_zones Active tracking zones with live person tracks"
-    );
-    let _ = writeln!(body, "# TYPE ruvsense_active_tracking_zones gauge");
-    let _ = writeln!(body, "ruvsense_active_tracking_zones {active_tracking_zones}");
+    let active_zones = IntGauge::with_opts(Opts::new(
+        "ruvsense_active_tracking_zones",
+        "Active tracking zones with live person tracks",
+    ))
+    .map_err(|e| e.to_string())?;
+    register(&registry, &active_zones)?;
+    active_zones.set(active_tracking_zones as i64);
 
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4",
-        )],
-        body,
-    )
+    let encoder = TextEncoder::new();
+    let metric_families = registry.gather();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .map_err(|e| format!("encode metrics: {e}"))?;
+    String::from_utf8(buffer).map_err(|e| format!("metrics were not UTF-8: {e}"))
+}
+
+async fn config_schema_endpoint() -> Json<schemars::schema::RootSchema> {
+    Json(runtime_config_schema())
 }
 
 async fn info_page() -> Html<String> {
@@ -7059,7 +7972,11 @@ async fn info_page() -> Html<String> {
 
 // ── UDP receiver task ────────────────────────────────────────────────────────
 
-async fn udp_receiver_task(state: SharedState, udp_port: u16) {
+async fn udp_receiver_task(
+    state: SharedState,
+    udp_port: u16,
+    jitter_config: udp_jitter::UdpJitterConfig,
+) {
     let addr = format!("0.0.0.0:{udp_port}");
     let socket = match UdpSocket::bind(&addr).await {
         Ok(s) => {
@@ -7073,10 +7990,11 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
     };
 
     let mut buf = [0u8; 2048];
-    let mut jitter = udp_jitter::UdpJitterBuffer::default();
+    let mut jitter = udp_jitter::UdpJitterBuffer::new(jitter_config);
+    let mut last_src_by_node: HashMap<u8, SocketAddr> = HashMap::new();
     loop {
-        match socket.recv_from(&mut buf).await {
-            Ok((len, src)) => {
+        match tokio::time::timeout(jitter.max_hold(), socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, src))) => {
                 // ADR-039: Try edge vitals packet first (magic 0xC511_0002).
                 if let Some(vitals) = parse_esp32_vitals(&buf[..len]) {
                     debug!(
@@ -7113,7 +8031,10 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     // ── Per-node state for edge vitals (issue #249) ──────
                     let node_id = vitals.node_id;
-                    let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
+                    let ns = s
+                        .node_states
+                        .entry(node_id)
+                        .or_insert_with(|| NodeState::new_for_node(node_id));
                     let now_arrival = std::time::Instant::now();
                     ns.observe_edge_vitals_arrival(now_arrival);
                     ns.observe_remote_addr(src);
@@ -7271,12 +8192,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-                        source: if is_live_frame {
-                            "esp32"
-                        } else {
-                            "esp32:interpolated"
-                        }
-                        .to_string(),
+                        source: "esp32".to_string(),
                         tick,
                         nodes: active_nodes,
                         features: fused_features.clone(),
@@ -7359,8 +8275,10 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                                        sync.local_minus_epoch_us());
                                 let mut s = state.write().await;
                                 let node_id = sync.node_id;
-                                let ns =
-                                    s.node_states.entry(node_id).or_insert_with(NodeState::new);
+                                let ns = s
+                                    .node_states
+                                    .entry(node_id)
+                                    .or_insert_with(|| NodeState::new_for_node(node_id));
                                 ns.apply_sync_packet(sync, std::time::Instant::now());
                                 ns.observe_remote_addr(src);
                                 continue;
@@ -7394,7 +8312,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     let ns = s
                         .node_states
                         .entry(fused.node_id)
-                        .or_insert_with(NodeState::new);
+                        .or_insert_with(|| NodeState::new_for_node(fused.node_id));
                     ns.observe_edge_vitals_arrival(std::time::Instant::now());
                     ns.observe_remote_addr(src);
                     ns.rssi_history.push_back(fused.rssi as f64);
@@ -7445,7 +8363,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
                     s.node_states
                         .entry(wasm_output.node_id)
-                        .or_insert_with(NodeState::new)
+                        .or_insert_with(|| NodeState::new_for_node(wasm_output.node_id))
                         .observe_remote_addr(src);
                     s.latest_wasm_events = Some(wasm_output);
                     continue;
@@ -7453,6 +8371,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                 if let Some(frame) = parse_esp32_frame(&buf[..len]) {
                     let jitter_node_id = frame.node_id;
+                    last_src_by_node.insert(jitter_node_id, src);
                     let delivered_frames = jitter.push(frame, std::time::Instant::now());
                     if delivered_frames.is_empty() {
                         if let Some(stats) = jitter.snapshot(jitter_node_id) {
@@ -7522,7 +8441,10 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     // to avoid unsafe raw pointer (review finding #2).
                     let adaptive_model_clone = s.adaptive_model.clone();
 
-                    let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
+                    let ns = s
+                        .node_states
+                        .entry(node_id)
+                        .or_insert_with(|| NodeState::new_for_node(node_id));
                     // ADR-110 iter 19 — feed the per-node fps EMA from real
                     // CSI arrivals. The helper sets `last_frame_time` as a
                     // side effect, so the previous bare assignment is gone.
@@ -7543,6 +8465,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         ns.frame_history.pop_front();
                     }
 
+                    let dsp_started = std::time::Instant::now();
                     let sample_rate_hz = 1000.0 / 500.0_f64;
                     let (
                         features,
@@ -7575,6 +8498,14 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                             (conf * 0.7 + classification.confidence * 0.3).clamp(0.0, 1.0);
                     }
 
+                    update_node_adaptive_calibration(
+                        ns,
+                        &frame,
+                        &classification,
+                        &features,
+                        is_live_frame,
+                    );
+
                     ns.rssi_history.push_back(features.mean_rssi);
                     if ns.rssi_history.len() > 60 {
                         ns.rssi_history.pop_front();
@@ -7585,6 +8516,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .process_frame(&frame.amplitudes, &frame.phases);
                     let vitals = smooth_vitals_node(ns, &raw_vitals);
                     ns.latest_vitals = vitals.clone();
+                    ns.update_tensor_compression(&frame.amplitudes, &frame.phases);
 
                     // DynamicMinCut person estimation from subcarrier correlation.
                     let corr_persons = estimate_persons_from_correlation(&ns.frame_history);
@@ -7604,6 +8536,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     // Store latest features on node for cross-node fusion.
                     ns.latest_features = Some(features.clone());
+                    let _ = ns;
+                    record_dsp_latency(&mut s, dsp_started);
 
                     // Done with per-node mutable borrow; now read aggregated
                     // state from all nodes (the borrow of `ns` ends here).
@@ -7710,7 +8644,12 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-                        source: "esp32".to_string(),
+                        source: if is_live_frame {
+                            "esp32"
+                        } else {
+                            "esp32:interpolated"
+                        }
+                        .to_string(),
                         tick,
                         nodes: active_nodes,
                         features: fused_features.clone(),
@@ -7784,15 +8723,299 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("UDP recv error: {e}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(_) => {
+                let delivered_frames = jitter.flush_due(std::time::Instant::now());
+                for delivered in delivered_frames {
+                    let node_id = delivered.frame.node_id;
+                    let src = last_src_by_node.get(&node_id).copied();
+                    let jitter_snapshot = jitter.snapshot(node_id);
+                    handle_delivered_esp32_frame(&state, src, delivered, jitter_snapshot).await;
+                }
             }
         }
     }
 }
 
 // ── Simulated data task ──────────────────────────────────────────────────────
+
+async fn handle_delivered_esp32_frame(
+    state: &SharedState,
+    src: Option<SocketAddr>,
+    delivered: udp_jitter::DeliveredFrame,
+    jitter_snapshot: Option<udp_jitter::NodeJitterSnapshot>,
+) {
+    let frame = delivered.frame;
+    let is_live_frame = delivered.kind == udp_jitter::FrameKind::Live;
+    let src_label = src
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "held-buffer".to_string());
+    debug!(
+        "ESP32 frame from {src_label}: node={}, subs={}, seq={}",
+        frame.node_id, frame.n_subcarriers, frame.sequence
+    );
+
+    let mut s = state.write().await;
+    if let Some(stats) = jitter_snapshot {
+        s.udp_jitter_stats.insert(frame.node_id, stats);
+    }
+    if is_live_frame {
+        s.source = "esp32".to_string();
+        s.last_esp32_frame = Some(std::time::Instant::now());
+    }
+
+    s.frame_history.push_back(frame.amplitudes.clone());
+    if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
+        s.frame_history.pop_front();
+    }
+
+    {
+        let intro_feature = if frame.amplitudes.is_empty() {
+            0.0
+        } else {
+            frame.amplitudes.iter().copied().sum::<f64>() / frame.amplitudes.len() as f64
+        };
+        let intro_ts_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let _ = s.intro.update(intro_ts_ns, intro_feature);
+        if let Ok(intro_json) = serde_json::to_string(s.intro.snapshot()) {
+            let _ = s.intro_tx.send(intro_json);
+        }
+    }
+
+    let node_id = frame.node_id;
+    let adaptive_model_clone = s.adaptive_model.clone();
+
+    let ns = s
+        .node_states
+        .entry(node_id)
+        .or_insert_with(|| NodeState::new_for_node(node_id));
+    if is_live_frame {
+        ns.observe_csi_frame_arrival(std::time::Instant::now());
+    }
+    if let Some(src) = src {
+        ns.observe_remote_addr(src);
+    }
+
+    ns.update_novelty(&frame.amplitudes);
+    ns.frame_history.push_back(frame.amplitudes.clone());
+    if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
+        ns.frame_history.pop_front();
+    }
+
+    let dsp_started = std::time::Instant::now();
+    let sample_rate_hz = 1000.0 / 500.0_f64;
+    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+        extract_features_from_frame(&frame, &ns.frame_history, sample_rate_hz);
+    smooth_and_classify_node(ns, &mut classification, raw_motion);
+
+    if let Some(ref model) = adaptive_model_clone {
+        let amps = ns.frame_history.back().map(|v| v.as_slice()).unwrap_or(&[]);
+        let feat_arr = adaptive_classifier::features_from_runtime(
+            &serde_json::json!({
+                "variance": features.variance,
+                "motion_band_power": features.motion_band_power,
+                "breathing_band_power": features.breathing_band_power,
+                "spectral_power": features.spectral_power,
+                "dominant_freq_hz": features.dominant_freq_hz,
+                "change_points": features.change_points,
+                "mean_rssi": features.mean_rssi,
+            }),
+            amps,
+        );
+        let (label, conf) = model.classify(&feat_arr);
+        classification.motion_level = label.to_string();
+        classification.presence = label != "absent";
+        classification.confidence = (conf * 0.7 + classification.confidence * 0.3).clamp(0.0, 1.0);
+    }
+
+    update_node_adaptive_calibration(
+        ns,
+        &frame,
+        &classification,
+        &features,
+        is_live_frame,
+    );
+
+    ns.rssi_history.push_back(features.mean_rssi);
+    if ns.rssi_history.len() > 60 {
+        ns.rssi_history.pop_front();
+    }
+
+    let raw_vitals = ns
+        .vital_detector
+        .process_frame(&frame.amplitudes, &frame.phases);
+    let vitals = smooth_vitals_node(ns, &raw_vitals);
+    ns.latest_vitals = vitals.clone();
+    ns.update_tensor_compression(&frame.amplitudes, &frame.phases);
+
+    let corr_persons = estimate_persons_from_correlation(&ns.frame_history);
+    let raw_score = corr_persons_to_score(corr_persons);
+    ns.smoothed_person_score = ns.smoothed_person_score * 0.92 + raw_score * 0.08;
+    if classification.presence {
+        let count = score_to_person_count(ns.smoothed_person_score, ns.prev_person_count);
+        ns.prev_person_count = count;
+    } else {
+        ns.prev_person_count = 0;
+    }
+    ns.latest_features = Some(features.clone());
+    let _ = ns;
+    record_dsp_latency(&mut s, dsp_started);
+
+    s.rssi_history.push_back(features.mean_rssi);
+    if s.rssi_history.len() > 60 {
+        s.rssi_history.pop_front();
+    }
+    s.latest_vitals = vitals.clone();
+
+    let fused_features = fuse_multi_node_features(&features, &s.node_states);
+
+    s.tick += 1;
+    let tick = s.tick;
+
+    let motion_score = if classification.motion_level == "active" {
+        0.8
+    } else if classification.motion_level == "present_still" {
+        0.3
+    } else {
+        0.05
+    };
+
+    let now = std::time::Instant::now();
+    let total_persons = if classification.presence {
+        let dedup = s.dedup_factor;
+        let (fused, fallback_count) =
+            multistatic_bridge::fuse_or_fallback(&s.multistatic_fuser, &s.node_states, dedup);
+        match fused {
+            Some(ref f) => {
+                let score =
+                    multistatic_bridge::compute_person_score_from_amplitudes(&f.fused_amplitude);
+                s.smoothed_person_score = s.smoothed_person_score * 0.90 + score * 0.10;
+                let count = aggregate_person_count(s.person_count(), &s.node_states, now);
+                s.prev_person_count = count;
+                count.max(1)
+            }
+            None => aggregate_person_count(fallback_count.unwrap_or(0), &s.node_states, now).max(1),
+        }
+    } else {
+        s.prev_person_count = 0;
+        0
+    };
+
+    if is_live_frame {
+        if let Some(frame_history) = s
+            .node_states
+            .get(&node_id)
+            .map(|ns| ns.frame_history.clone())
+        {
+            if let Some(ref mut fm) = s.field_model {
+                field_bridge::maybe_feed_calibration(fm, &frame_history);
+            }
+        }
+    }
+
+    let environment = s.environment.clone();
+    let active_nodes: Vec<NodeInfo> = s
+        .node_states
+        .iter()
+        .filter(|(_, n)| {
+            n.last_frame_time
+                .is_some_and(|t| now.duration_since(t).as_secs() < 10)
+        })
+        .map(|(&id, n)| NodeInfo {
+            node_id: id,
+            rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
+            position: configured_node(&environment, id)
+                .map(|cfg| cfg.position_m)
+                .unwrap_or([0.0, 0.0, 0.0]),
+            amplitude: n
+                .frame_history
+                .back()
+                .map(|a| a.iter().take(56).cloned().collect())
+                .unwrap_or_default(),
+            subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
+            sync: n.sync_snapshot(),
+        })
+        .collect();
+
+    let mut update = SensingUpdate {
+        msg_type: "sensing_update".to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+        source: if is_live_frame {
+            "esp32"
+        } else {
+            "esp32:interpolated"
+        }
+        .to_string(),
+        tick,
+        nodes: active_nodes,
+        features: fused_features.clone(),
+        classification,
+        signal_field: generate_signal_field(
+            fused_features.mean_rssi,
+            motion_score,
+            breathing_rate_hz,
+            fused_features.variance.min(1.0),
+            &sub_variances,
+        ),
+        vital_signs: Some(vitals),
+        enhanced_motion: None,
+        enhanced_breathing: None,
+        posture: None,
+        signal_quality_score: None,
+        quality_verdict: None,
+        bssid_count: None,
+        pose_keypoints: None,
+        model_status: None,
+        persons: None,
+        estimated_persons: if total_persons > 0 {
+            Some(total_persons)
+        } else {
+            None
+        },
+        node_features: build_node_features(&s.node_states, now),
+    };
+
+    let pose_started = std::time::Instant::now();
+    let raw_persons = derive_pose_from_sensing(&update);
+    let mut last_tracker_instant = s.last_tracker_instant.take();
+    let persons = persons_for_update(
+        &update,
+        raw_persons,
+        &mut s.pose_tracker,
+        &mut last_tracker_instant,
+    );
+    s.last_tracker_instant = last_tracker_instant;
+    record_pose_latency(&mut s, pose_started);
+    if !persons.is_empty() {
+        update.persons = Some(persons);
+    }
+
+    if let Ok(json) = serde_json::to_string(&update) {
+        let _ = s.tx.send(json);
+    }
+    s.latest_update = Some(update);
+
+    if tick % 100 == 0 {
+        let stale = Duration::from_secs(60);
+        let before = s.node_states.len();
+        s.node_states
+            .retain(|_id, ns| ns.last_frame_time.is_some_and(|t| now.duration_since(t) < stale));
+        let evicted = before - s.node_states.len();
+        if evicted > 0 {
+            info!(
+                "Evicted {} stale node(s), {} active",
+                evicted,
+                s.node_states.len()
+            );
+        }
+    }
+}
 
 async fn simulated_data_task(state: SharedState, tick_ms: u64) {
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
@@ -7813,11 +9036,13 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             s.frame_history.pop_front();
         }
 
+        let dsp_started = std::time::Instant::now();
         let sample_rate_hz = 1000.0 / tick_ms as f64;
         let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
             extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
         smooth_and_classify(&mut s, &mut classification, raw_motion);
         adaptive_override(&s, &features, &mut classification);
+        record_dsp_latency(&mut s, dsp_started);
 
         s.rssi_history.push_back(features.mean_rssi);
         if s.rssi_history.len() > 60 {
@@ -8138,17 +9363,71 @@ fn coalesce_ui_path(initial: std::path::PathBuf) -> std::path::PathBuf {
     initial
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+fn parse_log_format(value: Option<&str>) -> Result<LogFormat, String> {
+    match value.unwrap_or("text").trim().to_ascii_lowercase().as_str() {
+        "" | "text" => Ok(LogFormat::Text),
+        "json" => Ok(LogFormat::Json),
+        other => Err(format!(
+            "unsupported LOG_FORMAT '{other}'; expected 'text' or 'json'"
+        )),
+    }
+}
+
+fn init_tracing_from_env() -> Result<(), String> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,tower_http=debug".into());
+    match parse_log_format(std::env::var("LOG_FORMAT").ok().as_deref())? {
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init()
+            .map_err(|e| format!("failed to initialize tracing: {e}")),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .try_init()
+            .map_err(|e| format!("failed to initialize tracing: {e}")),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tower_http=debug".into()),
-        )
-        .init();
+    if let Err(message) = init_tracing_from_env() {
+        eprintln!("Logging configuration error: {message}");
+        std::process::exit(2);
+    }
 
     let mut args = Args::parse();
+    if let Some(kind) = args.print_config_schema.clone() {
+        match serde_json::to_string_pretty(&schema_for_config_kind(kind)) {
+            Ok(schema) => {
+                println!("{schema}");
+                return;
+            }
+            Err(e) => {
+                error!("Failed to render configuration schema: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if let Some(root) = args.validate_config_root.as_ref() {
+        match validate_config_root(root) {
+            Ok(report) => {
+                info!("Configuration validation passed: {}", report.summary());
+                println!("{}", report.summary());
+                return;
+            }
+            Err(message) => {
+                error!("Configuration validation failed: {message}");
+                std::process::exit(2);
+            }
+        }
+    }
     args.ui_path = coalesce_ui_path(args.ui_path);
 
     // Handle --benchmark mode: run vital sign benchmark and exit
@@ -8836,7 +10115,12 @@ async fn main() {
     );
 
     // ADR-044 §5.3: load persisted runtime config from the data directory.
-    let runtime_config = match load_runtime_config(&data_dir) {
+    let runtime_config_result = if let Some(path) = args.config_file.as_ref() {
+        load_runtime_config_file(path)
+    } else {
+        load_runtime_config(&data_dir)
+    };
+    let runtime_config = match runtime_config_result {
         Ok(config) => config,
         Err(message) => {
             error!("Runtime config validation failed: {message}");
@@ -9033,6 +10317,8 @@ async fn main() {
         p95_spectral_power: RollingP95::new(600, 60),
         latest_pose_latency_ms: 0.0,
         pose_latency_p95_ms: RollingP95::new(600, 10),
+        latest_dsp_latency_ms: 0.0,
+        dsp_latency_p95_ms: RollingP95::new(600, 10),
         // ADR-044 §5.3: runtime-configurable dedup factor (persisted).
         dedup_factor: runtime_config.dedup_factor,
         enabled_modules: runtime_config.enabled_modules.iter().cloned().collect(),
@@ -9053,7 +10339,17 @@ async fn main() {
     // Start background tasks based on source
     match source {
         "esp32" => {
-            tokio::spawn(udp_receiver_task(state.clone(), args.udp_port));
+            let jitter_config = udp_jitter::UdpJitterConfig {
+                max_reorder_gap: args.udp_jitter_max_reorder_gap,
+                max_interpolate_gap: args.udp_jitter_max_interpolate_gap,
+                max_buffered_frames: args.udp_jitter_max_buffered_frames.max(1),
+                max_hold: Duration::from_millis(args.udp_jitter_hold_ms.max(1)),
+            };
+            tokio::spawn(udp_receiver_task(
+                state.clone(),
+                args.udp_port,
+                jitter_config,
+            ));
             tokio::spawn(broadcast_tick_task(state.clone(), args.tick_ms));
         }
         "wifi" => {
@@ -9232,6 +10528,7 @@ async fn main() {
             get(config_get_dedup_factor).post(config_set_dedup_factor),
         )
         .route("/api/v1/config/ground-truth", post(config_set_ground_truth))
+        .route("/api/v1/config/schema", get(config_schema_endpoint))
         // Static UI files
         .nest_service("/ui", ServeDir::new(&ui_path))
         // ADR-102: make the edge registry handle (Option<Arc<EdgeRegistry>>)
@@ -9320,10 +10617,12 @@ async fn main() {
 mod topology_console_tests {
     use super::{
         business_modules, default_dedup_factor, default_enabled_modules, load_runtime_config,
-        module_status, normalize_runtime_config, runtime_config_schema, save_runtime_config,
-        topology_nodes_json, topology_readiness_json, validate_runtime_config, AccessPointConfig,
-        EnvironmentConfig, EnvironmentLinkConfig, EnvironmentNodeConfig, NodeState, RoomConfig,
-        RuntimeConfig, ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION,
+        load_runtime_config_file, module_status, normalize_runtime_config, parse_log_format,
+        runtime_config_schema, save_runtime_config, schema_for_config_kind, topology_nodes_json,
+        topology_readiness_json, validate_config_file, validate_runtime_config, AccessPointConfig,
+        ConfigSchemaKind, EnvironmentConfig, EnvironmentLinkConfig, EnvironmentNodeConfig,
+        LogFormat, NodeState, RoomConfig, RuntimeConfig, ESP32_OFFLINE_TIMEOUT,
+        MODULE_CONFIG_VERSION,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -9488,6 +10787,99 @@ mod topology_console_tests {
         let err = load_runtime_config(dir.path()).expect_err("unknown fields must fail");
 
         assert!(err.contains("JSON schema parse error"));
+    }
+
+    #[test]
+    fn runtime_config_file_loads_toml_and_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml_path = dir.path().join("runtime.toml");
+        fs::write(
+            &toml_path,
+            r#"
+dedup_factor = 2.5
+enabled_modules = ["respiration_tracking", "fall_detection"]
+"#,
+        )
+        .expect("write toml");
+        let toml = load_runtime_config_file(&toml_path).expect("TOML config should load");
+        assert_eq!(toml.dedup_factor, 2.5);
+        assert_eq!(toml.module_config_version, MODULE_CONFIG_VERSION);
+
+        let yaml_path = dir.path().join("runtime.yaml");
+        fs::write(
+            &yaml_path,
+            r#"
+dedup_factor: 4.0
+enabled_modules:
+  - intrusion_detection
+"#,
+        )
+        .expect("write yaml");
+        let yaml = load_runtime_config_file(&yaml_path).expect("YAML config should load");
+        assert_eq!(yaml.dedup_factor, 4.0);
+        assert_eq!(yaml.enabled_modules, vec!["intrusion_detection".to_string()]);
+    }
+
+    #[test]
+    fn runtime_config_file_rejects_toml_unknown_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runtime.toml");
+        fs::write(
+            &path,
+            r#"
+dedup_factor = 2.0
+surprise = true
+"#,
+        )
+        .expect("write");
+
+        let err = load_runtime_config_file(&path).expect_err("unknown TOML field must fail");
+
+        assert!(err.contains("TOML schema parse error"));
+    }
+
+    #[test]
+    fn runtime_config_file_rejects_unsupported_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runtime.ini");
+        fs::write(&path, "dedup_factor = 2.0").expect("write");
+
+        let err = load_runtime_config_file(&path).expect_err("unsupported extension must fail");
+
+        assert!(err.contains("unsupported runtime config extension"));
+    }
+
+    #[test]
+    fn bfld_blueprint_yaml_shape_tolerates_home_assistant_input_tags() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cog-ha-matter/blueprints/bfld/presence-lighting.yaml");
+
+        validate_config_file(&path).expect("checked-in BFLD blueprint should validate");
+    }
+
+    #[test]
+    fn schema_kind_generation_covers_public_config_shapes() {
+        for kind in [
+            ConfigSchemaKind::Runtime,
+            ConfigSchemaKind::Swarm,
+            ConfigSchemaKind::Training,
+            ConfigSchemaKind::HomecoreAutomation,
+            ConfigSchemaKind::BfldBlueprint,
+        ] {
+            let schema = schema_for_config_kind(kind);
+            assert!(
+                schema.schema.object.is_some() || !schema.definitions.is_empty(),
+                "schema should not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn log_format_parser_accepts_text_json_and_rejects_unknown() {
+        assert_eq!(parse_log_format(None).unwrap(), LogFormat::Text);
+        assert_eq!(parse_log_format(Some("text")).unwrap(), LogFormat::Text);
+        assert_eq!(parse_log_format(Some("json")).unwrap(), LogFormat::Json);
+        assert!(parse_log_format(Some("xml")).is_err());
     }
 
     #[test]

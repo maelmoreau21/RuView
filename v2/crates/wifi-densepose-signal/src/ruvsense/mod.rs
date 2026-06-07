@@ -79,7 +79,9 @@ pub use array_coordinator::{
     ArrayCoordinator, ArrayCoordinatorConfig, ArrayNodeInput, DirectionalEvidence,
 };
 pub use calibration_drift::{
-    CalibrationDriftConfig, CalibrationDriftDecision, CalibrationDriftDetector,
+    AdaptiveCalibrationConfig, AdaptiveCalibrationDecision, AdaptiveCalibrationMonitor,
+    AdaptiveCalibrationSnapshot, AdaptiveCalibrationStatus, CalibrationDriftConfig,
+    CalibrationDriftDecision, CalibrationDriftDetector,
 };
 pub use coherence::CoherenceState;
 pub use coherence_gate::{GateDecision, GatePolicy};
