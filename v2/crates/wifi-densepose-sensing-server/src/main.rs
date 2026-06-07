@@ -8723,6 +8723,7 @@ async fn udp_receiver_task(
                     }
                 }
             }
+        }
             Ok(Err(e)) => {
                 warn!("UDP recv error: {e}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
