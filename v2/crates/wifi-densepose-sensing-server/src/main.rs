@@ -28,7 +28,7 @@ use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, train
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1840,7 +1840,7 @@ fn schema_for_config_kind(kind: ConfigSchemaKind) -> schemars::schema::RootSchem
     }
 }
 
-fn parse_runtime_config_text(path: &Path, text: &str) -> Result<RuntimeConfig, String> {
+fn parse_runtime_config_text(path: &StdPath, text: &str) -> Result<RuntimeConfig, String> {
     let ext = path
         .extension()
         .and_then(|value| value.to_str())
@@ -1865,7 +1865,7 @@ fn parse_runtime_config_text(path: &Path, text: &str) -> Result<RuntimeConfig, S
     Ok(normalize_runtime_config(parsed))
 }
 
-pub(crate) fn load_runtime_config_file(path: &Path) -> Result<RuntimeConfig, String> {
+pub(crate) fn load_runtime_config_file(path: &StdPath) -> Result<RuntimeConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("{}: failed to read runtime config: {e}", path.display()))?;
     parse_runtime_config_text(path, &text)
@@ -1888,7 +1888,7 @@ impl ConfigValidationReport {
     }
 }
 
-fn validate_config_root(root: &Path) -> Result<ConfigValidationReport, String> {
+fn validate_config_root(root: &StdPath) -> Result<ConfigValidationReport, String> {
     if !root.is_dir() {
         return Err(format!("{}: validation root is not a directory", root.display()));
     }
@@ -1914,7 +1914,7 @@ fn validate_config_root(root: &Path) -> Result<ConfigValidationReport, String> {
     })
 }
 
-fn collect_config_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_config_files(dir: &StdPath, files: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("{}: failed to read dir: {e}", dir.display()))?;
     for entry in entries {
@@ -1937,7 +1937,7 @@ fn collect_config_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Stri
     Ok(())
 }
 
-fn is_supported_config_artifact(path: &Path) -> bool {
+fn is_supported_config_artifact(path: &StdPath) -> bool {
     matches!(
         path.extension()
             .and_then(|value| value.to_str())
@@ -1947,7 +1947,7 @@ fn is_supported_config_artifact(path: &Path) -> bool {
     )
 }
 
-fn validate_config_file(path: &Path) -> Result<(), String> {
+fn validate_config_file(path: &StdPath) -> Result<(), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("{}: failed to read config artifact: {e}", path.display()))?;
     match path
@@ -1963,7 +1963,7 @@ fn validate_config_file(path: &Path) -> Result<(), String> {
     }
 }
 
-fn validate_toml_config_file(path: &Path, text: &str) -> Result<(), String> {
+fn validate_toml_config_file(path: &StdPath, text: &str) -> Result<(), String> {
     let value: toml::Value = toml::from_str(text)
         .map_err(|e| format!("{}: TOML parse error: {e}", path.display()))?;
     if value.get("swarm").is_some() {
@@ -1982,7 +1982,7 @@ fn validate_toml_config_file(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_yaml_config_file(path: &Path, text: &str) -> Result<(), String> {
+fn validate_yaml_config_file(path: &StdPath, text: &str) -> Result<(), String> {
     let value: serde_yaml::Value = serde_yaml::from_str(text)
         .map_err(|e| format!("{}: YAML parse error: {e}", path.display()))?;
     let Some(root) = value.as_mapping() else {
@@ -1999,7 +1999,7 @@ fn validate_yaml_config_file(path: &Path, text: &str) -> Result<(), String> {
 }
 
 fn validate_homecore_automation_yaml(
-    path: &Path,
+    path: &StdPath,
     root: &serde_yaml::Mapping,
 ) -> Result<(), String> {
     require_yaml_string(path, root, "name")?;
@@ -2013,7 +2013,7 @@ fn validate_homecore_automation_yaml(
     Ok(())
 }
 
-fn validate_bfld_blueprint_yaml(path: &Path, root: &serde_yaml::Mapping) -> Result<(), String> {
+fn validate_bfld_blueprint_yaml(path: &StdPath, root: &serde_yaml::Mapping) -> Result<(), String> {
     let blueprint = yaml_get(root, "blueprint")
         .and_then(serde_yaml::Value::as_mapping)
         .ok_or_else(|| format!("{}: blueprint must be a mapping", path.display()))?;
@@ -2042,7 +2042,7 @@ fn yaml_get<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde
 }
 
 fn require_yaml_string(
-    path: &Path,
+    path: &StdPath,
     mapping: &serde_yaml::Mapping,
     key: &str,
 ) -> Result<String, String> {
@@ -2054,7 +2054,7 @@ fn require_yaml_string(
 }
 
 fn require_yaml_sequence(
-    path: &Path,
+    path: &StdPath,
     mapping: &serde_yaml::Mapping,
     key: &str,
 ) -> Result<(), String> {
@@ -2065,7 +2065,7 @@ fn require_yaml_sequence(
         .ok_or_else(|| format!("{}: {key} must be a non-empty sequence", path.display()))
 }
 
-fn validate_cargo_metadata(manifest_path: &Path) -> Result<(), String> {
+fn validate_cargo_metadata(manifest_path: &StdPath) -> Result<(), String> {
     let manifest = manifest_path.display().to_string();
     let output = std::process::Command::new("cargo")
         .args([
