@@ -5,7 +5,7 @@
  * the fusion pipeline. It never generates synthetic CSI frames.
  */
 
-export class CsiSimulator {
+export class LiveCsiClient {
   static VERSION = 'v5-live-only';
 
   constructor(opts = {}) {

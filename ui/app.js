@@ -6,6 +6,8 @@ const state = {
   ws: null,
   selectedCategory: 'All',
   reconnectTimer: null,
+  environmentError: null,
+  calibration: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -58,20 +60,80 @@ function setMasterStatus(status, text) {
   pill.querySelector('span:last-child').textContent = text;
 }
 
+function operatorFusionStatus(fusion, ready, active) {
+  const value = String(fusion || '').toLowerCase();
+  if (ready || value === 'active') return 'Fusion active';
+  if (active > 0 || value === 'degraded') return 'En attente de quorum';
+  return 'Hors ligne';
+}
+
+function operatorSourceLabel(fleet) {
+  const raw = String(fleet?.source_mode?.raw || fleet?.source || 'offline').toLowerCase();
+  if (raw === 'esp32') return 'Live ESP32 CSI';
+  if (raw === 'auto') return 'Auto, sans simulation';
+  if (raw === 'simulate' || raw === 'simulated') return 'Simulation dev/test';
+  if (raw === 'wifi') return 'RSSI hote';
+  return 'Hors ligne';
+}
+
+function nodeStatusLabel(node) {
+  const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+  if (status === 'active' || node.active) return 'Actif';
+  if (status === 'stale') return 'Signal perdu';
+  if (status === 'degraded') return 'Degrade';
+  return 'Noeud non vu';
+}
+
+function nodeNextAction(node) {
+  const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+  if (status === 'active' || node.active) return `Derniere trame ${fmtAge(node.last_seen_ms)}`;
+  if (status === 'stale') return 'Verifier alimentation ou WiFi';
+  return 'Verifier provisioning et IP du Pi';
+}
+
+function updateChecklist() {
+  const fleet = state.fleet || {};
+  const env = state.environment || {};
+  const calibrationStatus = String(state.calibration?.status || state.calibration?.calibration?.status || '').toLowerCase();
+  const active = Number(fleet.active_nodes || 0);
+  const minNodes = Number(fleet.min_nodes || 3);
+  const checks = {
+    master: Boolean(fleet.status || fleet.source || fleet.source_mode),
+    ap1: (env.access_points || []).length >= 1,
+    ap2: (env.access_points || []).length >= 2,
+    nodes: active >= minNodes,
+    quorum: Boolean(fleet.ready),
+    calibration: ['ready', 'complete', 'completed', 'baseline_ready'].includes(calibrationStatus),
+  };
+  let done = 0;
+  for (const [key, value] of Object.entries(checks)) {
+    const row = document.querySelector(`[data-check="${key}"]`);
+    if (!row) continue;
+    row.classList.toggle('check-done', Boolean(value));
+    row.classList.toggle('check-pending', !value);
+    if (value) done++;
+  }
+  setText('setup-summary', `${done}/6`);
+}
+
 function renderFleet() {
+  const hasFleet = Boolean(state.fleet);
   const fleet = state.fleet || {};
   const active = Number(fleet.active_nodes || 0);
   const minNodes = Number(fleet.min_nodes || 3);
   const ready = Boolean(fleet.ready);
   const fusion = fleet.fusion_status || (ready ? 'active' : active > 0 ? 'degraded' : 'offline');
 
-  setMasterStatus(ready ? 'live' : active > 0 ? 'degraded' : 'offline', ready ? 'Master ready' : active > 0 ? 'Master degraded' : 'Master waiting');
-  setText('fusion-status', fusion);
+  setMasterStatus(
+    hasFleet ? ready ? 'live' : active > 0 ? 'degraded' : 'offline' : 'offline',
+    hasFleet ? ready ? 'Master joignable' : active > 0 ? `Besoin de ${minNodes} noeuds` : 'Master en attente' : 'Master non joignable'
+  );
+  setText('fusion-status', operatorFusionStatus(fusion, ready, active));
   setText('active-nodes', String(active));
   setText('min-nodes', String(minNodes));
   setText('frame-rate', fmtHz(fleet.frame_rate_hz));
-  setText('source-mode', fleet.source_mode?.raw || fleet.source || 'offline');
-  setText('fleet-readiness', ready ? 'ready' : active > 0 ? 'degraded' : 'waiting');
+  setText('source-mode', operatorSourceLabel(fleet));
+  setText('fleet-readiness', ready ? 'pret' : active > 0 ? 'besoin de quorum' : 'en attente');
 
   const list = $('#node-list');
   if (!list) return;
@@ -86,28 +148,34 @@ function renderFleet() {
   for (const node of nodes) {
     const id = node.node_id ?? '?';
     const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+    const linkedAp = node.linked_ap || node.ap_id || 'AP non assigne';
     const row = document.createElement('article');
     row.className = `device-row device-${status}`;
     row.innerHTML = `
       <div>
         <strong>${node.label || `ESP32-C6 ${id}`}</strong>
-        <span>Node ${id} / slot ${node.tdm_slot ?? '-'} of ${node.tdm_total ?? '-'}</span>
+        <span>node_id ${id} / slot ${node.tdm_slot ?? '-'} sur ${node.tdm_total ?? '-'} / ${linkedAp}</span>
       </div>
       <div class="device-meta">
-        <span>${status}</span>
+        <span>${nodeStatusLabel(node)}</span>
         <span>${fmtHz(node.frame_rate_hz)}</span>
-        <span>${fmtAge(node.last_seen_ms)}</span>
+        <span>${nodeNextAction(node)}</span>
       </div>
     `;
     list.append(row);
   }
+  updateChecklist();
 }
 
 function renderEnvironment() {
   const env = state.environment;
-  if (!env) return;
+  if (!env) {
+    renderEnvironmentUnavailable();
+    updateChecklist();
+    return;
+  }
 
-  setText('room-name', env.room?.name || 'Primary room');
+  setText('room-name', env.room?.name || 'Piece principale');
   const dims = env.room?.dimensions_m || [0, 0, 0];
   setText('room-size', `${dims.map((v) => Number(v).toFixed(1)).join(' x ')} m`);
 
@@ -121,7 +189,7 @@ function renderEnvironment() {
     row.innerHTML = `
       <div>
         <strong>${ap.label || ap.ap_id}</strong>
-        <span>${ap.ssid || 'ssid'} / ${ap.role || 'mesh'}</span>
+        <span>${ap.ssid || 'SSID non renseigne'} / ${ap.role || 'ancre mesh'}</span>
       </div>
       <div class="device-meta">
         <span>${ap.band || '2.4GHz'}</span>
@@ -133,6 +201,15 @@ function renderEnvironment() {
 
   renderStage(env);
   renderEnvironmentForm(env);
+  updateChecklist();
+}
+
+function renderEnvironmentUnavailable() {
+  setText('room-name', 'Configuration indisponible');
+  setText('room-size', '--');
+  setText('ap-count', '0 AP');
+  $('#ap-list')?.replaceChildren(emptyRow('API environnement indisponible'));
+  $('#environment-stage')?.replaceChildren(emptyRow(state.environmentError || 'Configuration indisponible'));
 }
 
 function renderStage(env) {
@@ -160,7 +237,9 @@ function renderStage(env) {
     const a = toPct(ap.position_m || [0, 0, 0]);
     const b = toPct(node.position_m || node.position || [0, 0, 0]);
     const line = document.createElement('div');
-    line.className = `rf-link ${node.active ? 'rf-link-live' : 'rf-link-offline'}`;
+    const status = String(node.status || (node.active ? 'active' : 'offline')).toLowerCase();
+    const active = Boolean(node.active) && !['offline', 'stale'].includes(status);
+    line.className = `rf-link ${active ? 'rf-link-live' : 'rf-link-offline'}`;
     const ax = parseFloat(a.left);
     const ay = parseFloat(a.top);
     const bx = parseFloat(b.left);
@@ -260,7 +339,16 @@ function renderLatest() {
 }
 
 function renderCalibration(data) {
-  setText('calibration-status', data?.status || data?.calibration?.status || 'unknown');
+  state.calibration = data;
+  const status = data?.status || data?.calibration?.status || 'unknown';
+  setText('calibration-status', status === 'unknown' ? 'inconnue' : status);
+  const start = $('#start-calibration');
+  if (start) {
+    const ready = Boolean(state.fleet?.ready);
+    start.disabled = !ready;
+    start.title = ready ? 'Lancer la baseline piece vide' : 'Attendre les 3 noeuds actifs avant la calibration';
+  }
+  updateChecklist();
 }
 
 function emptyRow(text) {
@@ -282,8 +370,8 @@ function renderEnvironmentForm(env) {
 
   const fields = $('#environment-fields');
   fields?.replaceChildren();
-  fields?.append(sectionEditor('Mesh AP', env.access_points || [], 'ap'));
-  fields?.append(sectionEditor('ESP32-C6 nodes', env.nodes || [], 'node'));
+  fields?.append(sectionEditor('AP mesh', env.access_points || [], 'ap'));
+  fields?.append(sectionEditor('Noeuds ESP32-C6', env.nodes || [], 'node'));
 }
 
 function sectionEditor(title, items, type) {
@@ -300,9 +388,9 @@ function sectionEditor(title, items, type) {
     row.dataset.id = id;
     row.innerHTML = `
       <strong>${item.label || id}</strong>
-      <label>X<input data-axis="0" type="number" step="0.1" value="${item.position_m?.[0] ?? 0}"></label>
-      <label>Y<input data-axis="1" type="number" step="0.1" value="${item.position_m?.[1] ?? 0}"></label>
-      <label>Z<input data-axis="2" type="number" step="0.1" value="${item.position_m?.[2] ?? 0}"></label>
+      <label>Gauche / droite<input data-axis="0" type="number" step="0.1" value="${item.position_m?.[0] ?? 0}"></label>
+      <label>Hauteur<input data-axis="1" type="number" step="0.1" value="${item.position_m?.[1] ?? 0}"></label>
+      <label>Avant / arriere<input data-axis="2" type="number" step="0.1" value="${item.position_m?.[2] ?? 0}"></label>
     `;
     section.append(row);
   }
@@ -334,24 +422,39 @@ function readEnvironmentForm() {
 }
 
 async function refreshRest() {
-  try {
-    const [fleet, environment, modules, calibration] = await Promise.all([
+  const [fleetResult, environmentResult, modulesResult, calibrationResult] = await Promise.allSettled([
       fetchJson('/api/v1/fleet'),
       fetchJson('/api/v1/environment'),
       fetchJson('/api/v1/modules'),
       fetchJson('/api/v1/calibration').catch(() => null),
-    ]);
-    state.fleet = fleet;
-    state.environment = environment;
-    state.modules = Array.isArray(modules.modules) ? modules.modules : [];
+  ]);
+
+  if (fleetResult.status === 'fulfilled') {
+    state.fleet = fleetResult.value;
     renderFleet();
-    renderEnvironment();
-    renderModules();
-    renderCalibration(calibration);
-  } catch (error) {
-    setMasterStatus('offline', 'Master offline');
-    logEvent(error.message, 'warn');
+  } else {
+    state.fleet = null;
+    setMasterStatus('offline', 'Master non joignable');
+    logEvent(fleetResult.reason.message, 'warn');
+    renderFleet();
   }
+
+  if (environmentResult.status === 'fulfilled') {
+    state.environment = environmentResult.value;
+    state.environmentError = null;
+  } else {
+    state.environment = null;
+    state.environmentError = environmentResult.reason.message;
+    logEvent(environmentResult.reason.message, 'warn');
+  }
+
+  if (modulesResult.status === 'fulfilled') {
+    state.modules = Array.isArray(modulesResult.value.modules) ? modulesResult.value.modules : [];
+  }
+
+  renderEnvironment();
+  renderModules();
+  renderCalibration(calibrationResult.status === 'fulfilled' ? calibrationResult.value : null);
 }
 
 function connectWs() {
@@ -362,7 +465,7 @@ function connectWs() {
   state.ws = ws;
 
   ws.onopen = () => {
-    logEvent('WebSocket connected');
+    logEvent('Flux CSI connecte');
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
   };
   ws.onmessage = (event) => {
@@ -380,8 +483,8 @@ function connectWs() {
   };
   ws.onclose = () => {
     state.ws = null;
-    setMasterStatus('offline', 'Stream offline');
-    logEvent('WebSocket disconnected', 'warn');
+    setMasterStatus('offline', 'Flux CSI hors ligne');
+    logEvent('Flux CSI deconnecte', 'warn');
     state.reconnectTimer = setTimeout(connectWs, 3000);
   };
   ws.onerror = () => {

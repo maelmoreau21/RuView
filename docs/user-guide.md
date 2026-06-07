@@ -43,7 +43,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
     - [Intel 5300 / Atheros NIC](#intel-5300--atheros-nic)
 15. [Camera-Free Pose Training](#camera-free-pose-training)
 16. [ruvllm Training Pipeline](#ruvllm-training-pipeline)
-17. [Docker Compose (Multi-Service)](#docker-compose-multi-service)
+17. [Docker Compose (Single File)](#docker-compose-single-file)
 16. [Testing Firmware Without Hardware (QEMU)](#testing-firmware-without-hardware-qemu)
     - [What You Need](#what-you-need)
     - [Your First Test Run](#your-first-test-run)
@@ -88,10 +88,10 @@ Production RuvSense Edge requires live CSI. It does not silently switch to demo,
 
 The fastest path. No toolchain installation needed.
 
-For the RuvSense Edge appliance on a Raspberry Pi 4 64-bit OS, use the dedicated master compose file. It runs in host networking mode so three or more ESP32-C6 nodes can send UDP/5005 directly to the master. Production defaults are live: `CSI_SOURCE=esp32`, HTTP `3000`, WS `3001`, UDP `5005`, `RUVSENSE_MIN_NODES=3`, and runtime state under `/var/lib/ruvsense`.
+For the RuvSense Edge appliance on a Raspberry Pi 4 64-bit OS, use the single master compose file. It exposes HTTP `3000`, WS `3001`, and UDP `5005` explicitly so the same command works on Docker Desktop and on the Pi. Production defaults are live: `CSI_SOURCE=esp32`, `RUVSENSE_MIN_NODES=3`, simulation disabled, and runtime state under `/var/lib/ruvsense`.
 
 ```bash
-docker compose -f docker/compose.pi4.yml up -d
+docker compose -f docker/compose.yml up -d --build
 curl http://127.0.0.1:3000/health/ready
 
 python firmware/esp32-csi-node/provision_three_c6.py \
@@ -99,7 +99,7 @@ python firmware/esp32-csi-node/provision_three_c6.py \
   --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
 ```
 
-Open the RuvSense Console at `http://<pi-ip>:3000/ui/observatory.html`. Readiness is green only after at least `RUVSENSE_MIN_NODES` active nodes are seen; the default is `3`.
+Open the RuvSense Console at `http://<pi-ip>:3000/`. Readiness is green only after at least `RUVSENSE_MIN_NODES` active nodes are seen; the default is `3`.
 
 For production RF coverage, configure two mesh APs in the deployment environment or provisioning inventory, then provision each C6 node against the intended AP. The documented names are `RUVSENSE_MESH_AP1_SSID`, `RUVSENSE_MESH_AP1_PASSWORD`, `RUVSENSE_MESH_AP2_SSID`, and `RUVSENSE_MESH_AP2_PASSWORD`; keep them in a local `.env` or secrets store, never in source control.
 
@@ -265,21 +265,21 @@ Non-interactive:
 
 ```bash
 # Raspberry Pi 4 master, live ESP32-C6 fleet
-docker compose -f docker/compose.pi4.yml up -d
+docker compose -f docker/compose.yml up -d --build
 
 python firmware/esp32-csi-node/provision_three_c6.py \
   --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
   --ssid "YourWiFi" --password "secret" --target-ip <pi-ip>
 
 curl http://<pi-ip>:3000/health/ready
-# Open http://<pi-ip>:3000/ui/observatory.html
+# Open http://<pi-ip>:3000/
 ```
 
 You will see the RuvSense Console with:
-- 3D body skeleton (17 COCO keypoints)
-- Signal amplitude heatmap
-- Phase plot
-- Vital signs panel (breathing + heartbeat)
+- Master and readiness status
+- 2 AP mesh anchors and 3 ESP32-C6 nodes
+- Module catalog, calibration, logs, and diagnostics buttons
+- A hardware checklist that moves from offline to live as nodes appear
 
 The ready endpoint remains unavailable until the live node quorum is met. There is no automatic demo/mock/simulation fallback.
 
@@ -1942,26 +1942,25 @@ node scripts/benchmark-ruvllm.js --model models/csi-ruvllm
 
 ---
 
-## Docker Compose (Multi-Service)
+## Docker Compose (Single File)
 
-For production RuvSense Edge deployments, use the Pi master compose file:
-
-```bash
-docker compose -f docker/compose.pi4.yml up -d
-```
-
-This starts `ruvsense-master` with live ESP32 CSI defaults, host networking, SQLite state in `data/ruvsense`, and readiness gated by `RUVSENSE_MIN_NODES=3`.
-
-The older multi-service compose path is for development or legacy interoperability with the Python v1 server:
+For production RuvSense Edge deployments and local Docker Desktop checks, use the single compose file:
 
 ```bash
-cd docker
-docker compose up
+docker compose -f docker/compose.yml up -d --build
 ```
 
-This starts:
-- Rust sensing server on ports 3000 (HTTP), 3001 (WS), 5005 (UDP)
-- Python legacy server on ports 8080 (HTTP), 8765 (WS)
+This starts `ruvsense-master` with live ESP32 CSI defaults, persistent state in `data/ruvsense`, HTTP `3000`, WS `3001`, UDP `5005`, and readiness gated by `RUVSENSE_MIN_NODES=3`.
+
+Optional services stay in the same file as profiles:
+
+```bash
+docker compose -f docker/compose.yml --profile home up -d
+docker compose -f docker/compose.yml --profile legacy-python up -d
+docker compose -f docker/compose.yml --profile monitoring up -d
+```
+
+There is no second production compose path.
 
 ---
 
@@ -2397,7 +2396,7 @@ Install PyYAML: `pip install pyyaml`
 ## FAQ
 
 **Q: Do I need special hardware to try this?**
-For production RuvSense Edge, yes: use a Raspberry Pi master with at least three ESP32-C6 nodes. For development or proof replay only, run `docker run -e CSI_SOURCE=simulated -p 3000:3000 ruvnet/wifi-densepose:latest` and open `http://localhost:3000`.
+For production RuvSense Edge, yes: use a Raspberry Pi master with at least three ESP32-C6 nodes. For development or proof replay only, start the same compose file with explicit simulation enabled: `CSI_SOURCE=simulate RUVSENSE_ENABLE_SIMULATION=true docker compose -f docker/compose.yml up -d`.
 
 **Q: Can consumer WiFi laptops do pose estimation?**
 No. Consumer WiFi exposes only RSSI (one number per access point), not CSI (56+ complex subcarrier values per frame). RSSI supports coarse presence and motion detection. Full pose estimation requires CSI-capable hardware like an ESP32-S3 ($8) or a research NIC.

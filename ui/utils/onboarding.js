@@ -34,19 +34,19 @@ export class Onboarding {
       {
         title: 'Fleet Status',
         text: 'The console shows readiness, active nodes, fusion status, and source mode without switching to synthetic data.',
-        target: '#fleetState',
+        target: '#fleet-readiness',
         position: 'bottom'
       },
       {
         title: 'Environment',
         text: 'Use the environment view to inspect your 2 AP mesh anchors, 3 ESP32-C6 sensing nodes, and live RF links.',
-        target: '#environmentStage',
+        target: '#environment-stage',
         position: 'bottom'
       },
       {
-        title: 'Advanced Views',
-        text: 'Buttons on the console open Observatory and Pose Fusion when you need deeper visualization.',
-        target: '.top-actions',
+        title: 'Advanced Diagnostics',
+        text: 'Use diagnostics only when you need Observatory, Pose Fusion, metrics, or raw environment JSON.',
+        target: '.panel-diagnostics',
         position: 'bottom'
       },
       {

@@ -90,6 +90,7 @@ All 5 ruvector crates integrated in workspace:
 ### Production Runtime Defaults
 
 - RuvSense Edge production target: Raspberry Pi 4/5 running `ruvsense-master` plus at least 3 ESP32-C6 CSI nodes
+- Single official Docker Compose file: `docker/compose.yml`; do not add or document alternate production compose files
 - Docker Pi defaults: `CSI_SOURCE=esp32`, `RUVSENSE_HTTP_PORT=3000`, `RUVSENSE_WS_PORT=3001`, `RUVSENSE_UDP_PORT=5005`, `RUVSENSE_MIN_NODES=3`, `RUVSENSE_DATA_DIR=/var/lib/ruvsense`
 - Production readiness must fail closed when the live node quorum is absent; do not document or add automatic demo/mock/simulation fallback
 - Two mesh APs are operator-configurable through environment or provisioning inventory: `RUVSENSE_MESH_AP1_SSID`, `RUVSENSE_MESH_AP1_PASSWORD`, `RUVSENSE_MESH_AP2_SSID`, `RUVSENSE_MESH_AP2_PASSWORD`

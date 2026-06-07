@@ -91,6 +91,7 @@ class Observatory {
     // Live data
     this._currentData = null;
     this._environment = null;
+    this._environmentNotice = null;
     this._wsReconnectTimer = null;
     this._lastLiveAt = 0;
 
@@ -251,44 +252,25 @@ class Observatory {
     }
   }
 
-  _defaultEnvironment() {
-    return {
-      room: { dimensions_m: [5.2, 2.6, 4.8] },
-      access_points: [
-        { ap_id: 'ap-1', label: 'Mesh AP 1', position_m: [-2.4, 1.9, -2.0], active: true },
-        { ap_id: 'ap-2', label: 'Mesh AP 2', position_m: [2.4, 1.9, 2.0], active: true },
-      ],
-      nodes: [
-        { node_id: 1, label: 'ESP32-C6 1', position_m: [-2.0, 1.1, -1.6], linked_ap: 'ap-1' },
-        { node_id: 2, label: 'ESP32-C6 2', position_m: [2.0, 1.1, -1.6], linked_ap: 'ap-1' },
-        { node_id: 3, label: 'ESP32-C6 3', position_m: [0.0, 1.1, 2.0], linked_ap: 'ap-2' },
-      ],
-      links: [
-        { link_id: 'ap-1:c6-1', ap_id: 'ap-1', node_id: 1 },
-        { link_id: 'ap-1:c6-2', ap_id: 'ap-1', node_id: 2 },
-        { link_id: 'ap-1:c6-3', ap_id: 'ap-1', node_id: 3 },
-        { link_id: 'ap-2:c6-1', ap_id: 'ap-2', node_id: 1 },
-        { link_id: 'ap-2:c6-2', ap_id: 'ap-2', node_id: 2 },
-        { link_id: 'ap-2:c6-3', ap_id: 'ap-2', node_id: 3 },
-      ],
-    };
-  }
-
   _fetchEnvironment() {
     fetch('/api/v1/environment', { cache: 'no-store' })
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(env => {
         this._environment = env;
+        this._setEnvironmentNotice(false);
         this._syncTopology(this._currentData);
       })
       .catch(() => {
-        this._environment = this._defaultEnvironment();
+        this._environment = null;
+        this._setEnvironmentNotice(true);
+        this._clearTopology();
         this._syncTopology(this._currentData);
       });
   }
 
   _mergeNodes(liveData) {
-    const env = this._environment || this._defaultEnvironment();
+    const env = this._environment;
+    if (!env) return [];
     const live = new Map((liveData?.nodes || []).map(n => [Number(n.node_id), n]));
     const nodes = (env.nodes || []).map(cfg => ({
       ...cfg,
@@ -298,6 +280,30 @@ class Observatory {
       if (!nodes.some(n => Number(n.node_id) === Number(node.node_id))) nodes.push(node);
     }
     return nodes;
+  }
+
+  _setEnvironmentNotice(visible) {
+    if (!visible) {
+      if (this._environmentNotice?.parentNode) this._environmentNotice.parentNode.removeChild(this._environmentNotice);
+      this._environmentNotice = null;
+      return;
+    }
+    if (!this._environmentNotice) {
+      const notice = document.createElement('div');
+      notice.className = 'environment-unavailable';
+      notice.textContent = 'Configuration environnement indisponible: verifier le master et /api/v1/environment.';
+      document.body.appendChild(notice);
+      this._environmentNotice = notice;
+    }
+  }
+
+  _clearTopology() {
+    for (const [, entry] of this._deviceMeshes) entry.group.visible = false;
+    for (const [, line] of this._linkMeshes) line.visible = false;
+    for (const waves of this._wifiWaves) {
+      waves.active = false;
+      for (const shell of waves.shells) shell.mesh.visible = false;
+    }
   }
 
   _positionOf(entity) {
@@ -369,7 +375,11 @@ class Observatory {
   }
 
   _syncTopology(liveData) {
-    const env = this._environment || this._defaultEnvironment();
+    const env = this._environment;
+    if (!env) {
+      this._clearTopology();
+      return;
+    }
     const nodes = this._mergeNodes(liveData);
     const nodeById = new Map(nodes.map(n => [Number(n.node_id), n]));
     const apById = new Map((env.access_points || []).map(ap => [ap.ap_id, ap]));

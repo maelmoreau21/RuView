@@ -7,11 +7,15 @@ services:
       dockerfile: docker/Dockerfile.master
     image: ghcr.io/maelmoreau21/ruvsense-edge-master:local
     container_name: ruvsense-master
-    network_mode: host
     restart: unless-stopped
+    ports:
+      - "${RUVSENSE_HTTP_PORT:-3000}:${RUVSENSE_HTTP_PORT:-3000}"
+      - "${RUVSENSE_WS_PORT:-3001}:${RUVSENSE_WS_PORT:-3001}"
+      - "${RUVSENSE_UDP_PORT:-5005}:${RUVSENSE_UDP_PORT:-5005}/udp"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       CSI_SOURCE: ${CSI_SOURCE:-esp32}
+      RUVSENSE_ENABLE_SIMULATION: ${RUVSENSE_ENABLE_SIMULATION:-false}
       RUVSENSE_HTTP_PORT: ${RUVSENSE_HTTP_PORT:-3000}
       RUVSENSE_WS_PORT: ${RUVSENSE_WS_PORT:-3001}
       RUVSENSE_UDP_PORT: ${RUVSENSE_UDP_PORT:-5005}
@@ -31,8 +35,9 @@ services:
   mqtt:
     image: eclipse-mosquitto:2.0
     profiles: ["home"]
-    network_mode: host
     restart: unless-stopped
+    ports:
+      - "1883:1883"
     volumes:
       - ../data/mosquitto:/mosquitto/data
 
@@ -51,7 +56,8 @@ services:
   prometheus:
     image: prom/prometheus:latest
     profiles: ["monitoring"]
-    network_mode: host
     restart: unless-stopped
+    ports:
+      - "9090:9090"
     volumes:
       - ./prometheus.ruvsense.yml:/etc/prometheus/prometheus.yml:ro

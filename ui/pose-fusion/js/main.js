@@ -5,7 +5,7 @@
  */
 
 import { VideoCapture } from './video-capture.js?v=13';
-import { CsiSimulator } from './csi-simulator.js?v=13';
+import { LiveCsiClient } from './live-csi-client.js?v=13';
 import { CnnEmbedder } from './cnn-embedder.js?v=13';
 import { FusionEngine } from './fusion-engine.js?v=13';
 import { PoseDecoder } from './pose-decoder.js?v=13';
@@ -26,7 +26,7 @@ const latency = { video: 0, csi: 0, fusion: 0, total: 0 };
 
 // === Components ===
 const videoCapture = new VideoCapture(document.getElementById('webcam'));
-const csiSimulator = new CsiSimulator({ subcarriers: 52, timeWindow: 56 });
+const liveCsiClient = new LiveCsiClient({ subcarriers: 52, timeWindow: 56 });
 const visualCnn = new CnnEmbedder({ inputSize: 56, embeddingDim: 128, seed: 42 });
 const csiCnn = new CnnEmbedder({ inputSize: 56, embeddingDim: 128, seed: 137 });
 const fusionEngine = new FusionEngine(128);
@@ -82,7 +82,7 @@ const RSSI_HISTORY_MAX = 80;
 
 // === Initialize ===
 function init() {
-  console.log(`[PoseFusion] init() v4 — CsiSimulator=${CsiSimulator.VERSION || 'OLD'}, starting...`);
+  console.log(`[PoseFusion] init() v4 - LiveCsiClient=${LiveCsiClient.VERSION || 'OLD'}, starting...`);
   resizeCanvases();
   console.log(`[PoseFusion] canvases: skeleton=${skeletonCanvas.width}x${skeletonCanvas.height}, csi=${csiCanvas.width}x${csiCanvas.height}, emb=${embeddingCanvas.width}x${embeddingCanvas.height}`);
   window.addEventListener('resize', resizeCanvases);
@@ -114,7 +114,7 @@ function init() {
     const url = wsUrlInput.value.trim();
     if (!url) return;
     connectWsBtn.textContent = 'Connecting...';
-    const ok = await csiSimulator.connectLive(url);
+    const ok = await liveCsiClient.connectLive(url);
     connectWsBtn.textContent = ok ? '✓ Connected' : 'Connect';
     if (ok) {
       connectWsBtn.classList.add('active');
@@ -140,7 +140,7 @@ function init() {
   const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const defaultWsUrl = `${wsProto}//${window.location.host}/ws/sensing`;
   if (wsUrlInput) wsUrlInput.value = defaultWsUrl;
-  csiSimulator.connectLive(defaultWsUrl).then(ok => {
+  liveCsiClient.connectLive(defaultWsUrl).then(ok => {
     if (ok && connectWsBtn) {
       connectWsBtn.textContent = '✓ Live ESP32';
       connectWsBtn.classList.add('active');
@@ -230,7 +230,7 @@ function mainLoop(timestamp) {
       videoEmb = visualCnn.extract(frame.rgb, frame.width, frame.height);
       motionRegion = videoCapture.detectMotionRegion(56, 56);
 
-      csiSimulator.updatePersonState(
+      liveCsiClient.updatePersonState(
         motionRegion.detected ? 1.0 : 0,
         motionRegion.detected ? motionRegion.x + motionRegion.w / 2 : 0.5,
         motionRegion.detected ? motionRegion.y + motionRegion.h / 2 : 0.5,
@@ -239,7 +239,7 @@ function mainLoop(timestamp) {
 
       fusionEngine.updateConfidence(
         frame.brightness, frame.motion,
-        0, csiSimulator.isLive || mode === 'dual'
+        0, liveCsiClient.isLive || mode === 'dual'
       );
     }
     latency.video = performance.now() - t0;
@@ -249,9 +249,9 @@ function mainLoop(timestamp) {
   let csiEmb = null;
   if (mode !== 'video') {
     const t0 = performance.now();
-    const csiFrame = csiSimulator.nextFrame(elapsed);
+    const csiFrame = liveCsiClient.nextFrame(elapsed);
     if (csiFrame) {
-      const pseudoImage = csiSimulator.buildPseudoImage(56);
+      const pseudoImage = liveCsiClient.buildPseudoImage(56);
       csiEmb = csiCnn.extract(pseudoImage, 56, 56);
     }
 
@@ -263,7 +263,7 @@ function mainLoop(timestamp) {
     );
 
     // Draw CSI heatmap
-    const heatmap = csiSimulator.getHeatmapData();
+    const heatmap = liveCsiClient.getHeatmapData();
     renderer.drawCsiHeatmap(csiCtx, heatmap, csiCanvas.width, csiCanvas.height);
 
     latency.csi = performance.now() - t0;
@@ -277,7 +277,7 @@ function mainLoop(timestamp) {
   // --- Pose Decode ---
   // CSI-only mode requires live CSI energy.
   if (mode === 'csi' && (!motionRegion || !motionRegion.detected)) {
-    const csiPresence = csiSimulator.personPresence;
+    const csiPresence = liveCsiClient.personPresence;
     if (csiPresence > 0.1) {
       motionRegion = {
         detected: true,
@@ -292,8 +292,8 @@ function mainLoop(timestamp) {
 
   // CSI state for through-wall tracking
   const csiState = {
-    csiPresence: csiSimulator.personPresence,
-    isLive: csiSimulator.isLive
+    csiPresence: liveCsiClient.personPresence,
+    isLive: liveCsiClient.isLive
   };
 
   const keypoints = poseDecoder.decode(fusedEmb, motionRegion, elapsed, csiState);
@@ -360,12 +360,12 @@ function mainLoop(timestamp) {
   }
 
   // RSSI update
-  updateRssi(csiSimulator.rssiDbm);
+  updateRssi(liveCsiClient.rssiDbm);
 
   // One-time diagnostic
   if (!_diagDone) {
     _diagDone = true;
-    console.log(`[PoseFusion] frame 1 OK — mode=${mode}, csi.bufLen=${csiSimulator.amplitudeBuffer.length}, embPts=${embPoints?.fused?.length ?? 0}, rssi=${(csiSimulator.rssiDbm ?? -99).toFixed(1)}`);
+    console.log(`[PoseFusion] frame 1 OK - mode=${mode}, csi.bufLen=${liveCsiClient.amplitudeBuffer.length}, embPts=${embPoints?.fused?.length ?? 0}, rssi=${(liveCsiClient.rssiDbm ?? -99).toFixed(1)}`);
   }
 
   } catch (err) {

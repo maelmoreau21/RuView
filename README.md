@@ -79,17 +79,17 @@ RuView turns ordinary WiFi into a contactless sensor. A $9 ESP32 board reads the
 ```bash
 # RuvSense Edge production: Raspberry Pi 4 master + 3 ESP32-C6 nodes
 # Optional .env: RUVSENSE_MESH_AP1_SSID/PASSWORD and RUVSENSE_MESH_AP2_SSID/PASSWORD
-docker compose -f docker/compose.pi4.yml up -d
+docker compose -f docker/compose.yml up -d --build
 curl http://127.0.0.1:3000/health/ready
 
 python firmware/esp32-csi-node/provision_three_c6.py \
   --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
   --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
 
-# Open http://<pi-ip>:3000/ui/observatory.html
+# Open http://<pi-ip>:3000/
 
 # Development-only simulation is opt-in; production Docker defaults to live ESP32 CSI.
-docker run -e CSI_SOURCE=simulated -p 3000:3000 ruvnet/wifi-densepose:latest
+CSI_SOURCE=simulate RUVSENSE_ENABLE_SIMULATION=true docker compose -f docker/compose.yml up -d
 
 # Option 1: Live sensing with ESP32-S3 hardware ($9)
 # Flash firmware, provision WiFi, and start sensing:
@@ -135,7 +135,7 @@ pip install "ruview[client]"              # or: pip install "wifi-densepose[clie
 [![PyPI ruview](https://img.shields.io/pypi/v/ruview?label=ruview)](https://pypi.org/project/ruview/) [![PyPI wifi-densepose](https://img.shields.io/pypi/v/wifi-densepose?label=wifi-densepose)](https://pypi.org/project/wifi-densepose/)
 
 > [!NOTE]
-> **Live CSI hardware required for production.** Presence, vital signs, through-wall sensing, and all advanced capabilities require Channel State Information (CSI) from ESP32 hardware. The RuvSense Edge production appliance expects at least three ESP32-C6 nodes and does not substitute simulated data when the fleet is offline. Use `CSI_SOURCE=simulated` only for explicit development, CI, or deterministic proof checks. Consumer WiFi laptops provide RSSI-only presence detection.
+> **Live CSI hardware required for production.** Presence, vital signs, through-wall sensing, and all advanced capabilities require Channel State Information (CSI) from ESP32 hardware. The RuvSense Edge production appliance expects at least three ESP32-C6 nodes and does not substitute simulated data when the fleet is offline. Use `CSI_SOURCE=simulate` with `RUVSENSE_ENABLE_SIMULATION=true` only for explicit development, CI, or deterministic proof checks. Consumer WiFi laptops provide RSSI-only presence detection.
 
 > **Hardware options** for live CSI capture:
 >

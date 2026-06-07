@@ -29,7 +29,8 @@ export class ConnectionStatus {
 
     this.widget.querySelector('.conn-status-reconnect').addEventListener('click', () => {
       this.setStatus('reconnecting', 'Reconnecting...');
-      sensingService.reconnect?.();
+      sensingService.stop();
+      sensingService.start();
     });
 
     // Insert into header-info, after theme toggle if present

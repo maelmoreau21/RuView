@@ -65,6 +65,11 @@ button.primary,
   color: #fff;
 }
 
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .skip-to-content {
   position: absolute;
   left: 16px;
@@ -131,10 +136,14 @@ h3 {
   max-width: 680px;
 }
 
-.quick-nav {
+.quick-nav,
+.advanced-links {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.quick-nav {
   justify-content: flex-end;
 }
 
@@ -208,6 +217,8 @@ h3 {
 }
 
 .panel-environment,
+.panel-checklist,
+.panel-diagnostics,
 .panel-modules,
 .panel-settings,
 .panel-log {
@@ -243,6 +254,70 @@ h3 {
     #f9fbf8;
   background-size: 44px 44px;
   overflow: hidden;
+}
+
+.environment-stage .empty-row {
+  position: absolute;
+  inset: 18px;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.checklist {
+  display: grid;
+  gap: 8px;
+}
+
+.check-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  column-gap: 10px;
+  row-gap: 2px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfb;
+}
+
+.check-row > span {
+  grid-row: span 2;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--warn);
+  background: #fff;
+}
+
+.check-row strong {
+  font-size: 13px;
+}
+
+.check-row small {
+  color: var(--muted);
+}
+
+.check-done > span {
+  border-color: var(--ok);
+  background: var(--ok);
+  box-shadow: 0 0 0 4px rgba(22, 131, 93, 0.12);
+}
+
+.check-pending {
+  color: var(--muted);
+}
+
+.panel-diagnostics {
+  background: var(--surface-2);
+}
+
+.advanced-links {
+  align-items: stretch;
+}
+
+.advanced-links .nav-button {
+  flex: 1 1 160px;
 }
 
 .rf-link {
@@ -290,7 +365,9 @@ h3 {
 }
 
 .map-marker-node-offline span,
-.map-marker-node-stale span {
+.map-marker-node-stale span,
+.map-marker.node-offline span,
+.map-marker.node-stale span {
   background: var(--muted);
 }
 

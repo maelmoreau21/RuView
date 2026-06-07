@@ -31,6 +31,23 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+.environment-unavailable {
+  position: fixed;
+  left: 50%;
+  top: 18px;
+  transform: translateX(-50%);
+  z-index: 30;
+  max-width: min(620px, calc(100vw - 32px));
+  border: 1px solid rgba(255, 176, 32, 0.45);
+  border-radius: 8px;
+  background: rgba(8, 16, 28, 0.94);
+  color: #ffe4ad;
+  padding: 10px 14px;
+  text-align: center;
+  font-size: 13px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
+}
+
 #observatory-canvas {
   position: fixed;
   top: 0; left: 0;

@@ -18,12 +18,6 @@
       <h1>RuvSense Console</h1>
       <p class="subtitle">Production view for Raspberry Pi master, ESP32-C6 nodes, and mesh AP anchors.</p>
     </div>
-    <nav class="quick-nav" aria-label="Advanced views">
-      <a class="nav-button" href="/ui/observatory.html">Open Observatory</a>
-      <a class="nav-button" href="/ui/pose-fusion.html">Pose Fusion</a>
-      <a class="nav-button" href="/metrics">Metrics</a>
-      <a class="nav-button" href="/api/v1/environment">Environment JSON</a>
-    </nav>
   </header>
 
   <main id="main" class="console-grid">
@@ -33,15 +27,15 @@
         <span>Master offline</span>
       </div>
       <div>
-        <span class="label">Fusion</span>
+        <span class="label">Fusion live</span>
         <strong id="fusion-status">offline</strong>
       </div>
       <div>
-        <span class="label">Nodes</span>
+        <span class="label">Noeuds vus</span>
         <strong><span id="active-nodes">0</span>/<span id="min-nodes">3</span></strong>
       </div>
       <div>
-        <span class="label">Frame rate</span>
+        <span class="label">Debit CSI</span>
         <strong id="frame-rate">0.0 Hz</strong>
       </div>
       <div>
@@ -50,11 +44,29 @@
       </div>
     </section>
 
+    <section class="panel panel-checklist">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Mise en route</p>
+          <h2>Checklist installation</h2>
+        </div>
+        <span class="panel-badge" id="setup-summary">0/6</span>
+      </div>
+      <div class="checklist" id="setup-checklist">
+        <div class="check-row" data-check="master"><span></span><strong>Master Pi joignable</strong><small>Docker lance sur le port 3000</small></div>
+        <div class="check-row" data-check="ap1"><span></span><strong>AP mesh 1 configure</strong><small>Ancre radio dans l'environnement</small></div>
+        <div class="check-row" data-check="ap2"><span></span><strong>AP mesh 2 configure</strong><small>Deuxieme ancre radio</small></div>
+        <div class="check-row" data-check="nodes"><span></span><strong>3 ESP32-C6 vus</strong><small>node_id 1..3, slots TDM 0..2</small></div>
+        <div class="check-row" data-check="quorum"><span></span><strong>Quorum pret</strong><small>Readiness verte avec 3 noeuds actifs</small></div>
+        <div class="check-row" data-check="calibration"><span></span><strong>Calibration piece vide</strong><small>Baseline RF enregistree</small></div>
+      </div>
+    </section>
+
     <section class="panel panel-environment">
       <div class="panel-heading">
         <div>
-          <p class="eyebrow">Environment</p>
-          <h2 id="room-name">Primary room</h2>
+          <p class="eyebrow">Environnement</p>
+          <h2 id="room-name">Piece principale</h2>
         </div>
         <span class="panel-badge" id="room-size">--</span>
       </div>
@@ -81,7 +93,7 @@
       <div class="panel-heading">
         <div>
           <p class="eyebrow">Mesh</p>
-          <h2>Access points</h2>
+          <h2>AP mesh</h2>
         </div>
         <span class="panel-badge" id="ap-count">0 AP</span>
       </div>
@@ -104,13 +116,13 @@
       <div class="panel-heading">
         <div>
           <p class="eyebrow">Calibration</p>
-          <h2>Room baseline</h2>
+          <h2>Piece vide</h2>
         </div>
         <span class="panel-badge" id="calibration-status">unknown</span>
       </div>
       <div class="calibration-actions">
-        <button class="primary" id="start-calibration" type="button">Start</button>
-        <button id="stop-calibration" type="button">Stop</button>
+        <button class="primary" id="start-calibration" type="button">Start empty-room calibration</button>
+        <button id="stop-calibration" type="button">Stop calibration</button>
       </div>
       <dl class="kv">
         <div><dt>Presence</dt><dd id="presence-state">unknown</dd></div>
@@ -122,21 +134,36 @@
     <section class="panel panel-settings">
       <div class="panel-heading">
         <div>
-          <p class="eyebrow">Settings</p>
-          <h2>Environment editor</h2>
+          <p class="eyebrow">Reglages</p>
+          <h2>Position du materiel</h2>
         </div>
         <span class="panel-badge" id="save-status">idle</span>
       </div>
       <form id="environment-form" class="env-form">
         <div class="form-row">
-          <label>Room name<input name="room.name" autocomplete="off"></label>
-          <label>Size X<input name="room.x" type="number" step="0.1"></label>
-          <label>Size Y<input name="room.y" type="number" step="0.1"></label>
-          <label>Size Z<input name="room.z" type="number" step="0.1"></label>
+          <label>Nom de la piece<input name="room.name" autocomplete="off"></label>
+          <label>Largeur (m)<input name="room.x" type="number" step="0.1"></label>
+          <label>Hauteur (m)<input name="room.y" type="number" step="0.1"></label>
+          <label>Profondeur (m)<input name="room.z" type="number" step="0.1"></label>
         </div>
         <div id="environment-fields" class="env-fields"></div>
-        <button class="primary" type="submit">Save environment</button>
+        <button class="primary" type="submit">Save hardware layout</button>
       </form>
+    </section>
+
+    <section class="panel panel-diagnostics">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Diagnostics avances</p>
+          <h2>Outils techniques</h2>
+        </div>
+      </div>
+      <div class="advanced-links" aria-label="Advanced diagnostic views">
+        <a class="nav-button" href="/ui/observatory.html">Observatory 3D</a>
+        <a class="nav-button" href="/ui/pose-fusion.html">Pose Fusion</a>
+        <a class="nav-button" href="/metrics">Prometheus metrics</a>
+        <a class="nav-button" href="/api/v1/environment">Environment JSON</a>
+      </div>
     </section>
 
     <section class="panel panel-log">
