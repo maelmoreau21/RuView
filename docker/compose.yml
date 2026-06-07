@@ -22,6 +22,7 @@ services:
       RUVSENSE_MIN_NODES: ${RUVSENSE_MIN_NODES:-1}
       RUVSENSE_WIFI_INTERFACE: ${RUVSENSE_WIFI_INTERFACE:-wlan0}
       RUVSENSE_AP_SCAN_INTERVAL_SECS: ${RUVSENSE_AP_SCAN_INTERVAL_SECS:-10}
+      SENSING_ALLOWED_HOSTS: ${SENSING_ALLOWED_HOSTS:-}
       RUVSENSE_DATA_DIR: /var/lib/ruvsense
       MODELS_DIR: /var/lib/ruvsense/models
       RUVIEW_API_TOKEN: ${RUVIEW_API_TOKEN:-}
@@ -33,33 +34,3 @@ services:
       timeout: 3s
       retries: 8
       start_period: 20s
-
-  mqtt:
-    image: eclipse-mosquitto:2.0
-    profiles: ["home"]
-    restart: unless-stopped
-    ports:
-      - "1883:1883"
-    volumes:
-      - ../data/mosquitto:/mosquitto/data
-
-  legacy-python:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.python
-    image: ruvnet/wifi-densepose:python
-    profiles: ["legacy-python"]
-    ports:
-      - "8765:8765"
-      - "8080:8080"
-    environment:
-      PYTHONUNBUFFERED: "1"
-
-  prometheus:
-    image: prom/prometheus:latest
-    profiles: ["monitoring"]
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.ruvsense.yml:/etc/prometheus/prometheus.yml:ro

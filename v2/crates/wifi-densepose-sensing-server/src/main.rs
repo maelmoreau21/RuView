@@ -7894,9 +7894,9 @@ async fn main() {
     // #872: actually start the MQTT publisher when `--mqtt` is set. The publisher
     // (mqtt::) consumes a typed VitalsSnapshot stream; we bridge the existing JSON
     // sensing broadcast into it with a defensive serde_json::Value mapping (absent
-    // fields default — never publish wrong values). Gated on the `mqtt` feature
-    // (the Docker image is built `--features mqtt`); without it `--mqtt` WARNs and
-    // no-ops, matching the documented contract.
+    // fields default — never publish wrong values). Gated on the optional
+    // `mqtt` feature; the minimal RuvSense Edge Docker image leaves this off
+    // unless an operator explicitly builds an integration image.
     if args.mqtt_opts.mqtt {
         #[cfg(feature = "mqtt")]
         {
@@ -7940,7 +7940,7 @@ async fn main() {
         #[cfg(not(feature = "mqtt"))]
         tracing::warn!(
             "--mqtt set but this binary was built without the `mqtt` feature; the publisher is a \
-             no-op. Use the official Docker image (built `--features mqtt`) or rebuild with \
+             no-op. Rebuild an integration image with \
              `cargo build -p ruvsense-master --features mqtt`."
         );
     }

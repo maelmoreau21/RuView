@@ -1,8 +1,8 @@
-# ESP32 CSI Node Firmware
+# RuvSense ESP32-C6 Node Firmware
 
 **Turn a $7 microcontroller into a privacy-first human sensing node.**
 
-This firmware captures WiFi Channel State Information (CSI) from an ESP32-S3 (production) or ESP32-C6 (research target — Wi-Fi 6 / 802.15.4 / TWT / LP-core hibernation, see [ADR-110](../../docs/adr/ADR-110-esp32-c6-firmware-extension.md)) and transforms it into real-time presence detection, vital sign monitoring, and programmable sensing -- all without cameras or wearables. Part of the [WiFi-DensePose](../../README.md) project.
+This firmware captures WiFi Channel State Information (CSI) from ESP32-C6 nodes for RuvSense Edge. ESP32-S3 remains compatible, but ESP32-C6 is the official first path for the Raspberry Pi `ruvsense-master` appliance.
 
 [![ESP-IDF v5.2](https://img.shields.io/badge/ESP--IDF-v5.2-blue.svg)](https://docs.espressif.com/projects/esp-idf/en/v5.2/)
 [![Target: ESP32-S3 / ESP32-C6](https://img.shields.io/badge/target-ESP32--S3%20%7C%20ESP32--C6-purple.svg)](https://www.espressif.com/en/products/socs/esp32-s3)
@@ -21,7 +21,65 @@ This firmware captures WiFi Channel State Information (CSI) from an ESP32-S3 (pr
 
 ---
 
-## Quick Start
+## RuvSense Edge ESP32-C6 Quick Start
+
+Use this path for intrusion, presence, and vital-sign deployments.
+
+Start the Raspberry Pi 4/5 master first, or run the same service locally with Docker Desktop:
+
+```powershell
+docker compose -f docker/compose.yml up -d --build
+```
+
+The master listens on `3000/tcp` for HTTP and `5005/udp` for ESP32-C6 CSI frames. Set `SENSING_ALLOWED_HOSTS=<master-ip>,<hostname>` before starting Docker if you need LAN host checks to allow a specific Pi address or DNS name.
+
+```powershell
+cd firmware/esp32-csi-node
+.\build_firmware.ps1 -Target esp32c6 -FullClean
+.\build_firmware.ps1 -Target esp32c6 -Flash -Port COM12
+```
+
+Provision one node against the master UDP port:
+
+```powershell
+python provision.py --port COM12 --chip esp32c6 `
+  --ssid "YourWiFi" --password "secret" `
+  --target-ip <master-ip> --target-port 5005 `
+  --node-id 1 --tdm-slot 0 --tdm-total 1 `
+  --edge-tier 2 --zone room-1
+```
+
+Provision a larger fleet with the wrapper. It accepts 1..100 ports and assigns `node_id=1..N`, `tdm_slot=0..N-1`, and `tdm_total=N`.
+
+```powershell
+python provision_three_c6.py --ports COM12,COM13,COM14 `
+  --ssid "YourWiFi" --password "secret" `
+  --target-ip <master-ip> --target-port 5005 `
+  --edge-tier 2 --zones room-1,hallway,entry
+```
+
+Verify the node on serial:
+
+```powershell
+python -m serial.tools.miniterm COM12 115200
+```
+
+Look for `ESP32-C6 CSI Node`, `Connected to WiFi`, `UDP sender initialized`, `CSI collection initialized`, and `CSI streaming active`.
+
+Verify the master and Console:
+
+```powershell
+curl http://<master-ip>:3000/health/live
+curl http://<master-ip>:3000/health/ready
+curl http://<master-ip>:3000/api/v1/topology
+curl http://<master-ip>:3000/api/v1/vital-signs
+```
+
+Open `http://<master-ip>:3000/ui/index.html`. The Console shows only detected APs and ESP32-C6 nodes that are actively sending live CSI. With zero nodes, `/health/ready` stays unavailable; with one live node, the default RuvSense Edge quorum is met, while 3+ nodes improve multistatic modules.
+
+---
+
+## Legacy / Advanced Quick Start
 
 For users who want to get running fast. Detailed explanations follow in later sections.
 
@@ -96,12 +154,12 @@ curl http://<ESP32_IP>:8032/wasm/list
 
 | Component | Specification | Notes |
 |-----------|---------------|-------|
-| **SoC** | ESP32-S3 (QFN56) | Dual-core Xtensa LX7, 240 MHz |
-| **Flash** | 8 MB | ~943 KB used by firmware |
-| **PSRAM** | 8 MB | 640 KB used for WASM arenas |
+| **SoC** | ESP32-C6 | RISC-V, WiFi 6 capable, official RuvSense Edge node target |
+| **Flash** | 4 MB minimum | C6 build is sized for common 4 MB boards |
+| **PSRAM** | Not required | RuvSense Edge C6 path streams CSI/vitals to the master |
 | **USB bridge** | Silicon Labs CP210x | Install the [CP210x driver](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers) |
-| **Recommended boards** | ESP32-S3-DevKitC-1, XIAO ESP32-S3 | Any ESP32-S3 with 8 MB flash works |
-| **Deployment** | 3-6 nodes per room | Multistatic mesh for 360-degree coverage |
+| **Recommended boards** | ESP32-C6-DevKit, Seeed/XIAO ESP32-C6 class boards | Use ESP32-S3 only as compatibility hardware |
+| **Deployment** | 1-100 nodes per master | One node starts the Console; 3+ improves multistatic coverage |
 
 > **Tip:** A single node provides presence and vital signs along its line of sight. Multiple nodes (3-6) create a multistatic mesh that resolves 3D pose with <30 mm jitter and zero identity swaps.
 

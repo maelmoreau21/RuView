@@ -15,15 +15,13 @@
 
 **Turn ordinary WiFi into a spatial intelligence / sensing system.** Detect people, measure breathing and heart rate, track movement, and monitor rooms — through walls, in the dark, with no cameras or wearables. Just physics.
 
-Works natively with the four major smart-home ecosystems: **[Home Assistant](docs/integrations/home-assistant.md)** via the HA-DISCO MQTT publisher, **[Apple Home & HomePod](docs/user-guide-apple-homepod.md)** as a discoverable HAP-1.1 bridge, **[Google Home](docs/integrations/home-assistant.md)** + **[Amazon Alexa](docs/integrations/home-assistant.md)** via the same HA bridge or a [Matter](docs/adr/ADR-122-bfld-ruview-ha-matter-exposure.md) endpoint. Siri, Google Assistant, and Alexa can voice presence and vitals by room with zero custom skills.
+The official setup path is intentionally small: one Raspberry Pi or Docker Desktop host running `ruvsense-master`, plus one or more ESP32-C6 nodes streaming real CSI over UDP. Home Assistant, Matter, MQTT, Python v1, QEMU, and research tooling remain advanced or legacy workflows; they are not required to run RuvSense Edge.
 
-[![Works with Home Assistant](https://img.shields.io/badge/Works%20with-Home%20Assistant-blue?logo=home-assistant&logoColor=white&labelColor=41BDF5)](docs/integrations/home-assistant.md) [![Works with Matter](https://img.shields.io/badge/Works%20with-Matter-blue?labelColor=4285F4)](docs/adr/ADR-122-bfld-ruview-ha-matter-exposure.md) [![Works with Apple Home](https://img.shields.io/badge/Works%20with-Apple%20Home-black?logo=apple)](docs/user-guide-apple-homepod.md) [![Works with Google Home](https://img.shields.io/badge/Works%20with-Google%20Home-blue?logo=googlehome)](docs/integrations/home-assistant.md) [![Works with Alexa](https://img.shields.io/badge/Works%20with-Alexa-blue?logo=amazon&logoColor=white&labelColor=00CAFF)](docs/integrations/home-assistant.md)
-
-> Drop into any **Home Assistant** install with one `--mqtt` flag. Or pair into **Apple Home / Google Home / Alexa / SmartThings** as a Matter Bridge. Ships 21 entities per node (11 raw signals + 10 inferred semantic states: someone-sleeping, possible-distress, room-active, elderly-inactivity-anomaly, meeting-in-progress, bathroom-occupied, fall-risk-elevated, bed-exit, no-movement, multi-room-transition) plus 3 starter HA Blueprints. See [`docs/integrations/home-assistant.md`](docs/integrations/home-assistant.md) · [ADR-115](docs/adr/ADR-115-home-assistant-integration.md).
+Advanced smart-home integrations are still available in the dedicated docs, but they are outside the minimal Docker appliance.
 
 ### RuvSense Edge is a Raspberry Pi + ESP32-C6 appliance for WiFi spatial intelligence.
 
-RuvSense Edge is the professionalized RuView fork: a Rust `ruvsense-master` on a Raspberry Pi 4 receives live UDP CSI from at least three ESP32-C6 nodes, exposes stable `/api/v1/*` APIs, serves the RuvSense Console, and reports readiness only when the configured node quorum is active. Production builds do not auto-fall back to demo, mock, or simulation data; simulation is an explicit development/test mode. Health and vitals modules are monitoring/screening surfaces with confidence and evidence, not medical diagnosis.
+RuvSense Edge is the professionalized RuView fork: a Rust `ruvsense-master` on a Raspberry Pi 4/5 or Docker Desktop host receives live UDP CSI from ESP32-C6 nodes, exposes stable `/api/v1/*` APIs, serves the RuvSense Console, and reports readiness as soon as real CSI is received from the configured live-node quorum. The default quorum is one node so small deployments work; modules that need 2 or 3+ nodes stay marked limited until the fleet is large enough. Production builds do not auto-fall back to demo, mock, or simulation data; simulation is an explicit development/test mode. Health and vitals modules are monitoring/screening surfaces with confidence and evidence, not medical diagnosis.
 
 Every WiFi router already fills your space with radio waves. When people move, breathe, or even sit still, they disturb those waves in measurable ways. RuView captures these disturbances using Channel State Information (CSI) from low-cost ESP32 sensors and turns them into actionable data: who's there, what they're doing, and whether they're okay.
 
@@ -34,7 +32,7 @@ Every WiFi router already fills your space with radio waves. When people move, b
 - **Environment mapping** — RF fingerprinting identifies rooms, detects moved furniture, spots new objects
 - **Sleep quality** — overnight monitoring with sleep stage classification and apnea screening
 
-Built on [RuVector](https://github.com/ruvnet/ruvector/) and [Cognitum Seed](https://cognitum.one), RuvSense Edge runs entirely on edge hardware: a Raspberry Pi master, at least three ESP32-C6 sensing nodes, and two operator-configured mesh APs for resilient RF coverage. No cloud, no cameras, no internet required.
+Built on [RuVector](https://github.com/ruvnet/ruvector/), RuvSense Edge runs entirely on edge hardware: a Raspberry Pi master, one to 100 ESP32-C6 sensing nodes, and the WiFi APs that are actually detected or explicitly configured. Three or more nodes improve multistatic coverage, but they are no longer required just to bring the system online. No cloud, no cameras, no internet required.
 
 The system learns each environment locally using spiking neural networks that adapt in under 30 seconds, with multi-frequency mesh scanning across 6 WiFi channels that uses your neighbors' routers as free radar illuminators. Every measurement is cryptographically attested via an Ed25519 witness chain.
 
@@ -49,7 +47,7 @@ RuView turns ordinary WiFi into a contactless sensor. A $9 ESP32 board reads the
 [![Tests: 1463](https://img.shields.io/badge/tests-1463%20passed-brightgreen.svg)](https://github.com/ruvnet/RuView)
 [![Docker: multi-arch](https://img.shields.io/badge/docker-amd64%20%2B%20arm64-blue.svg)](https://hub.docker.com/r/ruvnet/wifi-densepose)
 [![Vital Signs](https://img.shields.io/badge/vital%20signs-breathing%20%2B%20heartbeat-red.svg)](#vital-sign-detection)
-[![ESP32 Ready](https://img.shields.io/badge/ESP32--S3-CSI%20streaming-purple.svg)](#esp32-s3-hardware-pipeline)
+[![ESP32-C6 Ready](https://img.shields.io/badge/ESP32--C6-CSI%20streaming-purple.svg)](firmware/esp32-csi-node/README.md)
 [![crates.io](https://img.shields.io/crates/v/wifi-densepose-ruvector.svg)](https://crates.io/crates/wifi-densepose-ruvector)
 [![Downloads](https://img.shields.io/badge/downloads-10M%2B-brightgreen.svg)](#-edge-module-catalog)
 
@@ -77,36 +75,35 @@ RuView turns ordinary WiFi into a contactless sensor. A $9 ESP32 board reads the
 > 🤗 **Pretrained weights**: download from [`ruvnet/wifi-densepose-pretrained`](https://huggingface.co/ruvnet/wifi-densepose-pretrained) — see [Loading the pretrained model](#loading-the-pretrained-model) below for one-command setup.
 
 ```bash
-# RuvSense Edge production: Raspberry Pi 4 master + 3 ESP32-C6 nodes
-# Optional .env: RUVSENSE_MESH_AP1_SSID/PASSWORD and RUVSENSE_MESH_AP2_SSID/PASSWORD
+# RuvSense Edge: Raspberry Pi 4/5 or Docker Desktop master + ESP32-C6 nodes
 docker compose -f docker/compose.yml up -d --build
-curl http://127.0.0.1:3000/health/ready
+curl http://127.0.0.1:3000/health/live
 
+# Provision one ESP32-C6 node.
+python firmware/esp32-csi-node/provision.py --port COM12 --chip esp32c6 \
+  --ssid "YourWiFi" --password "secret" --target-ip <master-ip> \
+  --target-port 5005 --node-id 1 --tdm-slot 0 --tdm-total 1 --edge-tier 2
+
+# Or provision a larger C6 fleet; the wrapper accepts 1..100 ports.
 python firmware/esp32-csi-node/provision_three_c6.py \
   --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
-  --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
+  --ssid "YourWiFi" --password "secret" --target-ip <master-ip>
 
-# Open http://<pi-ip>:3000/
+# Open http://<master-ip>:3000/ui/index.html
+curl http://<master-ip>:3000/api/v1/topology
+curl http://<master-ip>:3000/api/v1/vital-signs
 
 # Development-only simulation is opt-in; production Docker defaults to live ESP32 CSI.
 CSI_SOURCE=simulate RUVSENSE_ENABLE_SIMULATION=true docker compose -f docker/compose.yml up -d
 
-# Option 1: Live sensing with ESP32-S3 hardware ($9)
-# Flash firmware, provision WiFi, and start sensing:
-python -m esptool --chip esp32s3 --port COM9 --baud 460800 \
-  write_flash 0x0 bootloader.bin 0x8000 partition-table.bin \
-  0xf000 ota_data_initial.bin 0x20000 esp32-csi-node.bin
-python firmware/esp32-csi-node/provision.py --port COM9 \
-  --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
-
-# Option 2: WiFi 6 + 802.15.4 production sensing with ESP32-C6 ($6-10, ADR-110)
+# Build and flash ESP32-C6 firmware if you are not using release binaries.
 # Same csi-node firmware compiled for the C6 target — picks up the C6
 # overlay (sdkconfig.defaults.esp32c6) automatically.
 cd firmware/esp32-csi-node
 ./build_firmware.ps1 -Target esp32c6
-idf.py -p COM6 flash
-python provision_three_c6.py --ports COM6,COM7,COM8 \
-  --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
+idf.py -p COM12 flash
+python provision_three_c6.py --ports COM12 \
+  --ssid "YourWiFi" --password "secret" --target-ip <master-ip>
 # C6 boot extras (vs S3): HE-LTF subcarrier tagging in ADR-018 bytes 18-19,
 #   802.15.4 mesh time-sync on channel 15, TWT setup when the AP supports it,
 #   opt-in LP-core wake-on-motion for ~5 µA battery seed nodes.
@@ -115,27 +112,13 @@ python provision_three_c6.py --ports COM6,COM7,COM8 \
 #   benchmark real iTWT without buying an 11ax router. Both default off,
 #   flip CONFIG_C6_{LP_CORE,SOFTAP_HE}_ENABLE to turn them on.
 
-# Option 3: Full system with Cognitum Seed ($140)
-# ESP32 streams CSI → bridge forwards to Seed for persistent storage + kNN + witness chain
-node scripts/rf-scan.js --port 5006           # Live RF room scan
-node scripts/snn-csi-processor.js --port 5006  # SNN real-time learning
-node scripts/mincut-person-counter.js --port 5006  # Correct person counting
-
-# Option 4: Python — live on PyPI (ADR-117)
-pip install ruview                        # or: pip install wifi-densepose
-# Both ship the same compiled PyO3 wheel (~250 KB, abi3-py310, Linux/macOS/Windows).
-# Add [client] for the asyncio WebSocket + paho-mqtt clients:
-pip install "ruview[client]"              # or: pip install "wifi-densepose[client]"
-
-# from ruview import BreathingExtractor, HeartRateExtractor   # equivalent to:
-# from wifi_densepose import BreathingExtractor, HeartRateExtractor
-# from ruview.client import SensingClient, RuViewMqttClient
+# Advanced integrations such as Cognitum Seed and Python clients are documented later.
 ```
 
-[![PyPI ruview](https://img.shields.io/pypi/v/ruview?label=ruview)](https://pypi.org/project/ruview/) [![PyPI wifi-densepose](https://img.shields.io/pypi/v/wifi-densepose?label=wifi-densepose)](https://pypi.org/project/wifi-densepose/)
+For LAN access from another machine, set `SENSING_ALLOWED_HOSTS=<master-ip>,<hostname>` before starting Docker so host-header validation accepts `http://<master-ip>:3000/`.
 
 > [!NOTE]
-> **Live CSI hardware required for production.** Presence, vital signs, through-wall sensing, and all advanced capabilities require Channel State Information (CSI) from ESP32 hardware. The RuvSense Edge production appliance expects at least three ESP32-C6 nodes and does not substitute simulated data when the fleet is offline. Use `CSI_SOURCE=simulate` with `RUVSENSE_ENABLE_SIMULATION=true` only for explicit development, CI, or deterministic proof checks. Consumer WiFi laptops provide RSSI-only presence detection.
+> **Live CSI hardware required for production.** Presence, vital signs, through-wall sensing, and advanced modules require Channel State Information (CSI) from ESP32 hardware. One ESP32-C6 node is enough to bring the Console online; 3+ nodes improve multistatic modules and confidence. RuvSense Edge never substitutes simulated data when the fleet is offline. Use `CSI_SOURCE=simulate` with `RUVSENSE_ENABLE_SIMULATION=true` only for explicit development, CI, or deterministic proof checks. Consumer WiFi laptops provide RSSI-only presence detection.
 
 > **Hardware options** for live CSI capture:
 >
@@ -143,7 +126,7 @@ pip install "ruview[client]"              # or: pip install "wifi-densepose[clie
 > |--------|----------|------|----------|-------------|
 > | **ESP32 + Cognitum Seed** (recommended) | ESP32-S3 + [Cognitum Seed](https://cognitum.one) | ~$140 | Yes | Presence, motion, breathing, heart rate, fall detection, multi-person counting, 17-keypoint pose (signed Cog binary), 105-cog catalog, persistent vector store, kNN search, witness chain, MCP proxy |
 > | **ESP32 Mesh** | 3-6× ESP32-S3 + WiFi router | ~$54 | Yes | Same capabilities as above without the persistent-memory features |
-> | **RuvSense Edge C6 fleet** ([ADR-110](docs/adr/ADR-110-esp32-c6-firmware-extension.md), [witness](docs/WITNESS-LOG-110.md), [reviewer guide](docs/ADR-110-REVIEW-GUIDE.md), [firmware v0.7.0](https://github.com/ruvnet/RuView/releases/tag/v0.7.0-esp32)) | 3+ ESP32-C6-DevKit nodes plus 2 mesh APs | ~$30+ nodes, APs vary | Yes (Wi-Fi 6 capable) | Production RuvSense Edge baseline. Same CSI pipeline as S3 with the dual-target firmware. **Firmware-side ADR-110 substrate now closed** (v0.7.0): ESP-NOW cross-board mesh quantified at **99.56 % match / 104 µs smoothed offset stdev / 3.95× EMA suppression** over a 5-min two-board soak (witness §A0.10), 32-byte UDP sync packet with operator-tunable cadence (§A0.12), ADR-018 byte 19 bit 4 wire-fix sourced from the working ESP-NOW path (§A0.13). Wire format ready for HE-LTF PPDU tagging in ADR-018 bytes 18-19 (firmware encoder + Rust + Python decoders verified end-to-end across 23 unit tests). LP-core motion-gate RISC-V program and Wi-Fi 6 soft-AP with TWT Responder both ship as opt-in code paths (default off). **Hardware-gated for measurement**: HE-LTF live subcarrier capture needs an 11ax AP (IDF v5.4 doesn't expose AP-side HE config — §A0.6); ~5 µA LP-core hibernation needs an INA meter to capture; 802.15.4 raw RX is broken in IDF v5.4 (workaround: ESP-NOW transport, shipped + measured). See witness log for the empirical / claimed split. |
+> | **RuvSense Edge C6 fleet** ([ADR-110](docs/adr/ADR-110-esp32-c6-firmware-extension.md), [firmware guide](firmware/esp32-csi-node/README.md)) | 1-100 ESP32-C6 nodes plus detected/configured APs | ~$25+ | Yes (Wi-Fi 6 capable) | Official appliance path. One node brings the Console online for intrusion/presence/vitals; 3+ nodes improve multistatic confidence and unlock modules requiring geometric diversity. |
 > | **Research NIC** | Intel 5300 / Atheros AR9580 | ~$50-100 | Yes | Full CSI with 3x3 MIMO |
 > | **Any WiFi** | Windows, macOS, or Linux laptop | $0 | No | RSSI-only: coarse presence and motion (see [tutorial #36](https://github.com/ruvnet/RuView/issues/36)) |
 >

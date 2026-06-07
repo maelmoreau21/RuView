@@ -3,6 +3,7 @@
 
 This wrapper keeps the authoritative NVS writer in provision.py and only
 assigns fleet-safe defaults: node_id=1..N, tdm_slot=0..N-1, tdm_total=N.
+It accepts one node for a small lab or up to 100 nodes for a larger fleet.
 """
 
 import argparse
@@ -18,11 +19,15 @@ def parse_csv(value: str) -> list[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Provision at least three ESP32-C6 nodes for a RuvSense Edge master.",
+        description="Provision 1..100 ESP32-C6 nodes for a RuvSense Edge master.",
         epilog=(
-            "Example: python provision_three_c6.py --ports COM12,COM13,COM14 "
+            "Examples:\n"
+            "  python provision_three_c6.py --ports COM12 "
+            "--ssid LabWiFi --password secret --target-ip 192.168.1.20\n"
+            "  python provision_three_c6.py --ports COM12,COM13,COM14 "
             "--ssid LabWiFi --password secret --target-ip 192.168.1.20"
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--ports", required=True, help="Comma-separated serial ports for the C6 nodes")
     parser.add_argument("--ssid", required=True, help="2.4 GHz WiFi SSID")
@@ -59,8 +64,10 @@ def main() -> int:
     args = parser.parse_args()
 
     ports = parse_csv(args.ports)
-    if len(ports) < 3:
-        parser.error("RuvSense Edge production provisioning requires at least 3 ESP32-C6 ports")
+    if not ports:
+        parser.error("--ports must contain at least one ESP32-C6 serial port")
+    if len(ports) > 100:
+        parser.error("RuvSense Edge fleet provisioning supports up to 100 ESP32-C6 ports at once")
     if len(set(ports)) != len(ports):
         parser.error("--ports contains duplicates")
     if not (1 <= args.target_port <= 65535):
@@ -75,7 +82,7 @@ def main() -> int:
     provisioner = Path(__file__).with_name("provision.py")
     tdm_total = len(ports)
 
-    print(f"Provisioning {tdm_total} ESP32-C6 nodes for RuvSense Edge master {args.target_ip}:{args.target_port}")
+    print(f"Provisioning {tdm_total} ESP32-C6 node(s) for RuvSense Edge master {args.target_ip}:{args.target_port}")
     for index, port in enumerate(ports):
         node_id = index + 1
         cmd = [

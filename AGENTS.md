@@ -3,7 +3,7 @@
 ## Project: ruvsense-edge
 
 RuvSense Edge is the professional RuView fork for WiFi/CSI sensing fleets:
-one Raspberry Pi `ruvsense-master` plus at least three ESP32-C6 nodes.
+one Raspberry Pi `ruvsense-master` plus one to 100 ESP32-C6 nodes.
 Production behavior is live-only: no automatic demo/mock/simulation fallback when
 hardware is absent or below quorum. Simulation is explicit dev/test only.
 Legacy Python v1 lives under `archive/v1/`; the Rust workspace lives in `v2/`.
@@ -89,9 +89,9 @@ All 5 ruvector crates integrated in workspace:
 
 ### Production Runtime Defaults
 
-- RuvSense Edge production target: Raspberry Pi 4/5 running `ruvsense-master` plus at least 3 ESP32-C6 CSI nodes
+- RuvSense Edge production target: Raspberry Pi 4/5 running `ruvsense-master` plus 1-100 ESP32-C6 CSI nodes
 - Single official Docker Compose file: `docker/compose.yml`; do not add or document alternate production compose files
-- Docker Pi defaults: `CSI_SOURCE=esp32`, `RUVSENSE_HTTP_PORT=3000`, `RUVSENSE_WS_PORT=3001`, `RUVSENSE_UDP_PORT=5005`, `RUVSENSE_MIN_NODES=3`, `RUVSENSE_DATA_DIR=/var/lib/ruvsense`
+- Docker Pi defaults: `CSI_SOURCE=esp32`, `RUVSENSE_HTTP_PORT=3000`, `RUVSENSE_WS_PORT=3001`, `RUVSENSE_UDP_PORT=5005`, `RUVSENSE_MIN_NODES=1`, `RUVSENSE_DATA_DIR=/var/lib/ruvsense`
 - Production readiness must fail closed when the live node quorum is absent; do not document or add automatic demo/mock/simulation fallback
 - Two mesh APs are operator-configurable through environment or provisioning inventory: `RUVSENSE_MESH_AP1_SSID`, `RUVSENSE_MESH_AP1_PASSWORD`, `RUVSENSE_MESH_AP2_SSID`, `RUVSENSE_MESH_AP2_PASSWORD`
 - Simulation, QEMU, mock CSI, and deterministic proof replay are explicit development/test workflows only
@@ -121,7 +121,7 @@ cd archive/v1 && python -m pytest tests/ -x -q
 cd firmware/esp32-csi-node
 ./build_firmware.ps1 -Target esp32c6
 
-# Flash and provision at least three nodes
+# Flash and provision one node or a larger C6 fleet
 # idf.py -p COM12 flash
 
 # Provision WiFi
