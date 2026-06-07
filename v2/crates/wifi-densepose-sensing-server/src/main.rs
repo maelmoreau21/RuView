@@ -57,7 +57,9 @@ use vital_signs::{VitalSignDetector, VitalSigns};
 
 // ADR-022 Phase 3: Multi-BSSID pipeline integration
 use wifi_densepose_wifiscan::parse_netsh_output as parse_netsh_bssid_output;
-use wifi_densepose_wifiscan::{BssidRegistry, WindowsWifiPipeline};
+#[cfg(target_os = "linux")]
+use wifi_densepose_wifiscan::LinuxIwScanner;
+use wifi_densepose_wifiscan::{BssidObservation, BssidRegistry, WindowsWifiPipeline};
 
 // Accuracy sprint: Kalman tracker, multistatic fusion, field model
 use wifi_densepose_signal::ruvsense::field_model::{CalibrationStatus, FieldModel};
@@ -67,7 +69,10 @@ use wifi_densepose_signal::ruvsense::pose_tracker::PoseTracker;
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "ruvsense-master", about = "RuvSense Edge master for WiFi/CSI sensing fleets")]
+#[command(
+    name = "ruvsense-master",
+    about = "RuvSense Edge master for WiFi/CSI sensing fleets"
+)]
 struct Args {
     /// HTTP port for UI and REST API
     #[arg(long, default_value = "8080")]
@@ -82,8 +87,16 @@ struct Args {
     udp_port: u16,
 
     /// Minimum active ESP32 nodes required before readiness is green.
-    #[arg(long, default_value = "3", env = "RUVSENSE_MIN_NODES")]
+    #[arg(long, default_value = "1", env = "RUVSENSE_MIN_NODES")]
     min_nodes: usize,
+
+    /// Linux WiFi interface used by the Raspberry Pi master to discover visible APs.
+    #[arg(long, default_value = "wlan0", env = "RUVSENSE_WIFI_INTERFACE")]
+    wifi_interface: String,
+
+    /// Seconds between Raspberry Pi AP scans for the live topology endpoint.
+    #[arg(long, default_value_t = 10, env = "RUVSENSE_AP_SCAN_INTERVAL_SECS")]
+    ap_scan_interval_secs: u64,
 
     /// Persistent data directory for runtime config, recordings, and SQLite state.
     #[arg(long, default_value = "data", env = "RUVSENSE_DATA_DIR")]
@@ -506,8 +519,10 @@ mod fps_ema_tests {
         for _ in 0..40 {
             fps = update_csi_fps_ema(fps, 0.100).unwrap();
         }
-        assert!((fps - 10.0).abs() < 0.1,
-                "expected ~10 Hz after 40 samples at 100 ms intervals, got {fps}");
+        assert!(
+            (fps - 10.0).abs() < 0.1,
+            "expected ~10 Hz after 40 samples at 100 ms intervals, got {fps}"
+        );
     }
 
     #[test]
@@ -566,7 +581,11 @@ impl NodeState {
         // samples; until then fall back to the 20 Hz firmware ceiling. The
         // §A0.12 capture showed real bench fps ≈ 10, so the measured value
         // is significantly more accurate than the constant fallback.
-        let fps = if self.csi_fps_samples >= 5 { self.csi_fps_ema } else { 20.0 };
+        let fps = if self.csi_fps_samples >= 5 {
+            self.csi_fps_ema
+        } else {
+            20.0
+        };
         Some(sync.mesh_aligned_us_for_sequence(frame_sequence, fps))
     }
 
@@ -922,10 +941,7 @@ fn configured_offline_node_json(
     })
 }
 
-fn all_node_summaries_json(
-    s: &AppStateInner,
-    now: std::time::Instant,
-) -> Vec<serde_json::Value> {
+fn all_node_summaries_json(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_json::Value> {
     let mut nodes = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -947,6 +963,284 @@ fn all_node_summaries_json(
     unknown.sort_by_key(|v| v.get("node_id").and_then(|id| id.as_u64()).unwrap_or(0));
     nodes.extend(unknown);
     nodes
+}
+
+fn observation_from_bssid(
+    obs: &BssidObservation,
+    now: std::time::Instant,
+) -> AccessPointObservation {
+    AccessPointObservation {
+        bssid: obs.bssid.to_string(),
+        ssid: obs.ssid.clone(),
+        channel: obs.channel,
+        band: obs.band.to_string(),
+        rssi_dbm: obs.rssi_dbm,
+        last_seen: now,
+    }
+}
+
+fn position_json(position: [f64; 3], source: &str, confidence: f64) -> serde_json::Value {
+    serde_json::json!({
+        "x": position[0],
+        "y": position[1],
+        "z": position[2],
+        "source": source,
+        "confidence": confidence.clamp(0.0, 1.0),
+    })
+}
+
+fn matching_config_ap<'a>(
+    env: &'a EnvironmentConfig,
+    ap: &AccessPointObservation,
+) -> Option<&'a AccessPointConfig> {
+    env.access_points
+        .iter()
+        .find(|cfg| detected_ap_matches_config(ap, cfg))
+}
+
+fn estimated_ring_position(
+    index: usize,
+    total: usize,
+    room: &RoomConfig,
+    y: f64,
+    phase: f64,
+) -> [f64; 3] {
+    let width = room.dimensions_m[0].max(1.0);
+    let depth = room.dimensions_m[2].max(1.0);
+    let n = total.max(1) as f64;
+    let angle = phase + (index as f64 / n) * std::f64::consts::TAU;
+    [
+        angle.cos() * width * 0.38,
+        y.clamp(0.0, room.dimensions_m[1].max(0.1)),
+        angle.sin() * depth * 0.38,
+    ]
+}
+
+fn topology_ap_position(
+    env: &EnvironmentConfig,
+    ap: &AccessPointObservation,
+    index: usize,
+    total: usize,
+) -> ([f64; 3], &'static str, f64) {
+    if let Some(cfg) = matching_config_ap(env, ap) {
+        return (cfg.position_m, "configured", 0.9);
+    }
+    (
+        estimated_ring_position(
+            index,
+            total,
+            &env.room,
+            env.room.dimensions_m[1] * 0.72,
+            0.4,
+        ),
+        "estimated",
+        0.3,
+    )
+}
+
+fn topology_node_position(
+    env: &EnvironmentConfig,
+    node_id: u8,
+    index: usize,
+    total: usize,
+    sync: Option<&NodeSyncSnapshot>,
+) -> ([f64; 3], &'static str, f64) {
+    if let Some(cfg) = configured_node(env, node_id) {
+        return (cfg.position_m, "configured", 0.95);
+    }
+    let confidence = if sync.is_some_and(|s| s.is_valid && s.smoothed) {
+        0.62
+    } else if total >= 3 {
+        0.52
+    } else if total > 1 {
+        0.42
+    } else {
+        0.32
+    };
+    (
+        estimated_ring_position(index, total, &env.room, 1.1, -0.2),
+        "estimated",
+        confidence,
+    )
+}
+
+fn detected_ap_matches_config(ap: &AccessPointObservation, cfg: &AccessPointConfig) -> bool {
+    cfg.bssid
+        .as_ref()
+        .is_some_and(|bssid| bssid.eq_ignore_ascii_case(&ap.bssid))
+        || (!cfg.ssid.is_empty() && cfg.ssid == ap.ssid)
+}
+
+fn topology_access_points_json(
+    env: &EnvironmentConfig,
+    aps: &[AccessPointObservation],
+    now: std::time::Instant,
+) -> Vec<serde_json::Value> {
+    let mut visible = aps.to_vec();
+    visible.sort_by(|a, b| {
+        b.rssi_dbm
+            .partial_cmp(&a.rssi_dbm)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let total = visible.len();
+    visible
+        .iter()
+        .enumerate()
+        .map(|(idx, ap)| {
+            let cfg = matching_config_ap(env, ap);
+            let (position, position_source, position_confidence) =
+                topology_ap_position(env, ap, idx, total);
+            serde_json::json!({
+                "ap_id": cfg.map(|c| c.ap_id.as_str()).unwrap_or(ap.bssid.as_str()),
+                "label": cfg.map(|c| c.label.as_str()).unwrap_or(if ap.ssid.is_empty() { "Hidden AP" } else { ap.ssid.as_str() }),
+                "bssid": ap.bssid.as_str(),
+                "ssid": ap.ssid.as_str(),
+                "channel": ap.channel,
+                "band": ap.band.as_str(),
+                "rssi_dbm": ap.rssi_dbm,
+                "last_seen_ms": now.saturating_duration_since(ap.last_seen).as_millis() as u64,
+                "status": "visible",
+                "position": position_json(position, position_source, position_confidence),
+                "position_confidence": position_confidence,
+                "position_source": position_source,
+            })
+        })
+        .collect()
+}
+
+fn topology_nodes_json(
+    env: &EnvironmentConfig,
+    node_states: &HashMap<u8, NodeState>,
+    now: std::time::Instant,
+) -> Vec<serde_json::Value> {
+    let mut active: Vec<_> = node_states
+        .iter()
+        .filter(|(_, ns)| is_node_active(ns, now))
+        .collect();
+    active.sort_by_key(|(id, _)| **id);
+    let total = active.len();
+    active
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (&id, ns))| {
+            let last_seen_ms = ns
+                .last_frame_time
+                .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+                .unwrap_or(u64::MAX);
+            let sync = ns.sync_snapshot();
+            let cfg = configured_node(env, id);
+            let (position, position_source, position_confidence) =
+                topology_node_position(env, id, idx, total, sync.as_ref());
+            serde_json::json!({
+                "node_id": id,
+                "label": cfg.map(|n| n.label.as_str()).unwrap_or("ESP32-C6"),
+                "kind": cfg.map(|n| n.kind.as_str()).unwrap_or("esp32_c6"),
+                "zone": cfg.map(|n| n.zone.as_str()).unwrap_or("unassigned"),
+                "status": "active",
+                "active": true,
+                "last_seen_ms": last_seen_ms,
+                "rssi_dbm": ns.rssi_history.back().copied().unwrap_or(-90.0),
+                "frame_rate_hz": ns.csi_fps_ema,
+                "frame_rate_samples": ns.csi_fps_samples,
+                "motion_level": &ns.current_motion_level,
+                "presence": !matches!(ns.current_motion_level.as_str(), "absent"),
+                "person_count": ns.prev_person_count,
+                "sync_status": sync.as_ref().map(|s| if s.is_valid { "valid" } else { "stale" }).unwrap_or("no_sync"),
+                "sync": sync,
+                "position": position_json(position, position_source, position_confidence),
+                "position_confidence": position_confidence,
+                "position_source": position_source,
+                "tdm_slot": cfg.map(|n| n.tdm_slot),
+                "tdm_total": cfg.map(|n| n.tdm_total),
+                "linked_ap": node_linked_ap(env, id),
+                "coherence": ns.coherence_score,
+                "novelty_score": ns.last_novelty_score,
+            })
+        })
+        .collect()
+}
+
+fn topology_links_json(
+    env: &EnvironmentConfig,
+    node_states: &HashMap<u8, NodeState>,
+    aps: &[AccessPointObservation],
+    now: std::time::Instant,
+) -> Vec<serde_json::Value> {
+    if aps.is_empty() {
+        return Vec::new();
+    }
+    let strongest = aps.iter().max_by(|a, b| {
+        a.rssi_dbm
+            .partial_cmp(&b.rssi_dbm)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut active_ids: Vec<u8> = node_states
+        .iter()
+        .filter_map(|(&id, ns)| is_node_active(ns, now).then_some(id))
+        .collect();
+    active_ids.sort_unstable();
+
+    active_ids
+        .into_iter()
+        .filter_map(|node_id| {
+            let configured_ap = node_linked_ap(env, node_id)
+                .and_then(|ap_id| env.access_points.iter().find(|ap| ap.ap_id == ap_id));
+            let matched = configured_ap
+                .and_then(|cfg| aps.iter().find(|ap| detected_ap_matches_config(ap, cfg)));
+            let (ap, source, confidence) = if let Some(ap) = matched {
+                (ap, "configured", 0.85)
+            } else if let Some(ap) = strongest {
+                (ap, "estimated", 0.35)
+            } else {
+                return None;
+            };
+            Some(serde_json::json!({
+                "link_id": format!("{}:node-{}", ap.bssid, node_id),
+                "ap_bssid": ap.bssid.as_str(),
+                "node_id": node_id,
+                "source": source,
+                "confidence": confidence,
+            }))
+        })
+        .collect()
+}
+
+fn topology_fusion_mode(active_nodes: usize) -> &'static str {
+    match active_nodes {
+        0 => "offline",
+        1 => "single_node",
+        2 => "partial_multistatic",
+        _ => "multistatic",
+    }
+}
+
+fn topology_readiness_json(active_nodes: usize, min_nodes: usize) -> serde_json::Value {
+    serde_json::json!({
+        "ready": active_nodes >= min_nodes.max(1),
+        "active_nodes": active_nodes,
+        "min_nodes": min_nodes.max(1),
+        "fusion_mode": topology_fusion_mode(active_nodes),
+    })
+}
+
+fn topology_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::Value {
+    let active_nodes = active_node_count(s, now);
+    serde_json::json!({
+        "product": "RuvSense Edge",
+        "service": "ruvsense-master",
+        "version": env!("CARGO_PKG_VERSION"),
+        "source": s.effective_source(),
+        "readiness": topology_readiness_json(active_nodes, s.min_nodes),
+        "room": &s.environment.room,
+        "access_points": topology_access_points_json(&s.environment, &s.detected_access_points, now),
+        "nodes": topology_nodes_json(&s.environment, &s.node_states, now),
+        "links": topology_links_json(&s.environment, &s.node_states, &s.detected_access_points, now),
+        "wifi_scan": {
+            "interface": s.wifi_interface.as_str(),
+            "interval_secs": s.ap_scan_interval_secs,
+            "available": cfg!(target_os = "linux"),
+        },
+    })
 }
 
 // ── ADR-044 §5.2: Rolling P95 adaptive feature normalizer ────────────────────
@@ -1062,6 +1356,17 @@ pub(crate) struct EnvironmentConfig {
     pub links: Vec<EnvironmentLinkConfig>,
 }
 
+/// AP observed by the Raspberry Pi master during a real WiFi scan.
+#[derive(Debug, Clone)]
+struct AccessPointObservation {
+    bssid: String,
+    ssid: String,
+    channel: u8,
+    band: String,
+    rssi_dbm: f64,
+    last_seen: std::time::Instant,
+}
+
 impl Default for EnvironmentConfig {
     fn default() -> Self {
         Self {
@@ -1070,70 +1375,9 @@ impl Default for EnvironmentConfig {
                 dimensions_m: [5.2, 2.6, 4.8],
                 coordinate_system: "x_right_y_up_z_depth".to_string(),
             },
-            access_points: vec![
-                AccessPointConfig {
-                    ap_id: "ap-1".to_string(),
-                    label: "Mesh AP 1".to_string(),
-                    ssid: "ruvsense-mesh".to_string(),
-                    bssid: None,
-                    role: "gateway".to_string(),
-                    position_m: [-2.4, 1.9, -2.0],
-                    channel: Some(1),
-                    band: "2.4GHz".to_string(),
-                    active: true,
-                },
-                AccessPointConfig {
-                    ap_id: "ap-2".to_string(),
-                    label: "Mesh AP 2".to_string(),
-                    ssid: "ruvsense-mesh".to_string(),
-                    bssid: None,
-                    role: "mesh".to_string(),
-                    position_m: [2.4, 1.9, 2.0],
-                    channel: Some(6),
-                    band: "2.4GHz".to_string(),
-                    active: true,
-                },
-            ],
-            nodes: vec![
-                EnvironmentNodeConfig {
-                    node_id: 1,
-                    label: "ESP32-C6 1".to_string(),
-                    kind: "esp32_c6".to_string(),
-                    zone: "front_left".to_string(),
-                    position_m: [-2.0, 1.1, -1.6],
-                    tdm_slot: 0,
-                    tdm_total: 3,
-                    linked_ap: "ap-1".to_string(),
-                },
-                EnvironmentNodeConfig {
-                    node_id: 2,
-                    label: "ESP32-C6 2".to_string(),
-                    kind: "esp32_c6".to_string(),
-                    zone: "front_right".to_string(),
-                    position_m: [2.0, 1.1, -1.6],
-                    tdm_slot: 1,
-                    tdm_total: 3,
-                    linked_ap: "ap-1".to_string(),
-                },
-                EnvironmentNodeConfig {
-                    node_id: 3,
-                    label: "ESP32-C6 3".to_string(),
-                    kind: "esp32_c6".to_string(),
-                    zone: "rear".to_string(),
-                    position_m: [0.0, 1.1, 2.0],
-                    tdm_slot: 2,
-                    tdm_total: 3,
-                    linked_ap: "ap-2".to_string(),
-                },
-            ],
-            links: vec![
-                EnvironmentLinkConfig { link_id: "ap-1:c6-1".to_string(), ap_id: "ap-1".to_string(), node_id: 1 },
-                EnvironmentLinkConfig { link_id: "ap-1:c6-2".to_string(), ap_id: "ap-1".to_string(), node_id: 2 },
-                EnvironmentLinkConfig { link_id: "ap-1:c6-3".to_string(), ap_id: "ap-1".to_string(), node_id: 3 },
-                EnvironmentLinkConfig { link_id: "ap-2:c6-1".to_string(), ap_id: "ap-2".to_string(), node_id: 1 },
-                EnvironmentLinkConfig { link_id: "ap-2:c6-2".to_string(), ap_id: "ap-2".to_string(), node_id: 2 },
-                EnvironmentLinkConfig { link_id: "ap-2:c6-3".to_string(), ap_id: "ap-2".to_string(), node_id: 3 },
-            ],
+            access_points: Vec::new(),
+            nodes: Vec::new(),
+            links: Vec::new(),
         }
     }
 }
@@ -1324,6 +1568,12 @@ struct AppStateInner {
     /// Per-node sensing state for multi-node deployments.
     /// Keyed by `node_id` from the ESP32 frame header.
     node_states: HashMap<u8, NodeState>,
+    /// Access points currently visible to the Raspberry Pi master.
+    detected_access_points: Vec<AccessPointObservation>,
+    /// Wireless interface used for Pi-side AP discovery.
+    wifi_interface: String,
+    /// AP scan interval in seconds.
+    ap_scan_interval_secs: u64,
     // ── Accuracy sprint: Kalman tracker, multistatic fusion, eigenvalue counting ──
     /// Global Kalman-based pose tracker for stable person IDs and smoothed keypoints.
     pose_tracker: PoseTracker,
@@ -1616,23 +1866,23 @@ mod issue_928_magic_collision_tests {
     fn build_fused_vitals_packet() -> Vec<u8> {
         let mut buf = vec![0u8; 48];
         buf[0..4].copy_from_slice(&0xC511_0004u32.to_le_bytes());
-        buf[4] = 9;                                            // node_id
-        buf[5] = 0b0000_1001;                                   // flags: presence | mmwave_present
-        buf[6..8].copy_from_slice(&1600u16.to_le_bytes());      // breathing 16.00 BPM
-        buf[8..12].copy_from_slice(&720_000u32.to_le_bytes());  // heartrate 72.0 BPM
-        buf[12] = (-55i8) as u8;                                // rssi
-        buf[13] = 1;                                            // n_persons
-        buf[14] = 2;                                            // mmwave_type
-        buf[15] = 85;                                           // fusion_confidence
-        buf[16..20].copy_from_slice(&0.42f32.to_le_bytes());    // motion_energy
-        buf[20..24].copy_from_slice(&0.95f32.to_le_bytes());    // presence_score
+        buf[4] = 9; // node_id
+        buf[5] = 0b0000_1001; // flags: presence | mmwave_present
+        buf[6..8].copy_from_slice(&1600u16.to_le_bytes()); // breathing 16.00 BPM
+        buf[8..12].copy_from_slice(&720_000u32.to_le_bytes()); // heartrate 72.0 BPM
+        buf[12] = (-55i8) as u8; // rssi
+        buf[13] = 1; // n_persons
+        buf[14] = 2; // mmwave_type
+        buf[15] = 85; // fusion_confidence
+        buf[16..20].copy_from_slice(&0.42f32.to_le_bytes()); // motion_energy
+        buf[20..24].copy_from_slice(&0.95f32.to_le_bytes()); // presence_score
         buf[24..28].copy_from_slice(&1_234_567u32.to_le_bytes()); // timestamp_ms
-        buf[28..32].copy_from_slice(&71.5f32.to_le_bytes());    // mmwave_hr_bpm
-        buf[32..36].copy_from_slice(&15.8f32.to_le_bytes());    // mmwave_br_bpm
-        buf[36..40].copy_from_slice(&182.0f32.to_le_bytes());   // mmwave_distance_cm
-        buf[40] = 1;                                            // mmwave_targets
-        buf[41] = 90;                                           // mmwave_confidence
-        // bytes 42..48 — firmware reserved fields, left as zero
+        buf[28..32].copy_from_slice(&71.5f32.to_le_bytes()); // mmwave_hr_bpm
+        buf[32..36].copy_from_slice(&15.8f32.to_le_bytes()); // mmwave_br_bpm
+        buf[36..40].copy_from_slice(&182.0f32.to_le_bytes()); // mmwave_distance_cm
+        buf[40] = 1; // mmwave_targets
+        buf[41] = 90; // mmwave_confidence
+                      // bytes 42..48 — firmware reserved fields, left as zero
         buf
     }
 
@@ -1642,8 +1892,14 @@ mod issue_928_magic_collision_tests {
         let pkt = parse_edge_fused_vitals(&buf).expect("must parse a well-formed packet");
         assert_eq!(pkt.node_id, 9);
         assert_eq!(pkt.flags, 0b0000_1001);
-        assert!((pkt.breathing_rate_bpm - 16.0).abs() < 1e-3, "breathing scale 100");
-        assert!((pkt.heartrate_bpm - 72.0).abs() < 1e-3, "heartrate scale 10000");
+        assert!(
+            (pkt.breathing_rate_bpm - 16.0).abs() < 1e-3,
+            "breathing scale 100"
+        );
+        assert!(
+            (pkt.heartrate_bpm - 72.0).abs() < 1e-3,
+            "heartrate scale 10000"
+        );
         assert_eq!(pkt.rssi, -55);
         assert_eq!(pkt.n_persons, 1);
         assert_eq!(pkt.mmwave_type, 2);
@@ -1678,8 +1934,10 @@ mod issue_928_magic_collision_tests {
         // accepted. A real fused-vitals packet starts with 0xC511_0004 and
         // would have been misparsed before this fix.
         let buf = build_fused_vitals_packet();
-        assert!(parse_wasm_output(&buf).is_none(),
-                "issue #928: WASM parser must NOT accept 0xC511_0004");
+        assert!(
+            parse_wasm_output(&buf).is_none(),
+            "issue #928: WASM parser must NOT accept 0xC511_0004"
+        );
     }
 
     #[test]
@@ -1687,9 +1945,9 @@ mod issue_928_magic_collision_tests {
         // Build a tiny well-formed WASM output packet on the new magic.
         let mut buf = vec![0u8; 8];
         buf[0..4].copy_from_slice(&0xC511_0007u32.to_le_bytes());
-        buf[4] = 5;                                          // node_id
-        buf[5] = 1;                                          // module_id
-        buf[6..8].copy_from_slice(&0u16.to_le_bytes());      // event_count = 0
+        buf[4] = 5; // node_id
+        buf[5] = 1; // module_id
+        buf[6..8].copy_from_slice(&0u16.to_le_bytes()); // event_count = 0
         let pkt = parse_wasm_output(&buf).expect("0xC511_0007 must parse");
         assert_eq!(pkt.node_id, 5);
         assert_eq!(pkt.module_id, 1);
@@ -2560,6 +2818,58 @@ fn parse_netsh_interfaces_output(output: &str) -> Option<(f64, f64, String)> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn scan_linux_access_points(interface: &str) -> Result<Vec<AccessPointObservation>, String> {
+    let now = std::time::Instant::now();
+    let observations = match LinuxIwScanner::with_interface(interface).scan_sync() {
+        Ok(obs) => obs,
+        Err(primary) => LinuxIwScanner::with_interface(interface)
+            .use_cached()
+            .scan_sync()
+            .map_err(|cached| format!("iw scan failed: {primary}; cached scan failed: {cached}"))?,
+    };
+    let mut access_points: Vec<_> = observations
+        .iter()
+        .map(|obs| observation_from_bssid(obs, now))
+        .collect();
+    access_points.sort_by(|a, b| {
+        b.rssi_dbm
+            .partial_cmp(&a.rssi_dbm)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(access_points)
+}
+
+#[cfg(target_os = "linux")]
+async fn ap_scan_task(state: SharedState, interface: String, interval_secs: u64) {
+    let interval = Duration::from_secs(interval_secs.max(1));
+    info!(
+        "Linux AP discovery active (interface={}, interval={}s)",
+        interface,
+        interval.as_secs()
+    );
+
+    loop {
+        let iface = interface.clone();
+        match tokio::task::spawn_blocking(move || scan_linux_access_points(&iface)).await {
+            Ok(Ok(access_points)) => {
+                let count = access_points.len();
+                let mut s = state.write().await;
+                s.detected_access_points = access_points;
+                debug!("AP discovery updated topology with {} visible APs", count);
+            }
+            Ok(Err(error)) => {
+                let mut s = state.write().await;
+                s.detected_access_points.clear();
+                debug!("AP discovery unavailable on {}: {}", interface, error);
+            }
+            Err(error) => debug!("AP discovery worker join error: {}", error),
+        }
+
+        tokio::time::sleep(interval).await;
+    }
+}
+
 async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
     let mut seq: u32 = 0;
@@ -2689,6 +2999,11 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         // ── Step 6: Update shared state ──────────────────────────────
         let mut s = state.write().await;
         s.source = format!("wifi:{ssid}");
+        let ap_seen_at = std::time::Instant::now();
+        s.detected_access_points = observations
+            .iter()
+            .map(|obs| observation_from_bssid(obs, ap_seen_at))
+            .collect();
         s.rssi_history.push_back(first_rssi);
         if s.rssi_history.len() > 60 {
             s.rssi_history.pop_front();
@@ -2741,7 +3056,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
                 position: [0.0, 0.0, 0.0],
                 amplitude: multi_ap_frame.amplitudes,
                 subcarrier_count: obs_count,
-                sync: None,  // multi-BSSID scan path — no mesh peer
+                sync: None, // multi-BSSID scan path — no mesh peer
             }],
             features,
             classification,
@@ -2897,7 +3212,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
             position: [0.0, 0.0, 0.0],
             amplitude: vec![signal_pct],
             subcarrier_count: 1,
-            sync: None,  // synthetic-RSSI fallback path — no mesh peer
+            sync: None, // synthetic-RSSI fallback path — no mesh peer
         }],
         features,
         classification,
@@ -4090,12 +4405,15 @@ async fn health_ready(State(state): State<SharedState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(serde_json::json!({
-        "status": if ready { "ready" } else { "not_ready" },
-        "source": s.effective_source(),
-        "active_nodes": active_nodes,
-        "min_nodes": s.min_nodes,
-    })))
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "source": s.effective_source(),
+            "active_nodes": active_nodes,
+            "min_nodes": s.min_nodes,
+        })),
+    )
 }
 
 async fn health_system(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -5049,15 +5367,21 @@ async fn node_sync_endpoint(
 ) -> Result<Json<NodeSyncSnapshot>, (StatusCode, Json<serde_json::Value>)> {
     let s = state.read().await;
     let ns = s.node_states.get(&id).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "unknown_node", "node_id": id,
-        })))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "unknown_node", "node_id": id,
+            })),
+        )
     })?;
     ns.sync_snapshot().map(Json).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "no_sync", "node_id": id,
-            "hint": "node hasn't emitted a sync packet yet (no mesh peer or not v0.6.9+)",
-        })))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no_sync", "node_id": id,
+                "hint": "node hasn't emitted a sync packet yet (no mesh peer or not v0.6.9+)",
+            })),
+        )
     })
 }
 
@@ -5091,26 +5415,52 @@ async fn mesh_metrics_endpoint(State(state): State<SharedState>) -> impl IntoRes
 
     // Each metric: HELP + TYPE header + one line per node that has a snapshot.
     let metrics: &[(&str, &str, &str)] = &[
-        ("wifi_densepose_mesh_offset_us",
-         "Cross-board mesh-aligned offset, microseconds (signed)", "gauge"),
-        ("wifi_densepose_mesh_is_leader",
-         "1 if this node is the elected mesh leader, else 0", "gauge"),
-        ("wifi_densepose_mesh_is_valid",
-         "1 if this node has heard a fresh leader beacon, else 0", "gauge"),
-        ("wifi_densepose_mesh_smoothed",
-         "1 once the firmware-side EMA filter has seeded, else 0", "gauge"),
-        ("wifi_densepose_mesh_sequence",
-         "High-water CSI sequence at sync emit time", "gauge"),
-        ("wifi_densepose_mesh_csi_fps",
-         "Per-node measured CSI frame rate (Hz)", "gauge"),
-        ("wifi_densepose_mesh_csi_fps_samples",
-         "How many inter-frame deltas the fps EMA has seen", "gauge"),
-        ("wifi_densepose_mesh_staleness_ms",
-         "Milliseconds since the host last received this node's sync packet", "gauge"),
+        (
+            "wifi_densepose_mesh_offset_us",
+            "Cross-board mesh-aligned offset, microseconds (signed)",
+            "gauge",
+        ),
+        (
+            "wifi_densepose_mesh_is_leader",
+            "1 if this node is the elected mesh leader, else 0",
+            "gauge",
+        ),
+        (
+            "wifi_densepose_mesh_is_valid",
+            "1 if this node has heard a fresh leader beacon, else 0",
+            "gauge",
+        ),
+        (
+            "wifi_densepose_mesh_smoothed",
+            "1 once the firmware-side EMA filter has seeded, else 0",
+            "gauge",
+        ),
+        (
+            "wifi_densepose_mesh_sequence",
+            "High-water CSI sequence at sync emit time",
+            "gauge",
+        ),
+        (
+            "wifi_densepose_mesh_csi_fps",
+            "Per-node measured CSI frame rate (Hz)",
+            "gauge",
+        ),
+        (
+            "wifi_densepose_mesh_csi_fps_samples",
+            "How many inter-frame deltas the fps EMA has seen",
+            "gauge",
+        ),
+        (
+            "wifi_densepose_mesh_staleness_ms",
+            "Milliseconds since the host last received this node's sync packet",
+            "gauge",
+        ),
     ];
 
     // Collect (id, snapshot) pairs once so each metric loop reads the same set.
-    let snaps: Vec<(u8, NodeSyncSnapshot)> = s.node_states.iter()
+    let snaps: Vec<(u8, NodeSyncSnapshot)> = s
+        .node_states
+        .iter()
         .filter_map(|(&id, ns)| ns.sync_snapshot().map(|snap| (id, snap)))
         .collect();
 
@@ -5119,12 +5469,23 @@ async fn mesh_metrics_endpoint(State(state): State<SharedState>) -> impl IntoRes
     // without scraping every per-node series and counting.
     let (leaders, followers) = fleet_role_counts(&snaps);
     let no_sync = s.node_states.len().saturating_sub(snaps.len()) as u64;
-    let _ = writeln!(body,
-        "# HELP wifi_densepose_mesh_node_total Per-state node count across the fleet");
+    let _ = writeln!(
+        body,
+        "# HELP wifi_densepose_mesh_node_total Per-state node count across the fleet"
+    );
     let _ = writeln!(body, "# TYPE wifi_densepose_mesh_node_total gauge");
-    let _ = writeln!(body, "wifi_densepose_mesh_node_total{{state=\"leader\"}} {leaders}");
-    let _ = writeln!(body, "wifi_densepose_mesh_node_total{{state=\"follower\"}} {followers}");
-    let _ = writeln!(body, "wifi_densepose_mesh_node_total{{state=\"no_sync\"}} {no_sync}");
+    let _ = writeln!(
+        body,
+        "wifi_densepose_mesh_node_total{{state=\"leader\"}} {leaders}"
+    );
+    let _ = writeln!(
+        body,
+        "wifi_densepose_mesh_node_total{{state=\"follower\"}} {followers}"
+    );
+    let _ = writeln!(
+        body,
+        "wifi_densepose_mesh_node_total{{state=\"no_sync\"}} {no_sync}"
+    );
 
     for (name, help, kind) in metrics {
         let _ = writeln!(body, "# HELP {name} {help}");
@@ -5138,17 +5499,27 @@ async fn mesh_metrics_endpoint(State(state): State<SharedState>) -> impl IntoRes
                 "wifi_densepose_mesh_sequence" => snap.sequence.to_string(),
                 "wifi_densepose_mesh_csi_fps" => format!("{:.3}", snap.csi_fps_ema),
                 "wifi_densepose_mesh_csi_fps_samples" => snap.csi_fps_samples.to_string(),
-                "wifi_densepose_mesh_staleness_ms" =>
-                    snap.staleness_ms.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
+                "wifi_densepose_mesh_staleness_ms" => snap
+                    .staleness_ms
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "0".into()),
                 _ => continue,
             };
             let _ = writeln!(body, "{name}{{node=\"{id}\"}} {value}");
         }
     }
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }
 
-fn bool_metric(b: bool) -> String { (if b { 1 } else { 0 }).to_string() }
+fn bool_metric(b: bool) -> String {
+    (if b { 1 } else { 0 }).to_string()
+}
 
 /// ADR-110 iter 37 — count (leaders, followers) in a populated snapshot set.
 /// Free function for testability — same pattern as iter 18's `update_csi_fps_ema`.
@@ -5197,7 +5568,8 @@ async fn fleet_endpoint(State(state): State<SharedState>) -> Json<serde_json::Va
             .values()
             .filter(|ns| is_node_active(ns, now))
             .map(|ns| ns.csi_fps_ema)
-            .sum::<f64>() / active_nodes as f64
+            .sum::<f64>()
+            / active_nodes as f64
     } else {
         0.0
     };
@@ -5274,8 +5646,18 @@ async fn environment_endpoint(State(state): State<SharedState>) -> Json<serde_js
     }))
 }
 
+async fn topology_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    Json(topology_payload(&s, std::time::Instant::now()))
+}
+
 fn validate_environment(env: &EnvironmentConfig) -> Result<(), String> {
-    if env.room.dimensions_m.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+    if env
+        .room
+        .dimensions_m
+        .iter()
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
         return Err("room dimensions must be positive finite meters".to_string());
     }
     let mut ap_ids = std::collections::HashSet::new();
@@ -5304,10 +5686,16 @@ fn validate_environment(env: &EnvironmentConfig) -> Result<(), String> {
     }
     for link in &env.links {
         if !ap_ids.contains(link.ap_id.as_str()) {
-            return Err(format!("link '{}' references unknown AP '{}'", link.link_id, link.ap_id));
+            return Err(format!(
+                "link '{}' references unknown AP '{}'",
+                link.link_id, link.ap_id
+            ));
         }
         if !node_ids.contains(&link.node_id) {
-            return Err(format!("link '{}' references unknown node {}", link.link_id, link.node_id));
+            return Err(format!(
+                "link '{}' references unknown node {}",
+                link.link_id, link.node_id
+            ));
         }
     }
     Ok(())
@@ -5366,36 +5754,246 @@ fn module_confidence(active_nodes: usize, required_nodes: usize) -> f64 {
 
 fn business_modules(active_nodes: usize) -> Vec<serde_json::Value> {
     let modules: &[(&str, &str, &str, u16, usize, &[&str])] = &[
-        ("fall_detection", "Health & Vitals", "Fall detection", 8, 1, &["edge_vitals", "sensing_update"]),
-        ("sleep_apnea_screening", "Health & Vitals", "Sleep apnea screening", 12, 1, &["vital_signs", "edge_vitals"]),
-        ("cardiac_arrhythmia", "Health & Vitals", "Cardiac arrhythmia", 14, 1, &["vital_signs"]),
-        ("seizure_detection", "Health & Vitals", "Seizure detection", 10, 3, &["sensing_update", "introspection"]),
-        ("sleep_staging", "Health & Vitals", "Sleep staging", 18, 1, &["vital_signs", "sensing_update"]),
-        ("respiration_tracking", "Health & Vitals", "Respiration tracking", 6, 1, &["vital_signs"]),
-        ("intrusion_detection", "Safety & Security", "Intrusion detection", 9, 1, &["sensing_update"]),
-        ("loitering_alert", "Safety & Security", "Loitering alert", 7, 2, &["sensing_update", "environment"]),
-        ("panic_motion", "Safety & Security", "Panic motion", 5, 1, &["sensing_update"]),
-        ("confined_space_monitor", "Safety & Security", "Confined-space monitor", 11, 3, &["environment", "vital_signs"]),
-        ("exclusion_zone_breach", "Safety & Security", "Exclusion-zone breach", 8, 3, &["environment"]),
-        ("cobot_proximity", "Safety & Security", "Cobot proximity", 12, 3, &["environment", "pose"]),
-        ("hvac_zone_control", "Building Automation", "HVAC zone control", 10, 1, &["environment"]),
-        ("lighting_automation", "Building Automation", "Lighting automation", 6, 1, &["sensing_update"]),
-        ("occupancy_based_access", "Building Automation", "Occupancy-based access", 11, 2, &["fleet", "environment"]),
-        ("meeting_room_sensing", "Building Automation", "Meeting-room sensing", 8, 1, &["sensing_update"]),
-        ("desk_utilization", "Building Automation", "Desk utilization", 7, 2, &["environment"]),
-        ("door_open_detection", "Building Automation", "Door-open detection", 5, 1, &["introspection"]),
-        ("queue_length", "Analytics", "Queue length", 8, 3, &["environment"]),
-        ("dwell_heatmap", "Analytics", "Dwell heatmap", 14, 3, &["environment"]),
-        ("table_turnover", "Analytics", "Table turnover", 9, 2, &["environment"]),
-        ("people_counting", "Analytics", "People counting", 7, 3, &["sensing_update", "fleet"]),
-        ("path_analytics", "Analytics", "Path analytics", 16, 3, &["environment", "pose"]),
-        ("conversion_funnels", "Analytics", "Conversion funnels", 11, 3, &["environment"]),
-        ("gesture_recognition", "Interaction", "Gesture recognition", 22, 2, &["introspection", "pose"]),
-        ("pointing_swipe", "Interaction", "Pointing / swipe", 15, 3, &["pose"]),
-        ("emotion_inference", "Interaction", "Emotion inference", 28, 3, &["vital_signs", "pose"]),
-        ("activity_classification", "Interaction", "Activity classification", 19, 2, &["sensing_update", "introspection"]),
-        ("posture_analytics", "Interaction", "Posture analytics", 13, 3, &["pose"]),
-        ("gait_biometrics", "Interaction", "Gait biometrics", 24, 3, &["pose", "environment"]),
+        (
+            "fall_detection",
+            "Health & Vitals",
+            "Fall detection",
+            8,
+            1,
+            &["edge_vitals", "sensing_update"],
+        ),
+        (
+            "sleep_apnea_screening",
+            "Health & Vitals",
+            "Sleep apnea screening",
+            12,
+            1,
+            &["vital_signs", "edge_vitals"],
+        ),
+        (
+            "cardiac_arrhythmia",
+            "Health & Vitals",
+            "Cardiac arrhythmia",
+            14,
+            1,
+            &["vital_signs"],
+        ),
+        (
+            "seizure_detection",
+            "Health & Vitals",
+            "Seizure detection",
+            10,
+            3,
+            &["sensing_update", "introspection"],
+        ),
+        (
+            "sleep_staging",
+            "Health & Vitals",
+            "Sleep staging",
+            18,
+            1,
+            &["vital_signs", "sensing_update"],
+        ),
+        (
+            "respiration_tracking",
+            "Health & Vitals",
+            "Respiration tracking",
+            6,
+            1,
+            &["vital_signs"],
+        ),
+        (
+            "intrusion_detection",
+            "Safety & Security",
+            "Intrusion detection",
+            9,
+            1,
+            &["sensing_update"],
+        ),
+        (
+            "loitering_alert",
+            "Safety & Security",
+            "Loitering alert",
+            7,
+            2,
+            &["sensing_update", "environment"],
+        ),
+        (
+            "panic_motion",
+            "Safety & Security",
+            "Panic motion",
+            5,
+            1,
+            &["sensing_update"],
+        ),
+        (
+            "confined_space_monitor",
+            "Safety & Security",
+            "Confined-space monitor",
+            11,
+            3,
+            &["environment", "vital_signs"],
+        ),
+        (
+            "exclusion_zone_breach",
+            "Safety & Security",
+            "Exclusion-zone breach",
+            8,
+            3,
+            &["environment"],
+        ),
+        (
+            "cobot_proximity",
+            "Safety & Security",
+            "Cobot proximity",
+            12,
+            3,
+            &["environment", "pose"],
+        ),
+        (
+            "hvac_zone_control",
+            "Building Automation",
+            "HVAC zone control",
+            10,
+            1,
+            &["environment"],
+        ),
+        (
+            "lighting_automation",
+            "Building Automation",
+            "Lighting automation",
+            6,
+            1,
+            &["sensing_update"],
+        ),
+        (
+            "occupancy_based_access",
+            "Building Automation",
+            "Occupancy-based access",
+            11,
+            2,
+            &["fleet", "environment"],
+        ),
+        (
+            "meeting_room_sensing",
+            "Building Automation",
+            "Meeting-room sensing",
+            8,
+            1,
+            &["sensing_update"],
+        ),
+        (
+            "desk_utilization",
+            "Building Automation",
+            "Desk utilization",
+            7,
+            2,
+            &["environment"],
+        ),
+        (
+            "door_open_detection",
+            "Building Automation",
+            "Door-open detection",
+            5,
+            1,
+            &["introspection"],
+        ),
+        (
+            "queue_length",
+            "Analytics",
+            "Queue length",
+            8,
+            3,
+            &["environment"],
+        ),
+        (
+            "dwell_heatmap",
+            "Analytics",
+            "Dwell heatmap",
+            14,
+            3,
+            &["environment"],
+        ),
+        (
+            "table_turnover",
+            "Analytics",
+            "Table turnover",
+            9,
+            2,
+            &["environment"],
+        ),
+        (
+            "people_counting",
+            "Analytics",
+            "People counting",
+            7,
+            3,
+            &["sensing_update", "fleet"],
+        ),
+        (
+            "path_analytics",
+            "Analytics",
+            "Path analytics",
+            16,
+            3,
+            &["environment", "pose"],
+        ),
+        (
+            "conversion_funnels",
+            "Analytics",
+            "Conversion funnels",
+            11,
+            3,
+            &["environment"],
+        ),
+        (
+            "gesture_recognition",
+            "Interaction",
+            "Gesture recognition",
+            22,
+            2,
+            &["introspection", "pose"],
+        ),
+        (
+            "pointing_swipe",
+            "Interaction",
+            "Pointing / swipe",
+            15,
+            3,
+            &["pose"],
+        ),
+        (
+            "emotion_inference",
+            "Interaction",
+            "Emotion inference",
+            28,
+            3,
+            &["vital_signs", "pose"],
+        ),
+        (
+            "activity_classification",
+            "Interaction",
+            "Activity classification",
+            19,
+            2,
+            &["sensing_update", "introspection"],
+        ),
+        (
+            "posture_analytics",
+            "Interaction",
+            "Posture analytics",
+            13,
+            3,
+            &["pose"],
+        ),
+        (
+            "gait_biometrics",
+            "Interaction",
+            "Gait biometrics",
+            24,
+            3,
+            &["pose", "environment"],
+        ),
     ];
 
     modules
@@ -5441,7 +6039,9 @@ async fn modules_endpoint(State(state): State<SharedState>) -> Json<serde_json::
     }))
 }
 
-async fn calibration_overview_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn calibration_overview_endpoint(
+    State(state): State<SharedState>,
+) -> Json<serde_json::Value> {
     let s = state.read().await;
     let status = s
         .field_model
@@ -5471,26 +6071,48 @@ async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl I
     let ready = if active_nodes >= s.min_nodes { 1 } else { 0 };
     let mut body = String::with_capacity(2048);
 
-    let _ = writeln!(body, "# HELP ruvsense_master_ready Master readiness based on active node quorum");
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_master_ready Master readiness based on active node quorum"
+    );
     let _ = writeln!(body, "# TYPE ruvsense_master_ready gauge");
     let _ = writeln!(body, "ruvsense_master_ready {ready}");
-    let _ = writeln!(body, "# HELP ruvsense_active_nodes Active ESP32 nodes seen within readiness timeout");
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_active_nodes Active ESP32 nodes seen within readiness timeout"
+    );
     let _ = writeln!(body, "# TYPE ruvsense_active_nodes gauge");
     let _ = writeln!(body, "ruvsense_active_nodes {active_nodes}");
-    let _ = writeln!(body, "# HELP ruvsense_min_nodes Minimum active nodes required for ready");
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_min_nodes Minimum active nodes required for ready"
+    );
     let _ = writeln!(body, "# TYPE ruvsense_min_nodes gauge");
     let _ = writeln!(body, "ruvsense_min_nodes {}", s.min_nodes);
-    let _ = writeln!(body, "# HELP ruvsense_ticks_total Sensing update ticks processed");
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_ticks_total Sensing update ticks processed"
+    );
     let _ = writeln!(body, "# TYPE ruvsense_ticks_total counter");
     let _ = writeln!(body, "ruvsense_ticks_total {}", s.tick);
-    let _ = writeln!(body, "# HELP ruvsense_ws_clients Current WebSocket subscriber count");
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_ws_clients Current WebSocket subscriber count"
+    );
     let _ = writeln!(body, "# TYPE ruvsense_ws_clients gauge");
     let _ = writeln!(body, "ruvsense_ws_clients {}", s.tx.receiver_count());
 
-    let _ = writeln!(body, "# HELP ruvsense_node_frame_rate_hz Per-node CSI frame-rate EMA");
+    let _ = writeln!(
+        body,
+        "# HELP ruvsense_node_frame_rate_hz Per-node CSI frame-rate EMA"
+    );
     let _ = writeln!(body, "# TYPE ruvsense_node_frame_rate_hz gauge");
     for (&id, ns) in &s.node_states {
-        let _ = writeln!(body, "ruvsense_node_frame_rate_hz{{node=\"{id}\"}} {:.3}", ns.csi_fps_ema);
+        let _ = writeln!(
+            body,
+            "ruvsense_node_frame_rate_hz{{node=\"{id}\"}} {:.3}",
+            ns.csi_fps_ema
+        );
     }
     let _ = writeln!(body, "# HELP ruvsense_node_active Per-node active status");
     let _ = writeln!(body, "# TYPE ruvsense_node_active gauge");
@@ -5499,7 +6121,13 @@ async fn prometheus_metrics_endpoint(State(state): State<SharedState>) -> impl I
         let _ = writeln!(body, "ruvsense_node_active{{node=\"{id}\"}} {active}");
     }
 
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }
 
 async fn info_page() -> Html<String> {
@@ -5804,8 +6432,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                                        sync.local_minus_epoch_us());
                                 let mut s = state.write().await;
                                 let node_id = sync.node_id;
-                                let ns = s.node_states.entry(node_id)
-                                    .or_insert_with(NodeState::new);
+                                let ns =
+                                    s.node_states.entry(node_id).or_insert_with(NodeState::new);
                                 ns.apply_sync_packet(sync, std::time::Instant::now());
                                 continue;
                             }
@@ -5828,8 +6456,11 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     debug!(
                         "Edge fused vitals from {src}: node={} br={:.1} hr={:.1} \
                          mmwave_targets={} fusion_conf={}",
-                        fused.node_id, fused.breathing_rate_bpm, fused.heartrate_bpm,
-                        fused.mmwave_targets, fused.fusion_confidence,
+                        fused.node_id,
+                        fused.breathing_rate_bpm,
+                        fused.heartrate_bpm,
+                        fused.mmwave_targets,
+                        fused.fusion_confidence,
                     );
                     let s = state.write().await;
                     if let Ok(json) = serde_json::to_string(&serde_json::json!({
@@ -6261,7 +6892,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 position: [2.0, 0.0, 1.5],
                 amplitude: frame_amplitudes,
                 subcarrier_count: frame_n_sub as usize,
-                sync: None,  // simulated frame path — no mesh peer
+                sync: None, // simulated frame path — no mesh peer
             }],
             features: features.clone(),
             classification,
@@ -6472,8 +7103,7 @@ fn diagnose_model_load_error(path: &std::path::Path, data: &[u8], err: &str) -> 
     // safetensors: 8-byte LE header length, then a JSON object starting with '{'.
     let looks_safetensors = ext == "safetensors" || (data.len() > 9 && data[8] == b'{');
     // JSONL manifest: starts with '{' (or the well-known suffix).
-    let looks_jsonl =
-        ext == "jsonl" || name.ends_with(".rvf.jsonl") || data.first() == Some(&b'{');
+    let looks_jsonl = ext == "jsonl" || name.ends_with(".rvf.jsonl") || data.first() == Some(&b'{');
     // Quantized weight blob shipped on HF (model-q2/q4/q8.bin).
     let looks_quant_bin = ext == "bin" || name.contains("-q");
 
@@ -7080,6 +7710,11 @@ async fn main() {
     info!("  Source:    {}", args.source);
     info!("  Simulation enabled: {}", args.enable_simulation);
     info!("  Min nodes: {}", args.min_nodes);
+    info!(
+        "  AP scan:   {} every {}s",
+        args.wifi_interface,
+        args.ap_scan_interval_secs.max(1)
+    );
     info!("  Data dir:  {}", args.data_dir.display());
 
     // Auto-detect data source
@@ -7204,7 +7839,10 @@ async fn main() {
         );
     }
     match init_sqlite_store(&data_dir).await {
-        Ok(()) => info!("SQLite store ready at {}", data_dir.join("ruvsense.sqlite").display()),
+        Ok(()) => info!(
+            "SQLite store ready at {}",
+            data_dir.join("ruvsense.sqlite").display()
+        ),
         Err(e) => warn!("SQLite store unavailable: {e}"),
     }
 
@@ -7365,6 +8003,9 @@ async fn main() {
                     );
                 }),
         node_states: HashMap::new(),
+        detected_access_points: Vec::new(),
+        wifi_interface: args.wifi_interface.clone(),
+        ap_scan_interval_secs: args.ap_scan_interval_secs.max(1),
         // Accuracy sprint
         pose_tracker: PoseTracker::new(),
         last_tracker_instant: None,
@@ -7401,6 +8042,15 @@ async fn main() {
         data_dir: data_dir.clone(),
         environment: runtime_config.environment.clone(),
     }));
+
+    #[cfg(target_os = "linux")]
+    if source != "simulate" {
+        tokio::spawn(ap_scan_task(
+            state.clone(),
+            args.wifi_interface.clone(),
+            args.ap_scan_interval_secs.max(1),
+        ));
+    }
 
     // Start background tasks based on source
     match source {
@@ -7505,6 +8155,7 @@ async fn main() {
         // Sensing endpoints
         .route("/api/v1/sensing/latest", get(latest))
         .route("/api/v1/fleet", get(fleet_endpoint))
+        .route("/api/v1/topology", get(topology_endpoint))
         .route(
             "/api/v1/environment",
             get(environment_endpoint).put(environment_update_endpoint),
@@ -7664,6 +8315,65 @@ async fn main() {
 }
 
 #[cfg(test)]
+mod topology_console_tests {
+    use super::{
+        module_status, topology_nodes_json, topology_readiness_json, EnvironmentConfig, NodeState,
+        ESP32_OFFLINE_TIMEOUT,
+    };
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn default_environment_does_not_invent_hardware() {
+        let environment = EnvironmentConfig::default();
+
+        assert!(environment.access_points.is_empty());
+        assert!(environment.nodes.is_empty());
+        assert!(environment.links.is_empty());
+    }
+
+    #[test]
+    fn topology_hides_stale_or_config_only_nodes() {
+        let now = Instant::now();
+        let mut active = NodeState::new();
+        active.last_frame_time = Some(now);
+        active.rssi_history.push_back(-48.0);
+        active.csi_fps_ema = 18.0;
+
+        let mut stale = NodeState::new();
+        stale.last_frame_time = now.checked_sub(ESP32_OFFLINE_TIMEOUT + Duration::from_secs(1));
+
+        let mut node_states = HashMap::new();
+        node_states.insert(1, active);
+        node_states.insert(2, stale);
+
+        let nodes = topology_nodes_json(&EnvironmentConfig::default(), &node_states, now);
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["node_id"], serde_json::json!(1));
+        assert_eq!(nodes[0]["status"], serde_json::json!("active"));
+    }
+
+    #[test]
+    fn topology_readiness_accepts_one_live_node() {
+        let readiness = topology_readiness_json(1, 1);
+
+        assert_eq!(readiness["ready"], serde_json::json!(true));
+        assert_eq!(readiness["active_nodes"], serde_json::json!(1));
+        assert_eq!(readiness["min_nodes"], serde_json::json!(1));
+        assert_eq!(readiness["fusion_mode"], serde_json::json!("single_node"));
+    }
+
+    #[test]
+    fn module_requirements_remain_node_gated() {
+        assert_eq!(module_status(1, 1), "active");
+        assert_eq!(module_status(1, 2), "available");
+        assert_eq!(module_status(1, 3), "available");
+        assert_eq!(module_status(0, 1), "offline");
+    }
+}
+
+#[cfg(test)]
 mod node_sync_snapshot_serialization_tests {
     //! ADR-110 iter 24 — JSON public-API contract for the iter 23
     //! NodeSyncSnapshot field. Any future rename / removal here must be
@@ -7700,11 +8410,21 @@ mod node_sync_snapshot_serialization_tests {
         let v = serde_json::to_value(sample_node(Some(sample_sync()))).unwrap();
         let s = v.get("sync").expect("sync key must be present");
         // All eight contract fields named exactly as iter 23/34 documented.
-        for key in ["offset_us", "is_leader", "is_valid", "smoothed",
-                    "sequence", "csi_fps_ema", "csi_fps_samples",
-                    "staleness_ms"] {
-            assert!(s.get(key).is_some(),
-                    "sync object missing field `{}` — UI contract broken", key);
+        for key in [
+            "offset_us",
+            "is_leader",
+            "is_valid",
+            "smoothed",
+            "sequence",
+            "csi_fps_ema",
+            "csi_fps_samples",
+            "staleness_ms",
+        ] {
+            assert!(
+                s.get(key).is_some(),
+                "sync object missing field `{}` — UI contract broken",
+                key
+            );
         }
         // Spot-check values round-trip.
         assert_eq!(s["offset_us"], 1_163_565);
@@ -7719,8 +8439,11 @@ mod node_sync_snapshot_serialization_tests {
         // emit `"sync": null`. The non-mesh paths rely on this for
         // backwards compatibility with pre-iter-23 UI clients.
         let v = serde_json::to_value(sample_node(None)).unwrap();
-        assert!(v.get("sync").is_none(),
-                "expected `sync` key omitted when None, got {:?}", v.get("sync"));
+        assert!(
+            v.get("sync").is_none(),
+            "expected `sync` key omitted when None, got {:?}",
+            v.get("sync")
+        );
         // The base NodeInfo fields are still there.
         assert_eq!(v["node_id"], 9);
         assert_eq!(v["rssi_dbm"], -38.0);
@@ -7759,7 +8482,11 @@ mod sync_snapshot_helper_tests {
         SyncPacket {
             node_id,
             proto_ver: 1,
-            flags: SyncPacketFlags { is_leader: false, is_valid: true, smoothed_used: true },
+            flags: SyncPacketFlags {
+                is_leader: false,
+                is_valid: true,
+                smoothed_used: true,
+            },
             local_us: 28_798_450,
             epoch_us: 27_634_885,
             sequence: 20,
@@ -7783,8 +8510,10 @@ mod sync_snapshot_helper_tests {
         ns.csi_fps_ema = 10.5;
         ns.csi_fps_samples = 42;
 
-        let snap = ns.sync_snapshot().expect("populated state must produce a snapshot");
-        assert_eq!(snap.offset_us, 1_163_565);  // §A0.10 measured boot delta
+        let snap = ns
+            .sync_snapshot()
+            .expect("populated state must produce a snapshot");
+        assert_eq!(snap.offset_us, 1_163_565); // §A0.10 measured boot delta
         assert!(!snap.is_leader);
         assert!(snap.is_valid);
         assert!(snap.smoothed);
@@ -7830,8 +8559,8 @@ mod sync_snapshot_helper_tests {
         ns.apply_sync_packet(second, t1);
 
         let cur = ns.latest_sync.as_ref().unwrap();
-        assert_eq!(cur.sequence, 40);            // newer sequence persisted
-        assert_eq!(cur.local_us, 30_000_000);    // newer local persisted
+        assert_eq!(cur.sequence, 40); // newer sequence persisted
+        assert_eq!(cur.local_us, 30_000_000); // newer local persisted
         assert_eq!(ns.latest_sync_at, Some(t1)); // staleness clock reset
     }
 
@@ -7843,16 +8572,19 @@ mod sync_snapshot_helper_tests {
         // in a plausible window.
         let mut ns = NodeState::new();
         ns.latest_sync = Some(populated_sync(9));
-        ns.latest_sync_at = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(750));
+        ns.latest_sync_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(750));
 
         let snap = ns.sync_snapshot().unwrap();
         let st = snap.staleness_ms.expect("staleness_ms must be present");
         // Should be approximately 750 ms — give a generous ±500 ms tolerance
         // for any test-runner scheduling delay between checked_sub() and
         // elapsed() within sync_snapshot.
-        assert!(st >= 740 && st < 1250,
-                "expected ~750 ms staleness, got {} ms", st);
+        assert!(
+            st >= 740 && st < 1250,
+            "expected ~750 ms staleness, got {} ms",
+            st
+        );
     }
 
     #[test]
@@ -7862,8 +8594,13 @@ mod sync_snapshot_helper_tests {
         // Local fixture rather than reaching across test modules.
         fn snap(is_leader: bool) -> NodeSyncSnapshot {
             NodeSyncSnapshot {
-                offset_us: 0, is_leader, is_valid: true, smoothed: true,
-                sequence: 0, csi_fps_ema: 10.0, csi_fps_samples: 10,
+                offset_us: 0,
+                is_leader,
+                is_valid: true,
+                smoothed: true,
+                sequence: 0,
+                csi_fps_ema: 10.0,
+                csi_fps_samples: 10,
                 staleness_ms: Some(0),
             }
         }
@@ -7871,7 +8608,10 @@ mod sync_snapshot_helper_tests {
         let snaps = vec![(12u8, snap(true)), (9, snap(false)), (3, snap(false))];
         assert_eq!(super::fleet_role_counts(&snaps), (1, 2));
         // Edge: all leaders (election would prevent this but gauge math must hold).
-        assert_eq!(super::fleet_role_counts(&[(1u8, snap(true)), (2, snap(true))]), (2, 0));
+        assert_eq!(
+            super::fleet_role_counts(&[(1u8, snap(true)), (2, snap(true))]),
+            (2, 0)
+        );
     }
 
     #[test]
@@ -7897,18 +8637,24 @@ mod sync_snapshot_helper_tests {
 
         // Fresh: 1 s old → should return Some.
         ns.latest_sync_at = now.checked_sub(std::time::Duration::from_secs(1));
-        assert!(ns.mesh_aligned_us_for_csi_frame(20).is_some(),
-                "1 s old sync must produce a mesh-aligned timestamp");
+        assert!(
+            ns.mesh_aligned_us_for_csi_frame(20).is_some(),
+            "1 s old sync must produce a mesh-aligned timestamp"
+        );
 
         // Just inside the gate: 8 s old → should still return Some.
         ns.latest_sync_at = now.checked_sub(std::time::Duration::from_secs(8));
-        assert!(ns.mesh_aligned_us_for_csi_frame(20).is_some(),
-                "8 s old sync must still be inside the 9 s gate");
+        assert!(
+            ns.mesh_aligned_us_for_csi_frame(20).is_some(),
+            "8 s old sync must still be inside the 9 s gate"
+        );
 
         // Just outside the gate: 10 s old → must return None.
         ns.latest_sync_at = now.checked_sub(std::time::Duration::from_secs(10));
-        assert!(ns.mesh_aligned_us_for_csi_frame(20).is_none(),
-                "10 s old sync must trigger the 9 s staleness gate");
+        assert!(
+            ns.mesh_aligned_us_for_csi_frame(20).is_none(),
+            "10 s old sync must trigger the 9 s staleness gate"
+        );
     }
 
     #[test]
@@ -7916,15 +8662,19 @@ mod sync_snapshot_helper_tests {
         // Same data shape that /api/v1/mesh emits for a leader node.
         let mut ns = NodeState::new();
         let mut s = populated_sync(12);
-        s.flags = SyncPacketFlags { is_leader: true, is_valid: true, smoothed_used: false };
+        s.flags = SyncPacketFlags {
+            is_leader: true,
+            is_valid: true,
+            smoothed_used: false,
+        };
         s.local_us = 28_864_932;
-        s.epoch_us = 28_864_939;  // -7 µs delta on the leader
+        s.epoch_us = 28_864_939; // -7 µs delta on the leader
         ns.latest_sync = Some(s);
         ns.latest_sync_at = Some(std::time::Instant::now());
 
         let snap = ns.sync_snapshot().unwrap();
         assert!(snap.is_leader);
-        assert_eq!(snap.offset_us, -7);  // call-stack µs only
+        assert_eq!(snap.offset_us, -7); // call-stack µs only
         assert!(!snap.smoothed);
     }
 }
