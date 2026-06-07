@@ -6,9 +6,10 @@ echo "Starting RuvSense Console UI..."
 echo ""
 echo "Configuration:"
 echo "   - UI Server: http://localhost:3000"
-echo "   - Console: http://localhost:3000/index.html"
-echo "   - Observatory: http://localhost:3000/observatory.html"
-echo "   - Pose Fusion: http://localhost:3000/pose-fusion.html"
+echo "   - Accueil: http://localhost:3000/ui/index.html"
+echo "   - Console: http://localhost:3000/ui/console.html#fleet"
+echo "   - Observatory: http://localhost:3000/ui/observatory.html"
+echo "   - Pose Fusion: http://localhost:3000/ui/pose-fusion.html"
 echo "   - Start ruvsense-master separately for live data"
 echo ""
 
@@ -22,4 +23,5 @@ echo "Starting HTTP server on port 3000..."
 echo "Press Ctrl+C to stop"
 echo ""
 
+cd "$(dirname "$0")/.." || exit 1
 python -m http.server 3000

@@ -402,14 +402,17 @@ struct PersonDetection {
     id: u32,
     confidence: f64,
     keypoints: Vec<PoseKeypoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keypoints_m: Option<Vec<PoseKeypoint>>,
     bbox: BoundingBox,
     zone: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     position_m: Option<[f64; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     position: Option<[f64; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     position_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pose_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1431,6 +1434,8 @@ const DEFAULT_ENABLED_MODULES: &[&str] = &[
     "activity_classification",
 ];
 
+const MODULE_CONFIG_VERSION: u8 = 1;
+
 fn default_enabled_modules() -> Vec<String> {
     DEFAULT_ENABLED_MODULES.iter().map(|id| (*id).to_string()).collect()
 }
@@ -1521,6 +1526,8 @@ pub(crate) struct RuntimeConfig {
     pub dedup_factor: f64,
     #[serde(default)]
     pub environment: EnvironmentConfig,
+    #[serde(default)]
+    pub module_config_version: u8,
     #[serde(default = "default_enabled_modules")]
     pub enabled_modules: Vec<String>,
 }
@@ -1530,9 +1537,35 @@ impl Default for RuntimeConfig {
         Self {
             dedup_factor: default_dedup_factor(),
             environment: EnvironmentConfig::default(),
+            module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules: default_enabled_modules(),
         }
     }
+}
+
+fn normalize_runtime_config(mut config: RuntimeConfig) -> RuntimeConfig {
+    if config.module_config_version == 0 {
+        config.enabled_modules = default_enabled_modules();
+    }
+
+    let valid_module_ids: HashSet<String> = {
+        let empty = HashSet::new();
+        business_modules(0, &empty)
+            .into_iter()
+            .filter_map(|module| {
+                module
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+    config.enabled_modules.retain(|id| valid_module_ids.contains(id));
+    config.enabled_modules.sort();
+    config.enabled_modules.dedup();
+
+    config.module_config_version = MODULE_CONFIG_VERSION;
+    config
 }
 
 /// Load persisted runtime config from `<data_dir>/config.json`.
@@ -1540,7 +1573,7 @@ impl Default for RuntimeConfig {
 pub(crate) fn load_runtime_config(data_dir: &std::path::Path) -> RuntimeConfig {
     let path = data_dir.join("config.json");
     match std::fs::read_to_string(&path) {
-        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+        Ok(json) => normalize_runtime_config(serde_json::from_str(&json).unwrap_or_default()),
         Err(_) => RuntimeConfig::default(),
     }
 }
@@ -3177,15 +3210,15 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let mut tracked = tracker_bridge::tracker_update(
+        let persons = persons_for_update(
+            &update,
+            raw_persons,
             &mut s.pose_tracker,
             &mut last_tracker_instant,
-            raw_persons.clone(),
         );
-        carry_person_positions(&mut tracked, &raw_persons);
         s.last_tracker_instant = last_tracker_instant;
-        if !tracked.is_empty() {
-            update.persons = Some(tracked);
+        if !persons.is_empty() {
+            update.persons = Some(persons);
         }
 
         if let Ok(json) = serde_json::to_string(&update) {
@@ -3333,15 +3366,15 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
 
     let raw_persons = derive_pose_from_sensing(&update);
     let mut last_tracker_instant = s.last_tracker_instant.take();
-    let mut tracked = tracker_bridge::tracker_update(
+    let persons = persons_for_update(
+        &update,
+        raw_persons,
         &mut s.pose_tracker,
         &mut last_tracker_instant,
-        raw_persons.clone(),
     );
-    carry_person_positions(&mut tracked, &raw_persons);
     s.last_tracker_instant = last_tracker_instant;
-    if !tracked.is_empty() {
-        update.persons = Some(tracked);
+    if !persons.is_empty() {
+        update.persons = Some(persons);
     }
 
     if let Ok(json) = serde_json::to_string(&update) {
@@ -3551,18 +3584,11 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                         if let Ok(sensing) = serde_json::from_str::<SensingUpdate>(&json) {
                             if sensing.msg_type == "sensing_update" {
                                 // Determine pose estimation mode for the UI indicator.
-                                // "model_inference"    — a trained RVF model is loaded.
-                                // "signal_derived"     — keypoints estimated from raw CSI features.
+                                // model_metric/model_px/sensor_geometry/synthetic_dev.
                                 let model_loaded = {
                                     let s = state.read().await;
                                     s.model_loaded
                                 };
-                                let pose_source = if model_loaded {
-                                    "model_inference"
-                                } else {
-                                    "signal_derived"
-                                };
-
                                 let persons = if model_loaded {
                                     // When a trained model is loaded, prefer its keypoints if present.
                                     sensing.pose_keypoints.as_ref().map(|kps| {
@@ -3581,15 +3607,34 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                             .collect();
                                         let (position_m, position_source) =
                                             estimate_person_world_position(&sensing, 0, 1);
+                                        let model_pose_source =
+                                            if model_keypoints_are_metric(&keypoints) {
+                                                MODEL_METRIC_POSE_SOURCE
+                                            } else {
+                                                MODEL_PX_POSE_SOURCE
+                                            };
+                                        let keypoints_m =
+                                            if model_pose_source == MODEL_METRIC_POSE_SOURCE {
+                                                Some(keypoints.clone())
+                                            } else {
+                                                position_m.and_then(|position| {
+                                                    metric_keypoints_from_legacy(
+                                                        &keypoints,
+                                                        position,
+                                                    )
+                                                })
+                                            };
                                         vec![PersonDetection {
                                             id: 1,
                                             confidence: sensing.classification.confidence,
                                             bbox: BoundingBox { x: 260.0, y: 150.0, width: 120.0, height: 220.0 },
                                             keypoints,
+                                            keypoints_m,
                                             zone: "zone_1".into(),
-                                            position_m: Some(position_m),
-                                            position: Some(position_m),
+                                            position_m,
+                                            position: position_m,
                                             position_source: Some(position_source.to_string()),
+                                            pose_source: Some(model_pose_source.to_string()),
                                         }]
                                     }).unwrap_or_else(|| {
                                         // Prefer tracked persons from broadcast if available
@@ -3599,6 +3644,14 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                     // Prefer tracked persons from broadcast if available
                                     sensing.persons.clone().unwrap_or_else(|| derive_pose_from_sensing(&sensing))
                                 };
+                                let pose_source = persons
+                                    .first()
+                                    .and_then(|person| person.pose_source.as_deref())
+                                    .unwrap_or(if model_loaded {
+                                        MODEL_PX_POSE_SOURCE
+                                    } else {
+                                        SYNTHETIC_DEV_POSE_SOURCE
+                                    });
 
                                 let pose_msg = serde_json::json!({
                                     "type": "pose_data",
@@ -4103,9 +4156,11 @@ fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
 fn aggregate_person_count(
     activity_count: usize,
     node_states: &std::collections::HashMap<u8, NodeState>,
+    now: std::time::Instant,
 ) -> usize {
     let node_max = node_states
         .values()
+        .filter(|n| is_node_active(n, now))
         .map(|n| n.prev_person_count)
         .max()
         .unwrap_or(0);
@@ -4118,27 +4173,31 @@ mod aggregate_person_count_tests {
     //! count-aware per-node estimate back down to 1.
     use super::*;
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
-    fn node_with_count(c: usize) -> NodeState {
+    fn node_with_count(c: usize, last_frame_time: Option<Instant>) -> NodeState {
         let mut n = NodeState::new();
         n.prev_person_count = c;
+        n.last_frame_time = last_frame_time;
         n
     }
 
     #[test]
     fn empty_nodes_fall_back_to_activity_count() {
         let nodes: HashMap<u8, NodeState> = HashMap::new();
-        assert_eq!(aggregate_person_count(1, &nodes), 1);
-        assert_eq!(aggregate_person_count(0, &nodes), 0);
+        let now = Instant::now();
+        assert_eq!(aggregate_person_count(1, &nodes, now), 1);
+        assert_eq!(aggregate_person_count(0, &nodes, now), 0);
     }
 
     #[test]
     fn node_estimate_raises_a_saturated_activity_count() {
         // The activity score saturates at 1, but a node positively reports 2.
         let mut nodes = HashMap::new();
-        nodes.insert(1u8, node_with_count(2));
+        let now = Instant::now();
+        nodes.insert(1u8, node_with_count(2, Some(now)));
         assert_eq!(
-            aggregate_person_count(1, &nodes),
+            aggregate_person_count(1, &nodes, now),
             2,
             "a node reporting 2 must not be discarded by the activity count"
         );
@@ -4148,26 +4207,42 @@ mod aggregate_person_count_tests {
     fn activity_count_wins_when_higher_than_nodes() {
         // Never *lower* a confident activity-derived count to a stale node value.
         let mut nodes = HashMap::new();
-        nodes.insert(1u8, node_with_count(1));
-        assert_eq!(aggregate_person_count(3, &nodes), 3);
+        let now = Instant::now();
+        nodes.insert(1u8, node_with_count(1, Some(now)));
+        assert_eq!(aggregate_person_count(3, &nodes, now), 3);
     }
 
     #[test]
     fn takes_max_across_multiple_nodes() {
         let mut nodes = HashMap::new();
-        nodes.insert(1u8, node_with_count(1));
-        nodes.insert(2u8, node_with_count(3));
-        nodes.insert(3u8, node_with_count(2));
-        assert_eq!(aggregate_person_count(1, &nodes), 3);
+        let now = Instant::now();
+        nodes.insert(1u8, node_with_count(1, Some(now)));
+        nodes.insert(2u8, node_with_count(3, Some(now)));
+        nodes.insert(3u8, node_with_count(2, Some(now)));
+        assert_eq!(aggregate_person_count(1, &nodes, now), 3);
     }
 
     #[test]
     fn single_occupant_is_never_inflated() {
         // Regression guard: a lone occupant (every node sees 1) stays 1.
         let mut nodes = HashMap::new();
-        nodes.insert(1u8, node_with_count(1));
-        nodes.insert(2u8, node_with_count(1));
-        assert_eq!(aggregate_person_count(1, &nodes), 1);
+        let now = Instant::now();
+        nodes.insert(1u8, node_with_count(1, Some(now)));
+        nodes.insert(2u8, node_with_count(1, Some(now)));
+        assert_eq!(aggregate_person_count(1, &nodes, now), 1);
+    }
+
+    #[test]
+    fn stale_node_counts_do_not_raise_activity_count() {
+        let mut nodes = HashMap::new();
+        let now = Instant::now();
+        nodes.insert(1u8, node_with_count(1, Some(now)));
+        nodes.insert(
+            2u8,
+            node_with_count(3, now.checked_sub(ESP32_OFFLINE_TIMEOUT + Duration::from_secs(1))),
+        );
+
+        assert_eq!(aggregate_person_count(1, &nodes, now), 1);
     }
 }
 
@@ -4175,14 +4250,38 @@ mod aggregate_person_count_tests {
 ///
 /// `person_idx`: 0-based index of this person.
 /// `total_persons`: total number of detected persons (for spacing calculation).
+const UNLOCALIZED_POSITION_SOURCE: &str = "unlocalized";
+const SENSOR_GEOMETRY_POSE_SOURCE: &str = "sensor_geometry";
+const SYNTHETIC_DEV_POSE_SOURCE: &str = "synthetic_dev";
+const MODEL_METRIC_POSE_SOURCE: &str = "model_metric";
+const MODEL_PX_POSE_SOURCE: &str = "model_px";
+const HUMAN_HEIGHT_M: f64 = 1.70;
+const FOOT_CLEARANCE_M: f64 = 0.04;
+
+fn is_unlocalized_origin(position: &[f64; 3]) -> bool {
+    position.iter().all(|v| v.abs() < 1e-9)
+}
+
+fn is_localized_position(position: &[f64; 3]) -> bool {
+    position.iter().all(|v| v.is_finite()) && !is_unlocalized_origin(position)
+}
+
+fn is_synthetic_dev_source(source: &str) -> bool {
+    matches!(source, "simulated" | "simulate" | "synthetic")
+}
+
 fn estimate_person_world_position(
     update: &SensingUpdate,
     person_idx: usize,
     total_persons: usize,
-) -> ([f64; 3], &'static str) {
-    let nodes: Vec<&NodeInfo> = update.nodes.iter().filter(|node| node.position.iter().all(|v| v.is_finite())).collect();
+) -> (Option<[f64; 3]>, &'static str) {
+    let nodes: Vec<&NodeInfo> = update
+        .nodes
+        .iter()
+        .filter(|node| is_localized_position(&node.position))
+        .collect();
     if nodes.is_empty() {
-        return ([0.0, 0.9, 0.0], "fallback_origin");
+        return (None, UNLOCALIZED_POSITION_SOURCE);
     }
 
     let mut weight_sum = 0.0;
@@ -4222,7 +4321,109 @@ fn estimate_person_world_position(
         position[2] += 0.8;
     }
 
-    (position, "sensor_geometry")
+    let source = if is_synthetic_dev_source(&update.source) {
+        SYNTHETIC_DEV_POSE_SOURCE
+    } else {
+        SENSOR_GEOMETRY_POSE_SOURCE
+    };
+
+    (Some(position), source)
+}
+
+fn mean_keypoint_x(keypoints: &[PoseKeypoint], indexes: &[usize]) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for &idx in indexes {
+        if let Some(kp) = keypoints.get(idx) {
+            if kp.x.is_finite() {
+                sum += kp.x;
+                count += 1;
+            }
+        }
+    }
+    (count > 0).then_some(sum / count as f64)
+}
+
+fn metric_keypoints_from_legacy(
+    keypoints: &[PoseKeypoint],
+    position_m: [f64; 3],
+) -> Option<Vec<PoseKeypoint>> {
+    if keypoints.len() < 17 || !is_localized_position(&position_m) {
+        return None;
+    }
+
+    let min_y = keypoints
+        .iter()
+        .map(|kp| kp.y)
+        .filter(|v| v.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let max_y = keypoints
+        .iter()
+        .map(|kp| kp.y)
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let height_px = max_y - min_y;
+    if !height_px.is_finite() || height_px < 80.0 {
+        return None;
+    }
+
+    let hip_x = mean_keypoint_x(keypoints, &[11, 12])
+        .or_else(|| mean_keypoint_x(keypoints, &[5, 6]))
+        .unwrap_or_else(|| keypoints.iter().map(|kp| kp.x).sum::<f64>() / keypoints.len() as f64);
+    let center_z = keypoints.iter().map(|kp| kp.z).sum::<f64>() / keypoints.len() as f64;
+    let y_scale = (HUMAN_HEIGHT_M - FOOT_CLEARANCE_M) / height_px;
+
+    let keypoints_m: Vec<PoseKeypoint> = keypoints
+        .iter()
+        .map(|kp| PoseKeypoint {
+            name: kp.name.clone(),
+            x: position_m[0] + (kp.x - hip_x) * y_scale,
+            y: FOOT_CLEARANCE_M + (max_y - kp.y) * y_scale,
+            z: position_m[2] + (kp.z - center_z) * y_scale,
+            confidence: kp.confidence,
+        })
+        .collect();
+
+    let foot_y = keypoints_m
+        .get(15)
+        .zip(keypoints_m.get(16))
+        .map(|(l, r)| l.y.min(r.y))
+        .unwrap_or(f64::INFINITY);
+    let derived_height = keypoints_m
+        .iter()
+        .map(|kp| kp.y)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - foot_y;
+    if (1.45..=1.95).contains(&derived_height) && (0.0..=0.12).contains(&foot_y) {
+        Some(keypoints_m)
+    } else {
+        None
+    }
+}
+
+fn model_keypoints_are_metric(keypoints: &[PoseKeypoint]) -> bool {
+    if keypoints.len() < 17 {
+        return false;
+    }
+    let min_y = keypoints
+        .iter()
+        .map(|kp| kp.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = keypoints
+        .iter()
+        .map(|kp| kp.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let foot_y = keypoints
+        .get(15)
+        .zip(keypoints.get(16))
+        .map(|(l, r)| l.y.min(r.y))
+        .unwrap_or(f64::INFINITY);
+    let height = max_y - foot_y;
+
+    min_y.is_finite()
+        && max_y.is_finite()
+        && (1.2..=2.2).contains(&height)
+        && (0.0..=0.25).contains(&foot_y)
 }
 
 fn derive_single_person_pose(
@@ -4408,11 +4609,21 @@ fn derive_single_person_pose(
     let max_y = ys.iter().cloned().fold(f64::MIN, f64::max) + 10.0;
     let (position_m, position_source) =
         estimate_person_world_position(update, person_idx, total_persons);
+    let keypoints_m =
+        position_m.and_then(|position| metric_keypoints_from_legacy(&keypoints, position));
+    let pose_source = if keypoints_m.is_some() {
+        position_source
+    } else if is_synthetic_dev_source(&update.source) {
+        SYNTHETIC_DEV_POSE_SOURCE
+    } else {
+        position_source
+    };
 
     PersonDetection {
         id: (person_idx + 1) as u32,
         confidence: cls.confidence * conf_decay,
         keypoints,
+        keypoints_m,
         bbox: BoundingBox {
             x: min_x,
             y: min_y,
@@ -4420,9 +4631,10 @@ fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
-        position_m: Some(position_m),
-        position: Some(position_m),
+        position_m,
+        position: position_m,
         position_source: Some(position_source.to_string()),
+        pose_source: Some(pose_source.to_string()),
     }
 }
 
@@ -4440,23 +4652,225 @@ fn derive_pose_from_sensing(update: &SensingUpdate) -> Vec<PersonDetection> {
         .collect()
 }
 
+/// PersonDetection JSON and metric-pose contract tests.
+#[cfg(test)]
+mod person_detection_contract_tests {
+    use super::*;
+
+    fn node(node_id: u8, position: [f64; 3], rssi_dbm: f64) -> NodeInfo {
+        NodeInfo {
+            node_id,
+            rssi_dbm,
+            position,
+            amplitude: vec![],
+            subcarrier_count: 0,
+            sync: None,
+        }
+    }
+
+    fn sensing_update(source: &str, nodes: Vec<NodeInfo>) -> SensingUpdate {
+        SensingUpdate {
+            msg_type: "sensing_update".to_string(),
+            timestamp: 0.0,
+            source: source.to_string(),
+            tick: 7,
+            nodes,
+            features: FeatureInfo {
+                mean_rssi: -48.0,
+                variance: 2.0,
+                motion_band_power: 8.0,
+                breathing_band_power: 0.4,
+                dominant_freq_hz: 1.2,
+                change_points: 2,
+                spectral_power: 0.6,
+            },
+            classification: ClassificationInfo {
+                motion_level: "present_moving".to_string(),
+                presence: true,
+                confidence: 0.82,
+            },
+            signal_field: SignalField {
+                grid_size: [1, 1, 1],
+                values: vec![0.0],
+            },
+            vital_signs: None,
+            enhanced_motion: None,
+            enhanced_breathing: None,
+            posture: None,
+            signal_quality_score: None,
+            quality_verdict: None,
+            bssid_count: None,
+            pose_keypoints: None,
+            model_status: None,
+            persons: None,
+            estimated_persons: Some(1),
+            node_features: None,
+        }
+    }
+
+    #[test]
+    fn unlocalized_live_pose_serializes_position_m_as_null() {
+        let update = sensing_update("esp32", vec![node(1, [0.0, 0.0, 0.0], -52.0)]);
+        let person = derive_single_person_pose(&update, 0, 1);
+
+        assert_eq!(person.position_m, None);
+        assert_eq!(person.position, None);
+        assert_eq!(person.position_source.as_deref(), Some(UNLOCALIZED_POSITION_SOURCE));
+        assert!(person.keypoints_m.is_none());
+
+        let json = serde_json::to_value(&person).unwrap();
+        assert_eq!(json["position_m"], serde_json::Value::Null);
+        assert_eq!(json["position_source"], UNLOCALIZED_POSITION_SOURCE);
+        assert!(json.get("position").is_none());
+    }
+
+    #[test]
+    fn unlocalized_live_pose_does_not_feed_tracker_or_fan_out() {
+        let update = sensing_update("esp32", vec![node(1, [0.0, 0.0, 0.0], -52.0)]);
+        let mut tracker = PoseTracker::new();
+        let mut last_tracker_instant = None;
+
+        let first = persons_for_update(
+            &update,
+            derive_pose_from_sensing(&update),
+            &mut tracker,
+            &mut last_tracker_instant,
+        );
+        let second = persons_for_update(
+            &update,
+            derive_pose_from_sensing(&update),
+            &mut tracker,
+            &mut last_tracker_instant,
+        );
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].zone, "zone_1");
+        assert_eq!(
+            second[0].position_source.as_deref(),
+            Some(UNLOCALIZED_POSITION_SOURCE)
+        );
+        assert_eq!(
+            second[0].pose_source.as_deref(),
+            Some(UNLOCALIZED_POSITION_SOURCE)
+        );
+    }
+
+    #[test]
+    fn live_sensor_geometry_pose_emits_metric_keypoints() {
+        let update = sensing_update(
+            "esp32",
+            vec![
+                node(1, [-1.2, 0.7, -0.4], -47.0),
+                node(2, [1.4, 1.8, 0.6], -42.0),
+            ],
+        );
+        let person = derive_single_person_pose(&update, 0, 1);
+        let keypoints_m = person.keypoints_m.as_ref().expect("metric keypoints");
+
+        assert_eq!(keypoints_m.len(), person.keypoints.len());
+        assert_eq!(person.pose_source.as_deref(), Some(SENSOR_GEOMETRY_POSE_SOURCE));
+        assert!(person.position_m.is_some());
+
+        let foot_y = keypoints_m[15].y.min(keypoints_m[16].y);
+        let height = keypoints_m
+            .iter()
+            .map(|kp| kp.y)
+            .fold(f64::NEG_INFINITY, f64::max)
+            - foot_y;
+        assert!((0.0..=0.12).contains(&foot_y), "foot_y={foot_y}");
+        assert!((1.45..=1.95).contains(&height), "height={height}");
+    }
+
+    #[test]
+    fn explicit_simulated_pose_is_marked_synthetic_dev() {
+        let update = sensing_update("simulated", vec![node(1, [2.0, 0.0, 1.5], -45.0)]);
+        let person = derive_single_person_pose(&update, 0, 1);
+
+        assert_eq!(person.pose_source.as_deref(), Some(SYNTHETIC_DEV_POSE_SOURCE));
+        assert!(person.keypoints_m.is_some());
+    }
+}
+
 // ── RuVector Phase 2: Temporal EMA smoothing for keypoints ──────────────────
 
-/// Expected bone lengths in pixel-space for the COCO-17 skeleton as used by
-/// `derive_single_person_pose`. Pairs are (parent_idx, child_idx).
 fn carry_person_positions(tracked: &mut [PersonDetection], raw: &[PersonDetection]) {
     for (idx, person) in tracked.iter_mut().enumerate() {
-        if person.position_m.is_some() {
-            continue;
-        }
         if let Some(source) = raw.get(idx) {
-            person.position_m = source.position_m;
-            person.position = source.position;
-            person.position_source = source.position_source.clone();
+            if person.position_m.is_none() {
+                person.position_m = source.position_m;
+                person.position = source.position;
+                person.position_source = source.position_source.clone();
+            }
+            if person.keypoints_m.is_none() {
+                person.keypoints_m = source.keypoints_m.clone();
+            }
+            if person.pose_source.is_none() {
+                person.pose_source = source.pose_source.clone();
+            }
         }
     }
 }
 
+fn normalize_person_contract(person: &mut PersonDetection) {
+    if person.position_m.is_none() {
+        person.position = None;
+        person.keypoints_m = None;
+        if person
+            .position_source
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            person.position_source = Some(UNLOCALIZED_POSITION_SOURCE.to_string());
+        }
+        if person
+            .pose_source
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            person.pose_source = Some(UNLOCALIZED_POSITION_SOURCE.to_string());
+        }
+    }
+}
+
+fn persons_for_update(
+    update: &SensingUpdate,
+    raw_persons: Vec<PersonDetection>,
+    tracker: &mut PoseTracker,
+    last_tracker_instant: &mut Option<std::time::Instant>,
+) -> Vec<PersonDetection> {
+    if raw_persons.is_empty() {
+        let _ = tracker_bridge::tracker_update(tracker, last_tracker_instant, Vec::new());
+        return Vec::new();
+    }
+
+    let expected_count = update.estimated_persons.unwrap_or(raw_persons.len()).max(1);
+    let has_metric_position = raw_persons.iter().any(|person| person.position_m.is_some());
+
+    let mut persons = if has_metric_position || is_synthetic_dev_source(&update.source) {
+        let mut tracked =
+            tracker_bridge::tracker_update(tracker, last_tracker_instant, raw_persons.clone());
+        carry_person_positions(&mut tracked, &raw_persons);
+        tracked
+    } else {
+        raw_persons
+    };
+
+    for person in &mut persons {
+        normalize_person_contract(person);
+    }
+    if persons.len() > expected_count {
+        persons.truncate(expected_count);
+    }
+    persons
+}
+
+/// Expected bone lengths in pixel-space for the COCO-17 skeleton as used by
+/// `derive_single_person_pose`. Pairs are (parent_idx, child_idx).
 const POSE_BONE_PAIRS: &[(usize, usize)] = &[
     (5, 7),
     (7, 9),
@@ -5918,6 +6332,7 @@ async fn environment_update_endpoint(
         &RuntimeConfig {
             dedup_factor,
             environment: environment.clone(),
+            module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
     );
@@ -6218,6 +6633,7 @@ fn business_modules(active_nodes: usize, enabled_modules: &HashSet<String>) -> V
                 "capability_status": capability_status,
                 "confidence": module_confidence(active_nodes, *required_nodes),
                 "required_nodes": required_nodes,
+                "active_nodes": active_nodes,
                 "evidence_streams": streams,
                 "safety_note": safety_note,
             })
@@ -6296,6 +6712,7 @@ async fn module_enabled_update_endpoint(
         &RuntimeConfig {
             dedup_factor,
             environment,
+            module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
     );
@@ -6525,12 +6942,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                                 // #803: don't let the saturating activity score
                                 // discard count-aware per-node estimates.
                                 let count =
-                                    aggregate_person_count(s.person_count(), &s.node_states);
+                                    aggregate_person_count(s.person_count(), &s.node_states, now);
                                 s.prev_person_count = count;
                                 count.max(1) // presence=true => at least 1
                             }
                             None => {
-                                aggregate_person_count(fallback_count.unwrap_or(0), &s.node_states)
+                                aggregate_person_count(
+                                    fallback_count.unwrap_or(0),
+                                    &s.node_states,
+                                    now,
+                                )
                                     .max(1)
                             }
                         }
@@ -6562,7 +6983,9 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: configured_node_position(&environment, id),
+                            position: configured_node(&environment, id)
+                                .map(|cfg| cfg.position_m)
+                                .unwrap_or([0.0, 0.0, 0.0]),
                             amplitude: vec![],
                             subcarrier_count: 0,
                             // Vitals-only path; still expose the sync snapshot
@@ -6666,15 +7089,15 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let mut tracked = tracker_bridge::tracker_update(
+                    let persons = persons_for_update(
+                        &update,
+                        raw_persons,
                         &mut s.pose_tracker,
                         &mut last_tracker_instant,
-                        raw_persons.clone(),
                     );
-                    carry_person_positions(&mut tracked, &raw_persons);
                     s.last_tracker_instant = last_tracker_instant;
-                    if !tracked.is_empty() {
-                        update.persons = Some(tracked);
+                    if !persons.is_empty() {
+                        update.persons = Some(persons);
                     }
 
                     if let Ok(json) = serde_json::to_string(&update) {
@@ -6970,12 +7393,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                                 // #803: don't let the saturating activity score
                                 // discard count-aware per-node estimates.
                                 let count =
-                                    aggregate_person_count(s.person_count(), &s.node_states);
+                                    aggregate_person_count(s.person_count(), &s.node_states, now);
                                 s.prev_person_count = count;
                                 count.max(1)
                             }
                             None => {
-                                aggregate_person_count(fallback_count.unwrap_or(0), &s.node_states)
+                                aggregate_person_count(
+                                    fallback_count.unwrap_or(0),
+                                    &s.node_states,
+                                    now,
+                                )
                                     .max(1)
                             }
                         }
@@ -7007,7 +7434,9 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: configured_node_position(&environment, id),
+                            position: configured_node(&environment, id)
+                                .map(|cfg| cfg.position_m)
+                                .unwrap_or([0.0, 0.0, 0.0]),
                             amplitude: n
                                 .frame_history
                                 .back()
@@ -7059,15 +7488,15 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let mut tracked = tracker_bridge::tracker_update(
+                    let persons = persons_for_update(
+                        &update,
+                        raw_persons,
                         &mut s.pose_tracker,
                         &mut last_tracker_instant,
-                        raw_persons.clone(),
                     );
-                    carry_person_positions(&mut tracked, &raw_persons);
                     s.last_tracker_instant = last_tracker_instant;
-                    if !tracked.is_empty() {
-                        update.persons = Some(tracked);
+                    if !persons.is_empty() {
+                        update.persons = Some(persons);
                     }
 
                     if let Ok(json) = serde_json::to_string(&update) {
@@ -7221,15 +7650,15 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let mut tracked = tracker_bridge::tracker_update(
+        let persons = persons_for_update(
+            &update,
+            raw_persons,
             &mut s.pose_tracker,
             &mut last_tracker_instant,
-            raw_persons.clone(),
         );
-        carry_person_positions(&mut tracked, &raw_persons);
         s.last_tracker_instant = last_tracker_instant;
-        if !tracked.is_empty() {
-            update.persons = Some(tracked);
+        if !persons.is_empty() {
+            update.persons = Some(persons);
         }
 
         if update.classification.presence {
@@ -8618,8 +9047,9 @@ async fn main() {
 #[cfg(test)]
 mod topology_console_tests {
     use super::{
-        module_status, topology_nodes_json, topology_readiness_json, EnvironmentConfig, NodeState,
-        ESP32_OFFLINE_TIMEOUT,
+        business_modules, default_dedup_factor, default_enabled_modules, module_status,
+        normalize_runtime_config, topology_nodes_json, topology_readiness_json, EnvironmentConfig,
+        NodeState, RuntimeConfig, ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION,
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -8696,6 +9126,37 @@ mod topology_console_tests {
         assert_eq!(respiration["effective_status"], serde_json::json!("active"));
         assert_eq!(sleep["enabled"], serde_json::json!(false));
         assert_eq!(sleep["effective_status"], serde_json::json!("disabled"));
+    }
+
+    #[test]
+    fn legacy_module_config_migrates_to_v1_defaults() {
+        let legacy = RuntimeConfig {
+            dedup_factor: default_dedup_factor(),
+            environment: EnvironmentConfig::default(),
+            module_config_version: 0,
+            enabled_modules: business_modules(3, &std::collections::HashSet::new())
+                .into_iter()
+                .filter_map(|module| {
+                    module
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .collect(),
+        };
+        let migrated = normalize_runtime_config(legacy);
+        assert_eq!(migrated.module_config_version, MODULE_CONFIG_VERSION);
+
+        let enabled = migrated
+            .enabled_modules
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let defaults = default_enabled_modules()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(enabled, defaults);
     }
 }
 
@@ -9128,6 +9589,7 @@ async fn config_set_dedup_factor(
         &RuntimeConfig {
             dedup_factor: clamped,
             environment,
+            module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
     );
@@ -9178,6 +9640,7 @@ async fn config_set_ground_truth(
         &RuntimeConfig {
             dedup_factor: clamped,
             environment,
+            module_config_version: MODULE_CONFIG_VERSION,
             enabled_modules,
         },
     );

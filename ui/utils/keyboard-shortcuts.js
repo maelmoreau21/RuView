@@ -14,9 +14,10 @@ export class KeyboardShortcuts {
   registerDefaults() {
     this.register('?', 'Show keyboard shortcuts', () => this.toggleHelp());
     this.register('Escape', 'Close overlay / dialog', () => this.closeAll());
-    this.register('1', 'Open Console', () => this.openPage('index.html'));
-    this.register('2', 'Open Observatory', () => this.openPage('observatory.html'));
-    this.register('3', 'Open Pose Fusion', () => this.openPage('pose-fusion.html'));
+    this.register('1', 'Open Home', () => this.openPage('/ui/index.html'));
+    this.register('2', 'Open Console', () => this.openPage('/ui/console.html#fleet'));
+    this.register('3', 'Open Observatory', () => this.openPage('/ui/observatory.html'));
+    this.register('4', 'Open Pose Fusion', () => this.openPage('/ui/pose-fusion.html'));
     this.register('p', 'Toggle performance monitor', () => this.togglePerfMonitor());
     this.register('t', 'Toggle dark/light theme', () => this.toggleTheme());
   }

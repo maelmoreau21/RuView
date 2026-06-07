@@ -22,9 +22,10 @@ export class CommandPalette {
   registerCommands() {
     // Navigation commands
     const views = [
-      { label: 'Open Console', keywords: ['console', 'home', 'fleet'], icon: 'grid', href: 'index.html' },
-      { label: 'Open Observatory', keywords: ['observatory', '3d', 'signal'], icon: 'wifi', href: 'observatory.html' },
-      { label: 'Open Pose Fusion', keywords: ['pose', 'fusion', 'camera'], icon: 'external', href: 'pose-fusion.html' },
+      { label: 'Open Home', keywords: ['home', 'accueil', 'docs', 'guide'], icon: 'home', href: '/ui/index.html' },
+      { label: 'Open Console', keywords: ['console', 'fleet', 'live'], icon: 'grid', href: '/ui/console.html#fleet' },
+      { label: 'Open Observatory', keywords: ['observatory', '3d', 'signal'], icon: 'wifi', href: '/ui/observatory.html' },
+      { label: 'Open Pose Fusion', keywords: ['pose', 'fusion', 'camera'], icon: 'external', href: '/ui/pose-fusion.html' },
     ];
 
     views.forEach(view => {

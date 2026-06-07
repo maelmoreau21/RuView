@@ -1,14 +1,15 @@
 // RuvSense Console service worker - offline caching for the console shell
 // Strategy: Network-first for API calls, Cache-first for static assets
 
-const CACHE_NAME = 'ruvsense-console-v1';
+const CACHE_NAME = 'ruvsense-console-v2';
 const SHELL_ASSETS = [
   '/',
-  '/index.html',
-  '/style.css',
-  '/app.js',
-  '/observatory.html',
-  '/pose-fusion.html'
+  '/ui/index.html',
+  '/ui/console.html',
+  '/ui/style.css',
+  '/ui/app.js',
+  '/ui/observatory.html',
+  '/ui/pose-fusion.html'
 ];
 
 // Install - cache shell assets
@@ -76,7 +77,7 @@ async function cacheFirst(request) {
   } catch {
     // Return offline fallback for HTML navigation
     if (request.headers.get('Accept')?.includes('text/html')) {
-      const fallback = await caches.match('/index.html');
+      const fallback = await caches.match('/ui/index.html') || await caches.match('/');
       if (fallback) return fallback;
     }
     return new Response('Offline', { status: 503, statusText: 'Service Unavailable' });

@@ -93,7 +93,9 @@ class Observatory {
     this._environment = null;
     this._environmentNotice = null;
     this._sensorOrigin = [0, 0, 0];
-    this._sensorBounds = { width: 12, depth: 10 };
+    this._sensorBounds = { width: 12, height: 4, depth: 10 };
+    this._sensorTargetY = 1.2;
+    this._roomSize = { width: 12, height: 4, depth: 10 };
     this._cameraFramedToSensors = false;
     this._wsReconnectTimer = null;
     this._lastLiveAt = 0;
@@ -181,21 +183,16 @@ class Observatory {
   // ---- Room ----
 
   _buildRoom() {
-    this._grid = new THREE.GridHelper(12, 24, 0x1a4830, 0x0c2818);
-    this._grid.material.opacity = 0.5;
-    this._grid.material.transparent = true;
+    const { width, height, depth } = this._roomSize;
+
+    this._grid = this._createRoomGrid(width, depth);
     this._scene.add(this._grid);
 
-    const boxGeo = new THREE.BoxGeometry(12, 4, 10);
-    const edges = new THREE.EdgesGeometry(boxGeo);
-    this._roomWire = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
-      color: C.greenDim, opacity: 0.3, transparent: true,
-    }));
-    this._roomWire.position.y = 2;
+    this._roomWire = this._createRoomWire(width, height, depth);
     this._scene.add(this._roomWire);
 
     // Reflective floor
-    const floorGeo = new THREE.PlaneGeometry(12, 10);
+    const floorGeo = new THREE.PlaneGeometry(width, depth);
     this._floorMat = new THREE.MeshStandardMaterial({
       color: 0x101810,
       roughness: 1.0 - this.settings.reflect * 0.7,
@@ -203,11 +200,89 @@ class Observatory {
       emissive: 0x020404,
       emissiveIntensity: 0.08,
     });
-    const floor = new THREE.Mesh(floorGeo, this._floorMat);
-    floor.rotation.x = -Math.PI / 2;
-    floor.receiveShadow = true;
-    this._scene.add(floor);
+    this._floor = new THREE.Mesh(floorGeo, this._floorMat);
+    this._floor.rotation.x = -Math.PI / 2;
+    this._floor.receiveShadow = true;
+    this._scene.add(this._floor);
 
+  }
+
+  _roomDimensions(env) {
+    const dims = env?.room?.dimensions_m;
+    const width = Number(dims?.[0]);
+    const height = Number(dims?.[1]);
+    const depth = Number(dims?.[2]);
+    return {
+      width: Number.isFinite(width) && width > 0 ? width : this._roomSize.width,
+      height: Number.isFinite(height) && height > 0 ? height : this._roomSize.height,
+      depth: Number.isFinite(depth) && depth > 0 ? depth : this._roomSize.depth,
+    };
+  }
+
+  _createRoomGrid(width, depth) {
+    const divisions = Math.max(4, Math.min(80, Math.ceil(Math.max(width, depth) * 2)));
+    const vertices = [];
+    for (let i = 0; i <= divisions; i++) {
+      const x = -width / 2 + (width * i) / divisions;
+      const z = -depth / 2 + (depth * i) / divisions;
+      vertices.push(x, 0.01, -depth / 2, x, 0.01, depth / 2);
+      vertices.push(-width / 2, 0.01, z, width / 2, 0.01, z);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x0c2818,
+      opacity: 0.5,
+      transparent: true,
+      depthWrite: false,
+    });
+    return new THREE.LineSegments(geo, mat);
+  }
+
+  _createRoomWire(width, height, depth) {
+    const boxGeo = new THREE.BoxGeometry(width, height, depth);
+    const edges = new THREE.EdgesGeometry(boxGeo);
+    const wire = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
+      color: C.greenDim, opacity: 0.3, transparent: true,
+    }));
+    wire.position.y = height / 2;
+    return wire;
+  }
+
+  _disposeLine(line) {
+    if (!line) return;
+    line.geometry?.dispose();
+    if (Array.isArray(line.material)) {
+      line.material.forEach((mat) => mat.dispose());
+    } else {
+      line.material?.dispose();
+    }
+    this._scene.remove(line);
+  }
+
+  _syncRoomGeometry(env) {
+    const next = this._roomDimensions(env);
+    const same =
+      Math.abs(next.width - this._roomSize.width) < 1e-6 &&
+      Math.abs(next.height - this._roomSize.height) < 1e-6 &&
+      Math.abs(next.depth - this._roomSize.depth) < 1e-6;
+    if (same) return;
+
+    this._roomSize = next;
+    this._disposeLine(this._grid);
+    this._grid = this._createRoomGrid(next.width, next.depth);
+    this._grid.visible = this.settings.grid;
+    this._scene.add(this._grid);
+
+    this._disposeLine(this._roomWire);
+    this._roomWire = this._createRoomWire(next.width, next.height, next.depth);
+    this._roomWire.visible = this.settings.room;
+    this._scene.add(this._roomWire);
+
+    if (this._floor) {
+      this._floor.geometry.dispose();
+      this._floor.geometry = new THREE.PlaneGeometry(next.width, next.depth);
+    }
   }
 
   // ---- Topology devices ----
@@ -260,8 +335,9 @@ class Observatory {
       .then(r => r.ok ? r.json() : Promise.reject())
       .then(env => {
         this._environment = env;
+        this._syncRoomGeometry(env);
         this._recomputeSceneFrame(env, env.nodes || []);
-        this._frameCameraToSensors();
+        this._frameCameraToSensors(true);
         this._setEnvironmentNotice(false);
         this._syncTopology(this._currentData);
       })
@@ -311,24 +387,28 @@ class Observatory {
     }
   }
 
-  _rawPositionOf(entity) {
-    const pos = entity?.position_m || entity?.position || [0, 0, 0];
-    if (Array.isArray(pos)) {
-      return [
-        Number(pos[0]) || 0,
-        Number(pos[1]) || 0,
-        Number(pos[2]) || 0,
-      ];
+  _parseVector3(value) {
+    if (Array.isArray(value) && value.length >= 3) {
+      const parsed = [Number(value[0]), Number(value[1]), Number(value[2])];
+      return parsed.every(Number.isFinite) ? parsed : null;
     }
-    return [
-      Number(pos.x) || 0,
-      Number(pos.y) || 0,
-      Number(pos.z) || 0,
-    ];
+    if (value && typeof value === 'object') {
+      const parsed = [Number(value.x), Number(value.y), Number(value.z)];
+      return parsed.every(Number.isFinite) ? parsed : null;
+    }
+    return null;
   }
 
-  _positionOf(entity) {
-    const raw = this._rawPositionOf(entity);
+  _rawPositionOf(entity, { requirePositionM = false } = {}) {
+    const metric = this._parseVector3(entity?.position_m);
+    if (metric) return metric;
+    if (requirePositionM) return null;
+    return this._parseVector3(entity?.position);
+  }
+
+  _positionOf(entity, options = {}) {
+    const raw = this._rawPositionOf(entity, options);
+    if (!raw) return null;
     return [
       raw[0] - this._sensorOrigin[0],
       raw[1],
@@ -337,35 +417,51 @@ class Observatory {
   }
 
   _recomputeSceneFrame(env, nodes = []) {
+    const room = this._roomDimensions(env);
     const sourceNodes = nodes.length ? nodes : (env?.nodes || []);
-    const positions = sourceNodes
-      .map(node => this._rawPositionOf(node))
-      .filter(pos => pos.every(Number.isFinite));
-    if (!positions.length) return;
+    const sensors = [...(env?.access_points || []), ...sourceNodes];
+    const positions = sensors
+      .map(sensor => this._rawPositionOf(sensor))
+      .filter(Boolean);
+
+    if (!positions.length) {
+      this._sensorOrigin = [0, 0, 0];
+      this._sensorBounds = { width: room.width, height: room.height, depth: room.depth };
+      this._sensorTargetY = Math.min(Math.max(room.height * 0.5, 0.8), room.height);
+      return;
+    }
 
     const xs = positions.map(pos => pos[0]);
+    const ys = positions.map(pos => pos[1]);
     const zs = positions.map(pos => pos[2]);
     const minX = Math.min(...xs);
     const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
     const minZ = Math.min(...zs);
     const maxZ = Math.max(...zs);
+    const avgY = ys.reduce((sum, value) => sum + value, 0) / ys.length;
     this._sensorOrigin = [
       xs.reduce((sum, value) => sum + value, 0) / xs.length,
       0,
       zs.reduce((sum, value) => sum + value, 0) / zs.length,
     ];
     this._sensorBounds = {
-      width: Math.max(maxX - minX, Number(env?.room?.dimensions_m?.[0]) || 4, 2),
-      depth: Math.max(maxZ - minZ, Number(env?.room?.dimensions_m?.[2]) || 4, 2),
+      width: Math.max(maxX - minX, room.width, 2),
+      height: Math.max(maxY - minY, room.height, 1),
+      depth: Math.max(maxZ - minZ, room.depth, 2),
     };
+    this._sensorTargetY = Math.min(Math.max(avgY, 0.8), Math.max(room.height, 0.8));
   }
 
-  _frameCameraToSensors() {
-    if (this._cameraFramedToSensors) return;
+  _frameCameraToSensors(force = false) {
+    if (this._cameraFramedToSensors && !force) return;
     const span = Math.max(this._sensorBounds.width, this._sensorBounds.depth, 4);
-    const distance = Math.min(Math.max(span * 1.35, 6), 18);
-    this._camera.position.set(distance * 0.72, Math.max(4.2, span * 0.52), distance);
-    this._controls.target.set(0, 1.2, 0);
+    const distance = Math.min(Math.max(span * 1.35, 6), 50);
+    const targetY = this._sensorTargetY || 1.2;
+    const cameraY = targetY + Math.max(2.8, this._sensorBounds.height * 0.6, span * 0.35);
+    this._camera.position.set(distance * 0.72, cameraY, distance);
+    this._controls.target.set(0, targetY, 0);
     this._controls.maxDistance = Math.max(25, distance * 2.2);
     this._controls.update();
     this._cameraFramedToSensors = true;
@@ -374,14 +470,33 @@ class Observatory {
   _sceneFrameData(data) {
     if (!data) return data;
     const persons = (data.persons || []).map(person => {
-      const position = this._positionOf(person);
+      if (String(person?.position_source || '').toLowerCase() === 'unlocalized') return null;
+      const position = this._positionOf(person, { requirePositionM: true });
+      if (!position) return null;
+      const keypointsM = this._transformMetricKeypoints(person.keypoints_m);
       return {
         ...person,
         position,
         position_m: position,
+        ...(keypointsM ? { keypoints_m: keypointsM } : {}),
       };
-    });
+    }).filter(Boolean);
     return { ...data, persons };
+  }
+
+  _transformMetricKeypoints(source) {
+    if (!Array.isArray(source) || source.length < 17) return null;
+    const points = [];
+    for (const kp of source.slice(0, 17)) {
+      const raw = this._parseVector3(kp);
+      if (!raw) return null;
+      points.push([
+        raw[0] - this._sensorOrigin[0],
+        raw[1],
+        raw[2] - this._sensorOrigin[2],
+      ]);
+    }
+    return points;
   }
 
   _upsertDevice(key, kind, label, position, active) {
@@ -464,6 +579,7 @@ class Observatory {
 
     for (const ap of env.access_points || []) {
       const position = this._positionOf(ap);
+      if (!position) continue;
       const key = `ap:${ap.ap_id}`;
       visibleDevices.add(key);
       this._upsertDevice(key, 'ap', ap.label || ap.ap_id, position, ap.active !== false);
@@ -474,6 +590,7 @@ class Observatory {
       const status = String(node.health_status || node.status || (node.active === false ? 'offline' : 'live')).toLowerCase();
       const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(status);
       const position = this._positionOf(node);
+      if (!position) continue;
       const key = `node:${node.node_id}`;
       visibleDevices.add(key);
       this._upsertDevice(key, 'node', node.display_label || node.label || `C6-${node.node_id}`, position, active);
@@ -487,8 +604,11 @@ class Observatory {
       const nodeStatus = String(node.health_status || node.status || (node.active === false ? 'offline' : 'live')).toLowerCase();
       const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(nodeStatus);
       const key = link.link_id || `${link.ap_id}:c6-${link.node_id}`;
+      const from = this._positionOf(ap);
+      const to = this._positionOf(node);
+      if (!from || !to) continue;
       visibleLinks.add(key);
-      this._upsertLink(key, this._positionOf(ap), this._positionOf(node), active);
+      this._upsertLink(key, from, to, active);
     }
 
     for (const [key, entry] of this._deviceMeshes) {
@@ -785,13 +905,14 @@ class Observatory {
     // Autopilot orbit
     if (this._autopilot) {
       this._autoAngle += dt * this.settings.orbitSpeed;
-      const r = 10;
+      const r = Math.min(Math.max(Math.max(this._sensorBounds.width, this._sensorBounds.depth) * 1.2, 8), 36);
+      const targetY = this._sensorTargetY || 1.2;
       this._camera.position.set(
         Math.sin(this._autoAngle) * r,
-        4.5 + Math.sin(this._autoAngle * 0.5),
+        targetY + Math.max(2.4, this._sensorBounds.height * 0.5) + Math.sin(this._autoAngle * 0.5),
         Math.cos(this._autoAngle) * r
       );
-      this._controls.target.set(0, 1.2, 0);
+      this._controls.target.set(0, targetY, 0);
       this._controls.update();
     }
     this._controls.update();
@@ -820,13 +941,14 @@ class Observatory {
     }
 
     // Follow primary person
-    const pp = persons[0].position || [0, 0, 0];
-    const px = pp[0] || 0, pz = pp[2] || 0;
+    const pp = persons[0].position_m || persons[0].position;
+    if (!pp) return;
+    const px = pp[0], pz = pp[2];
     const ms = persons[0].motion_score || 0;
     const pose = persons[0].pose || 'standing';
     const isLying = pose === 'lying' || pose === 'fallen';
     const bodyH = isLying ? 0.4 : 1.7;
-    const bodyBaseY = isLying ? (pp[1] || 0) + 0.05 : 0.05;
+    const bodyBaseY = isLying ? pp[1] + 0.05 : Math.max(0.05, pp[1]);
     const spread = ms > 50 ? 0.6 : 0.4;
 
     for (let i = 0; i < this._mistCount; i++) {
@@ -877,11 +999,12 @@ class Observatory {
       if (this._trailTimer >= emitRate) {
         this._trailTimer = 0;
         for (const p of persons) {
-          const pp = p.position || [0, 0, 0];
+          const pp = p.position_m || p.position;
+          if (!pp) continue;
           const idx = this._trailHead;
-          pos.array[idx * 3] = (pp[0] || 0) + (Math.random() - 0.5) * 0.15;
-          pos.array[idx * 3 + 1] = Math.random() * 1.5 + 0.1;
-          pos.array[idx * 3 + 2] = (pp[2] || 0) + (Math.random() - 0.5) * 0.15;
+          pos.array[idx * 3] = pp[0] + (Math.random() - 0.5) * 0.15;
+          pos.array[idx * 3 + 1] = pp[1] + Math.random() * 1.5 + 0.1;
+          pos.array[idx * 3 + 2] = pp[2] + (Math.random() - 0.5) * 0.15;
           ages.array[idx] = 0;
           this._trailHead = (this._trailHead + 1) % this._trailCount;
         }

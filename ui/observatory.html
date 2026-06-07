@@ -16,27 +16,10 @@
     <div id="brand">
       <div id="brand-logo"><span class="pi">&pi;</span> RuvSense Edge</div>
       <div id="brand-tagline">RuvSense Console / WiFi CSI Fleet</div>
-    </div>
-
-    <!-- Top-left: Fleet readiness -->
-    <div id="panel-fleet" class="data-panel operational-panel">
-      <div class="panel-header">Fleet</div>
-      <div id="fleet-ready" class="fleet-readiness">Waiting for nodes</div>
-      <div class="fleet-kpis">
-        <div>
-          <span class="kpi-label">Active</span>
-          <span id="fleet-active" class="kpi-value">0</span>
-        </div>
-        <div>
-          <span class="kpi-label">Required</span>
-          <span id="fleet-min" class="kpi-value">3</span>
-        </div>
-        <div>
-          <span class="kpi-label">Source</span>
-          <span id="fleet-source" class="kpi-value">--</span>
-        </div>
-      </div>
-      <div id="fleet-list" class="fleet-list"></div>
+      <nav id="hud-nav" aria-label="Observatory navigation">
+        <a href="/ui/index.html" class="hud-nav-link">Accueil</a>
+        <a href="/ui/console.html#fleet" class="hud-nav-link">Console</a>
+      </nav>
     </div>
 
     <!-- Top-right: Connection + status + gear -->
@@ -49,69 +32,101 @@
       <button id="settings-btn" title="Settings">&#9881;</button>
     </div>
 
-    <!-- Left panel: Vital Signs -->
-    <div id="panel-vitals" class="data-panel">
-      <div class="panel-header">Vital Signs</div>
-      <div class="vital-row">
-        <div class="vital-icon">&#9825;</div>
-        <div class="vital-data">
-          <div class="vital-label">Heart Rate</div>
-          <div class="vital-value"><span id="hr-value">--</span> <span class="vital-unit">BPM</span></div>
-          <div class="vital-bar"><div id="hr-bar" class="vital-bar-fill vital-bar--hr"></div></div>
+    <div id="hud-panel-layout">
+      <div id="mobile-hud-tabs" role="tablist" aria-label="HUD panels">
+        <button class="mobile-hud-tab active" type="button" role="tab" aria-selected="true" data-panel="panel-fleet">Fleet</button>
+        <button class="mobile-hud-tab" type="button" role="tab" aria-selected="false" data-panel="panel-signal">Signal</button>
+        <button class="mobile-hud-tab" type="button" role="tab" aria-selected="false" data-panel="panel-vitals">Vitals</button>
+        <button class="mobile-hud-tab" type="button" role="tab" aria-selected="false" data-panel="panel-modules">Modules</button>
+      </div>
+
+      <!-- Desktop left stack / mobile tab panels: Fleet, Vitals, Modules -->
+      <div id="hud-stack-left" class="hud-stack hud-stack--left">
+        <div id="panel-fleet" class="data-panel operational-panel mobile-active">
+          <div class="panel-header">Fleet</div>
+          <div id="fleet-ready" class="fleet-readiness">Waiting for nodes</div>
+          <div class="fleet-kpis">
+            <div>
+              <span class="kpi-label">Active</span>
+              <span id="fleet-active" class="kpi-value">0</span>
+            </div>
+            <div>
+              <span class="kpi-label">Required</span>
+              <span id="fleet-min" class="kpi-value">3</span>
+            </div>
+            <div>
+              <span class="kpi-label">Source</span>
+              <span id="fleet-source" class="kpi-value">--</span>
+            </div>
+          </div>
+          <div id="fleet-list" class="fleet-list"></div>
+        </div>
+
+        <div id="panel-vitals" class="data-panel">
+          <div class="panel-header">Vital Signs</div>
+          <div class="vital-row">
+            <div class="vital-icon">&#9825;</div>
+            <div class="vital-data">
+              <div class="vital-label">Heart Rate</div>
+              <div class="vital-value"><span id="hr-value">--</span> <span class="vital-unit">BPM</span></div>
+              <div class="vital-bar"><div id="hr-bar" class="vital-bar-fill vital-bar--hr"></div></div>
+            </div>
+          </div>
+          <div class="vital-row">
+            <div class="vital-icon">&#9788;</div>
+            <div class="vital-data">
+              <div class="vital-label">Respiration</div>
+              <div class="vital-value"><span id="br-value">--</span> <span class="vital-unit">RPM</span></div>
+              <div class="vital-bar"><div id="br-bar" class="vital-bar-fill vital-bar--br"></div></div>
+            </div>
+          </div>
+          <div class="vital-row">
+            <div class="vital-icon">&#9878;</div>
+            <div class="vital-data">
+              <div class="vital-label">Confidence</div>
+              <div class="vital-value"><span id="conf-value">--</span><span class="vital-unit">%</span></div>
+              <div class="vital-bar"><div id="conf-bar" class="vital-bar-fill vital-bar--conf"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="panel-modules" class="data-panel operational-panel">
+          <div class="panel-header">Modules</div>
+          <div id="module-summary" class="module-summary">Catalog pending</div>
+          <div id="module-list" class="module-list"></div>
         </div>
       </div>
-      <div class="vital-row">
-        <div class="vital-icon">&#9788;</div>
-        <div class="vital-data">
-          <div class="vital-label">Respiration</div>
-          <div class="vital-value"><span id="br-value">--</span> <span class="vital-unit">RPM</span></div>
-          <div class="vital-bar"><div id="br-bar" class="vital-bar-fill vital-bar--br"></div></div>
+
+      <!-- Desktop right stack / mobile tab panel: WiFi Signal + Presence -->
+      <div id="hud-stack-right" class="hud-stack hud-stack--right">
+        <div id="panel-signal" class="data-panel">
+          <div class="panel-header">WiFi Signal</div>
+          <div class="signal-row">
+            <span class="signal-label">RSSI</span>
+            <span class="signal-value" id="rssi-value">-- dBm</span>
+          </div>
+          <div class="signal-row">
+            <span class="signal-label">Variance</span>
+            <span class="signal-value" id="var-value">--</span>
+          </div>
+          <div class="signal-row">
+            <span class="signal-label">Motion</span>
+            <span class="signal-value" id="motion-value">--</span>
+          </div>
+          <div class="signal-row">
+            <span class="signal-label">Persons</span>
+            <span class="signal-value" id="persons-value">0</span>
+            <span id="persons-dots" class="persons-dots"></span>
+          </div>
+          <canvas id="rssi-sparkline" width="200" height="48"></canvas>
+
+          <div class="panel-header" style="margin-top:12px">Presence</div>
+          <div id="presence-indicator" class="presence-state presence--absent">
+            <span id="presence-label">ABSENT</span>
+          </div>
+          <div id="fall-alert" class="fall-alert" style="display:none">FALL DETECTED</div>
         </div>
       </div>
-      <div class="vital-row">
-        <div class="vital-icon">&#9878;</div>
-        <div class="vital-data">
-          <div class="vital-label">Confidence</div>
-          <div class="vital-value"><span id="conf-value">--</span><span class="vital-unit">%</span></div>
-          <div class="vital-bar"><div id="conf-bar" class="vital-bar-fill vital-bar--conf"></div></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Right panel: Signal & Presence -->
-    <div id="panel-signal" class="data-panel">
-      <div class="panel-header">WiFi Signal</div>
-      <div class="signal-row">
-        <span class="signal-label">RSSI</span>
-        <span class="signal-value" id="rssi-value">-- dBm</span>
-      </div>
-      <div class="signal-row">
-        <span class="signal-label">Variance</span>
-        <span class="signal-value" id="var-value">--</span>
-      </div>
-      <div class="signal-row">
-        <span class="signal-label">Motion</span>
-        <span class="signal-value" id="motion-value">--</span>
-      </div>
-      <div class="signal-row">
-        <span class="signal-label">Persons</span>
-        <span class="signal-value" id="persons-value">0</span>
-        <span id="persons-dots" class="persons-dots"></span>
-      </div>
-      <canvas id="rssi-sparkline" width="200" height="48"></canvas>
-
-      <div class="panel-header" style="margin-top:12px">Presence</div>
-      <div id="presence-indicator" class="presence-state presence--absent">
-        <span id="presence-label">ABSENT</span>
-      </div>
-      <div id="fall-alert" class="fall-alert" style="display:none">FALL DETECTED</div>
-    </div>
-
-    <!-- Bottom-left: Business modules -->
-    <div id="panel-modules" class="data-panel operational-panel">
-      <div class="panel-header">Modules</div>
-      <div id="module-summary" class="module-summary">Catalog pending</div>
-      <div id="module-list" class="module-list"></div>
     </div>
 
     <!-- Edge module badges (populated dynamically by HudController) -->

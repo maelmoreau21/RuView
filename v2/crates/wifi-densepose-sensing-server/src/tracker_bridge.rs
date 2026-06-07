@@ -174,11 +174,13 @@ pub fn tracker_to_person_detections(tracker: &PoseTracker) -> Vec<PersonDetectio
                 id,
                 confidence,
                 keypoints,
+                keypoints_m: None,
                 bbox,
                 zone: "tracked".to_string(),
                 position_m: None,
                 position: None,
                 position_source: None,
+                pose_source: None,
             }
         })
         .collect()
@@ -325,6 +327,7 @@ mod tests {
             id,
             confidence: 0.8,
             keypoints,
+            keypoints_m: None,
             bbox: BoundingBox {
                 x: 0.0,
                 y: 0.0,
@@ -335,6 +338,7 @@ mod tests {
             position_m: None,
             position: None,
             position_source: None,
+            pose_source: None,
         }
     }
 

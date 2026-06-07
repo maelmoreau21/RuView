@@ -1,193 +1,331 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#07110f">
-  <meta name="description" content="RuvSense Edge live operator console for Raspberry Pi masters and ESP32-C6 nodes">
-  <title>RuvSense Console</title>
+  <meta name="description" content="Accueil opérateur RuvSense Edge pour master Raspberry Pi et nœuds ESP32-C6 live">
+  <title>RuvSense Edge - Accueil opérateur</title>
   <link rel="stylesheet" href="style.css">
   <link rel="manifest" href="manifest.json">
 </head>
-<body>
-  <a href="#main" class="skip-to-content">Skip to main content</a>
+<body class="home-page">
+  <a href="#main" class="skip-to-content">Aller au contenu principal</a>
 
-  <header class="topbar" aria-live="polite">
+  <header class="topbar home-topbar">
     <div class="brand-lockup">
       <span class="brand-mark" aria-hidden="true"></span>
       <div>
         <p>RuvSense Edge</p>
-        <h1>RuvSense Console</h1>
+        <h1>Accueil opérateur</h1>
       </div>
     </div>
-    <div class="status-grid">
-      <div class="status-cell status-master" id="master-status"><span></span><strong>offline</strong><small>master</small></div>
-      <div class="status-cell"><strong id="active-nodes">0</strong><small>nodes live</small></div>
-      <div class="status-cell"><strong id="enabled-modules">0</strong><small>modules on</small></div>
-      <div class="status-cell"><strong id="fusion-mode">offline</strong><small>fusion</small></div>
-      <div class="status-cell"><strong id="source-mode">offline</strong><small>source</small></div>
-      <div class="status-cell"><strong id="scan-interface">wlan0</strong><small>scan</small></div>
-    </div>
+    <nav class="global-nav" aria-label="Navigation globale">
+      <a class="is-active" href="/ui/index.html">Accueil</a>
+      <a href="/ui/console.html#fleet">Console live</a>
+      <a href="/ui/observatory.html">Environnement 3D</a>
+      <a href="/ui/pose-fusion.html">Pose Fusion</a>
+      <a href="#diagnostics-api">Diagnostics/API</a>
+    </nav>
   </header>
 
-  <main id="main" class="console-shell">
-    <nav class="console-rail" aria-label="Console views">
-      <button class="rail-button is-active" type="button" data-panel="fleet" title="Fleet">Fleet</button>
-      <a class="rail-button" href="/ui/observatory.html" title="Environment 3D">3D</a>
-      <button class="rail-button" type="button" data-panel="modules" title="Modules">Modules</button>
-      <button class="rail-button" type="button" data-panel="vitals" title="Vital signs">Vitals</button>
-      <button class="rail-button" type="button" data-panel="calibration" title="Calibration">Cal</button>
-      <button class="rail-button" type="button" data-panel="diagnostics" title="Diagnostics">Diag</button>
-    </nav>
-
-    <section class="topology-pane" aria-labelledby="topology-title">
-      <div class="section-head">
-        <div>
-          <p class="eyebrow">Live topology</p>
-          <h2 id="topology-title">Materiel detecte</h2>
-        </div>
-        <div class="inline-metrics">
-          <span id="room-size">--</span>
-          <span id="readiness-label">not ready</span>
-          <span id="frame-rate">0.0 Hz</span>
-        </div>
+  <main id="main" class="home-shell">
+    <section class="home-intro" aria-labelledby="home-title">
+      <div>
+        <p class="eyebrow">Raspberry Pi master + ESP32-C6</p>
+        <h2 id="home-title">Guide opérateur live-only</h2>
+        <p class="home-lead">
+          Cette page sert de point d’entrée terrain pour installer, vérifier et exploiter RuvSense Edge.
+          En production, l’état reste fermé si le master ou les nœuds live ne répondent pas.
+        </p>
       </div>
-
-      <div id="topology-stage" class="topology-stage" aria-label="Detected AP and ESP32-C6 node topology"></div>
-
-      <div class="topology-legend">
-        <span><i class="legend-dot legend-node"></i>ESP32-C6</span>
-        <span><i class="legend-line"></i>Lien estime</span>
-        <span><i class="legend-hint"></i>Position estimee</span>
+      <div class="operator-actions" aria-label="Accès rapides">
+        <a class="primary-link" href="/ui/console.html#fleet">Ouvrir la console live</a>
+        <a href="/ui/observatory.html">Voir l’environnement 3D</a>
       </div>
     </section>
 
-    <aside class="side-panel" aria-label="Console details">
-      <div class="panel-tabs">
-        <button class="is-active" type="button" data-panel="fleet">Fleet</button>
-        <a href="/ui/observatory.html">3D</a>
-        <button type="button" data-panel="modules">Modules</button>
-        <button type="button" data-panel="vitals">Vitals</button>
-        <button type="button" data-panel="calibration">Calibration</button>
-        <button type="button" data-panel="diagnostics">Diagnostics</button>
-      </div>
-
-      <section class="panel-view is-active" data-view="fleet">
-        <div class="section-head compact">
-          <div>
-            <p class="eyebrow">Raspberry Pi 4</p>
-            <h2>Fleet live</h2>
-          </div>
-          <span id="fleet-summary" class="badge">0 live</span>
-        </div>
-        <div class="split-list">
-          <section>
-            <h3>Noeuds ESP32-C6</h3>
-            <div id="node-list" class="dense-list"></div>
-          </section>
-        </div>
-      </section>
-
-      <section class="panel-view" data-view="modules">
-        <div class="section-head compact">
-          <div>
-            <p class="eyebrow">Capabilities</p>
-            <h2>Modules</h2>
-          </div>
-          <span id="module-summary" class="badge">0 active</span>
-        </div>
-        <div class="filter-row">
-          <input id="module-filter" type="search" placeholder="Filter modules" autocomplete="off">
-          <select id="module-category" aria-label="Module category"></select>
-        </div>
-        <div class="table-wrap">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Module</th>
-                <th>Enabled</th>
-                <th>Nodes</th>
-                <th>Status</th>
-                <th>Confidence</th>
-              </tr>
-            </thead>
-            <tbody id="module-table"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="panel-view" data-view="vitals">
-        <div class="section-head compact">
-          <div>
-            <p class="eyebrow">CSI-grade</p>
-            <h2>Signes vitaux</h2>
-          </div>
-          <span id="vitals-status" class="badge">waiting</span>
-        </div>
-        <dl class="metric-list">
-          <div><dt>Presence</dt><dd id="presence-state">unknown</dd></div>
-          <div><dt>Personnes</dt><dd id="person-count">0</dd></div>
-          <div><dt>Mouvement</dt><dd id="motion-level">unknown</dd></div>
-          <div><dt>Respiration</dt><dd id="breathing-rate">--</dd></div>
-          <div><dt>Coeur</dt><dd id="heart-rate">--</dd></div>
-          <div><dt>Qualite signal</dt><dd id="signal-quality">--</dd></div>
-        </dl>
-      </section>
-
-      <section class="panel-view" data-view="calibration">
-        <div class="section-head compact">
-          <div>
-            <p class="eyebrow">Field model</p>
-            <h2>Calibration piece vide</h2>
-          </div>
-          <span id="calibration-status" class="badge">unknown</span>
-        </div>
-        <div class="action-row">
-          <button id="start-calibration" class="primary" type="button">Start</button>
-          <button id="stop-calibration" type="button">Stop</button>
-        </div>
-        <div class="table-wrap">
-          <table class="data-table">
-            <tbody id="calibration-table"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="panel-view" data-view="diagnostics">
-        <div class="section-head compact">
-          <div>
-            <p class="eyebrow">Runtime</p>
-            <h2>Diagnostics</h2>
-          </div>
-          <span id="diagnostics-status" class="badge">live</span>
-        </div>
-        <div class="split-list">
-          <section>
-            <h3>AP scan</h3>
-            <div id="ap-list" class="dense-list"></div>
-          </section>
-        </div>
-        <div class="advanced-links" aria-label="Advanced diagnostic views">
-          <a href="/ui/observatory.html">Observatory 3D</a>
-          <a href="/ui/pose-fusion.html">Pose Fusion</a>
-          <a href="/metrics">Metrics</a>
-          <a href="/api/v1/topology">Topology JSON</a>
-        </div>
-      </section>
-    </aside>
-
-    <section class="bottom-log" aria-labelledby="log-title">
+    <section class="live-band" aria-labelledby="live-title" aria-live="polite">
       <div class="section-head compact">
         <div>
-          <p class="eyebrow">Events</p>
-          <h2 id="log-title">Console log</h2>
+          <p class="eyebrow">État master</p>
+          <h2 id="live-title">Bandeau live</h2>
         </div>
-        <button id="clear-log" type="button">Clear</button>
+        <span id="live-updated" class="badge">Mise à jour en attente</span>
       </div>
-      <ol id="event-log" class="event-log"></ol>
+
+      <div class="endpoint-strip" aria-label="Endpoints interrogés">
+        <span class="endpoint-chip is-unknown" data-endpoint="/health/ready">/health/ready</span>
+        <span class="endpoint-chip is-unknown" data-endpoint="/api/v1/nodes">/api/v1/nodes</span>
+        <span class="endpoint-chip is-unknown" data-endpoint="/api/v1/topology">/api/v1/topology</span>
+        <span class="endpoint-chip is-unknown" data-endpoint="/api/v1/modules">/api/v1/modules</span>
+      </div>
+
+      <div class="live-grid">
+        <article id="live-readiness-card" class="live-card is-unknown">
+          <span>Readiness</span>
+          <strong id="live-readiness">Inconnue</strong>
+          <small id="live-readiness-detail">Le master n’a pas encore répondu.</small>
+        </article>
+        <article id="live-nodes-card" class="live-card is-unknown">
+          <span>Nœuds</span>
+          <strong id="live-nodes">0/1</strong>
+          <small id="live-nodes-detail">Aucun nœud live confirmé.</small>
+        </article>
+        <article id="live-geometry-card" class="live-card is-unknown">
+          <span>Géométrie</span>
+          <strong id="live-geometry">Non évaluée</strong>
+          <small id="live-geometry-detail">3+ nœuds donnent une meilleure géométrie multistatique.</small>
+        </article>
+        <article id="live-modules-card" class="live-card is-unknown">
+          <span>Modules</span>
+          <strong id="live-modules">0 actifs</strong>
+          <small id="live-modules-detail">Catalogue module indisponible.</small>
+        </article>
+      </div>
+    </section>
+
+    <section id="comment-ca-marche" class="operator-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Vue d’ensemble</p>
+          <h2>Comment ça marche</h2>
+        </div>
+      </div>
+      <div class="doc-grid">
+        <article class="doc-card">
+          <h3>Master</h3>
+          <p>Le Raspberry Pi exécute `ruvsense-master`, reçoit les trames CSI UDP et publie les API HTTP/WS.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Nœuds</h3>
+          <p>Les ESP32-C6 envoient du CSI live. Un nœud actif suffit au quorum V1, puis 3+ nœuds améliorent la fusion.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Modules</h3>
+          <p>Les modules restent limités par le nombre de nœuds et leur statut live. Aucun matériel absent n’est simulé.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="placement" class="operator-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Guide placement V1</p>
+          <h2>Placement recommandé</h2>
+        </div>
+      </div>
+      <div class="doc-grid placement-grid">
+        <article class="doc-card">
+          <h3>Quorum</h3>
+          <p>Prévoir au minimum 1 nœud ESP32-C6 live. Pour la meilleure géométrie, installer 3 nœuds ou plus.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Disposition</h3>
+          <p>Placer les nœuds autour de la zone à observer, en évitant de les aligner sur un seul mur ou une seule ligne.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Coordonnées</h3>
+          <p>Mesurer les positions en mètres et les saisir dans `position_m`. Les hauteurs différentes sont autorisées.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="demarrage" class="operator-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Mise en route</p>
+          <h2>Démarrage</h2>
+        </div>
+      </div>
+      <ol class="step-list">
+        <li>Démarrer le master sur Raspberry Pi avec la configuration production et les ports HTTP/WS/UDP prévus.</li>
+        <li>Provisionner chaque ESP32-C6 avec le SSID, le mot de passe WiFi et l’adresse IP cible du master.</li>
+        <li>Ouvrir la <a href="/ui/console.html#fleet">Console live</a> et attendre que le quorum de nœuds actifs soit atteint.</li>
+        <li>Renseigner les positions mesurées en mètres pour stabiliser la topologie et la fusion.</li>
+      </ol>
+    </section>
+
+    <section id="calibration" class="operator-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Pièce vide</p>
+          <h2>Calibration</h2>
+        </div>
+      </div>
+      <div class="doc-grid">
+        <article class="doc-card">
+          <h3>Avant</h3>
+          <p>Vider la zone, vérifier que le master est prêt et que les nœuds attendus sont live.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Pendant</h3>
+          <p>Lancer la calibration depuis la console, laisser la pièce stable, puis arrêter quand le modèle est collecté.</p>
+        </article>
+        <article class="doc-card">
+          <h3>Après</h3>
+          <p>Recalibrer après déplacement de nœuds, changement de mobilier important ou dérive de cohérence persistante.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="depannage" class="operator-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Terrain</p>
+          <h2>Dépannage</h2>
+        </div>
+      </div>
+      <div class="troubleshoot-list">
+        <article>
+          <strong>Readiness `not_ready`</strong>
+          <span>Contrôler le quorum `RUVSENSE_MIN_NODES`, l’UDP 5005, l’adresse cible et l’alimentation des nœuds.</span>
+        </article>
+        <article>
+          <strong>Nœud `stale` ou `sync_only`</strong>
+          <span>Vérifier le firmware CSI, le port série au besoin, puis confirmer que les trames CSI arrivent au master.</span>
+        </article>
+        <article>
+          <strong>Module indisponible</strong>
+          <span>Comparer le nombre de nœuds actifs avec `required_nodes`; certains modules attendent 2 ou 3+ nœuds.</span>
+        </article>
+        <article>
+          <strong>Topologie imprécise</strong>
+          <span>Mesurer les coordonnées, saisir `position_m` et éviter les nœuds colinéaires autour de la zone.</span>
+        </article>
+      </div>
+    </section>
+
+    <section id="diagnostics-api" class="operator-section api-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Liens directs</p>
+          <h2>Diagnostics/API</h2>
+        </div>
+      </div>
+      <div class="advanced-links" aria-label="Diagnostics et API">
+        <a href="/ui/console.html#diagnostics">Panneau diagnostics</a>
+        <a href="/health/ready">Health ready</a>
+        <a href="/api/v1/nodes">Nodes JSON</a>
+        <a href="/api/v1/topology">Topology JSON</a>
+        <a href="/api/v1/modules">Modules JSON</a>
+        <a href="/metrics">Metrics</a>
+      </div>
     </section>
   </main>
 
-  <script type="module" src="app.js"></script>
+  <script type="module">
+    const endpointPaths = ['/health/ready', '/api/v1/nodes', '/api/v1/topology', '/api/v1/modules'];
+    const endpointEls = new Map([...document.querySelectorAll('[data-endpoint]')].map((el) => [el.dataset.endpoint, el]));
+
+    function setText(id, value) {
+      const node = document.getElementById(id);
+      if (node) node.textContent = value;
+    }
+
+    function firstValue(...values) {
+      return values.find((value) => value !== undefined && value !== null && value !== '');
+    }
+
+    function numberValue(...values) {
+      const n = Number(firstValue(...values));
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function setCardState(id, state) {
+      const card = document.getElementById(id);
+      if (!card) return;
+      card.classList.remove('is-ready', 'is-warning', 'is-error', 'is-unknown');
+      card.classList.add(`is-${state}`);
+    }
+
+    async function fetchEndpoint(path) {
+      const started = performance.now();
+      try {
+        const response = await fetch(path, { cache: 'no-store' });
+        const raw = await response.text();
+        let data = null;
+        if (raw.trim().startsWith('{') || raw.trim().startsWith('[')) {
+          data = JSON.parse(raw);
+        }
+        return { path, status: response.status, ok: response.ok, data, ms: performance.now() - started };
+      } catch (error) {
+        return { path, status: 0, ok: false, error: error.message, ms: performance.now() - started };
+      }
+    }
+
+    function endpointState(result) {
+      if (!result || result.status === 0) return 'error';
+      if (!result.ok) {
+        if (result.path === '/health/ready' && result.status === 503 && result.data?.status === 'not_ready') return 'warning';
+        return 'error';
+      }
+      if (result.path === '/health/ready' && result.data?.status !== 'ready') return 'warning';
+      return 'ready';
+    }
+
+    function updateEndpointChip(result) {
+      const chip = endpointEls.get(result.path);
+      if (!chip) return;
+      const state = endpointState(result);
+      chip.classList.remove('is-ready', 'is-warning', 'is-error', 'is-unknown');
+      chip.classList.add(`is-${state}`);
+      const suffix = result.status ? `HTTP ${result.status}` : 'inaccessible';
+      chip.title = result.error ? `${suffix}: ${result.error}` : `${suffix}, ${Math.round(result.ms)} ms`;
+    }
+
+    function roomLabel(topology) {
+      const dims = topology?.room?.dimensions_m;
+      if (!Array.isArray(dims) || dims.length < 3) return 'Pièce non déclarée';
+      return `${Number(dims[0]).toFixed(1)} x ${Number(dims[1]).toFixed(1)} x ${Number(dims[2]).toFixed(1)} m`;
+    }
+
+    function renderLive(results) {
+      const byPath = Object.fromEntries(results.map((result) => [result.path, result]));
+      const health = byPath['/health/ready'];
+      const nodes = byPath['/api/v1/nodes']?.data || {};
+      const topology = byPath['/api/v1/topology']?.data || {};
+      const modules = byPath['/api/v1/modules']?.data || {};
+      const moduleList = Array.isArray(modules.modules) ? modules.modules : [];
+      const ready = health?.data?.status === 'ready' || nodes.ready === true || topology.readiness?.ready === true;
+      const masterReachable = Boolean(health?.data && (health.ok || health.status === 503));
+      const active = numberValue(health?.data?.active_nodes, nodes.active, topology.readiness?.active_nodes, 0);
+      const minNodes = Math.max(1, numberValue(health?.data?.min_nodes, nodes.min_nodes, topology.readiness?.min_nodes, 1));
+      const totalNodes = numberValue(nodes.total, Array.isArray(topology.nodes) ? topology.nodes.length : 0);
+      const source = firstValue(health?.data?.source, topology.source, 'source inconnue');
+      const enabledModules = moduleList.length
+        ? moduleList.filter((mod) => mod.enabled !== false).length
+        : (Array.isArray(modules.enabled_modules) ? modules.enabled_modules.length : 0);
+      const activeModules = moduleList.filter((mod) => ['active', 'live'].includes(String(mod.effective_status || mod.status))).length;
+      const apCount = Array.isArray(topology.access_points) ? topology.access_points.length : 0;
+
+      setText('live-readiness', ready ? 'Prêt' : masterReachable ? 'Non prêt' : 'Inaccessible');
+      setText('live-readiness-detail', `${source} · quorum ${active}/${minNodes}`);
+      setCardState('live-readiness-card', ready ? 'ready' : active > 0 ? 'warning' : 'error');
+
+      setText('live-nodes', `${active}/${minNodes}`);
+      setText('live-nodes-detail', `${totalNodes} nœud(s) connus côté master`);
+      setCardState('live-nodes-card', ready ? 'ready' : active > 0 ? 'warning' : 'error');
+
+      const geometryState = active >= 3 ? 'ready' : active >= 1 ? 'warning' : 'error';
+      setText('live-geometry', active >= 3 ? '3+ nœuds' : active >= 1 ? 'V1 minimal' : 'Absente');
+      setText('live-geometry-detail', `${roomLabel(topology)} · ${apCount} AP visible(s)`);
+      setCardState('live-geometry-card', geometryState);
+
+      setText('live-modules', `${activeModules} actifs`);
+      setText('live-modules-detail', `${enabledModules}/${moduleList.length || enabledModules} modules activés`);
+      setCardState('live-modules-card', activeModules > 0 ? 'ready' : enabledModules > 0 ? 'warning' : 'error');
+      setText('live-updated', `Mis à jour ${new Date().toLocaleTimeString()}`);
+    }
+
+    async function refreshLive() {
+      const results = await Promise.all(endpointPaths.map(fetchEndpoint));
+      for (const result of results) updateEndpointChip(result);
+      renderLive(results);
+    }
+
+    refreshLive();
+    window.setInterval(refreshLive, 5000);
+  </script>
 </body>
 </html>

@@ -261,26 +261,31 @@ export class FigurePool {
   // ---- Per-frame update ----
 
   _personPosition(person) {
-    const pos = person?.position_m || person?.position || [0, 0, 0];
-    if (Array.isArray(pos)) {
-      return [Number(pos[0]) || 0, Number(pos[1]) || 0, Number(pos[2]) || 0];
+    const pos = person?.position_m || person?.position;
+    let parsed = null;
+    if (Array.isArray(pos) && pos.length >= 3) {
+      parsed = [Number(pos[0]), Number(pos[1]), Number(pos[2])];
+    } else if (pos && typeof pos === 'object') {
+      parsed = [Number(pos.x), Number(pos.y), Number(pos.z)];
     }
-    return [Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0];
+    return parsed?.every(Number.isFinite) ? parsed : null;
   }
 
   _liveKeypoints(person, position) {
-    const source = person?.keypoints_m || person?.keypoints;
+    const hasMetricKeypoints = Array.isArray(person?.keypoints_m);
+    const source = hasMetricKeypoints ? person.keypoints_m : person?.keypoints;
     if (!Array.isArray(source) || source.length < 17) return null;
 
     const values = source.slice(0, 17).map((kp) => {
       if (Array.isArray(kp)) {
-        return [Number(kp[0]) || 0, Number(kp[1]) || 0, Number(kp[2]) || 0];
+        return [Number(kp[0]), Number(kp[1]), Number(kp[2] ?? 0)];
       }
-      return [Number(kp.x) || 0, Number(kp.y) || 0, Number(kp.z) || 0];
+      return [Number(kp.x), Number(kp.y), Number(kp.z ?? 0)];
     });
+    if (!values.every((kp) => kp.every(Number.isFinite))) return null;
 
     const looksLikePixels = values.some(([x, y]) => Math.abs(x) > 12 || Math.abs(y) > 12);
-    if (!looksLikePixels || person?.keypoints_m) return values;
+    if (!looksLikePixels || hasMetricKeypoints) return values;
 
     const anchor = [5, 6, 11, 12]
       .map((idx) => values[idx])
@@ -314,6 +319,13 @@ export class FigurePool {
       if (f < persons.length && isPresent) {
         const p = persons[f];
         const position = this._personPosition(p);
+        if (!position) {
+          if (fig.visible) {
+            this.hide(fig);
+            fig.visible = false;
+          }
+          continue;
+        }
         const kps = this._liveKeypoints(p, position)
           || this._poseSystem.generateKeypoints({ ...p, position }, elapsed, breathPulse);
         this.applyKeypoints(fig, kps, breathPulse, position, elapsed, p.pose);

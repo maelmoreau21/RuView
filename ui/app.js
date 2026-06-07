@@ -13,6 +13,7 @@ const state = {
   logSeen: new Set(),
 };
 
+const VALID_PANELS = new Set(['fleet', 'modules', 'vitals', 'calibration', 'diagnostics']);
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
@@ -394,10 +395,19 @@ function renderAll() {
   renderCalibration();
 }
 
-function activatePanel(panel) {
+function panelFromHash() {
+  const panel = window.location.hash.replace(/^#/, '');
+  return VALID_PANELS.has(panel) ? panel : 'fleet';
+}
+
+function activatePanel(panel, updateHash = false) {
+  if (!VALID_PANELS.has(panel)) panel = 'fleet';
   state.activePanel = panel;
   for (const button of $$('[data-panel]')) button.classList.toggle('is-active', button.dataset.panel === panel);
   for (const view of $$('.panel-view')) view.classList.toggle('is-active', view.dataset.view === panel);
+  if (updateHash && window.location.hash !== `#${panel}`) {
+    history.pushState(null, '', `#${panel}`);
+  }
 }
 
 async function refreshRest() {
@@ -450,8 +460,9 @@ function connectWs() {
 
 function bindActions() {
   for (const button of $$('[data-panel]')) {
-    button.addEventListener('click', () => activatePanel(button.dataset.panel));
+    button.addEventListener('click', () => activatePanel(button.dataset.panel, true));
   }
+  window.addEventListener('hashchange', () => activatePanel(panelFromHash()));
   $('#clear-log')?.addEventListener('click', () => {
     state.logSeen.clear();
     $('#event-log')?.replaceChildren();
@@ -554,7 +565,7 @@ window.__ruvsenseRenderFixture = (count = 3) => {
 
 async function init() {
   bindActions();
-  activatePanel('fleet');
+  activatePanel(panelFromHash());
   await refreshRest();
   connectWs();
   setInterval(refreshRest, 3000);

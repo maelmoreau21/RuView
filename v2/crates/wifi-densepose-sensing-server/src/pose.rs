@@ -20,19 +20,36 @@ pub const POSE_BONE_PAIRS: &[(usize, usize)] = &[
 
 const TORSO_KP: [usize; 4] = [5, 6, 11, 12];
 const EXTREMITY_KP: [usize; 4] = [9, 10, 15, 16];
+const UNLOCALIZED_POSITION_SOURCE: &str = "unlocalized";
+const SENSOR_GEOMETRY_POSE_SOURCE: &str = "sensor_geometry";
+const SYNTHETIC_DEV_POSE_SOURCE: &str = "synthetic_dev";
+const HUMAN_HEIGHT_M: f64 = 1.70;
+const FOOT_CLEARANCE_M: f64 = 0.04;
+
+fn is_unlocalized_origin(position: &[f64; 3]) -> bool {
+    position.iter().all(|v| v.abs() < 1e-9)
+}
+
+fn is_localized_position(position: &[f64; 3]) -> bool {
+    position.iter().all(|v| v.is_finite()) && !is_unlocalized_origin(position)
+}
+
+fn is_synthetic_dev_source(source: &str) -> bool {
+    matches!(source, "simulated" | "simulate" | "synthetic")
+}
 
 fn estimate_person_world_position(
     update: &SensingUpdate,
     person_idx: usize,
     total_persons: usize,
-) -> ([f64; 3], &'static str) {
+) -> (Option<[f64; 3]>, &'static str) {
     let nodes: Vec<&NodeInfo> = update
         .nodes
         .iter()
-        .filter(|node| node.position.iter().all(|v| v.is_finite()))
+        .filter(|node| is_localized_position(&node.position))
         .collect();
     if nodes.is_empty() {
-        return ([0.0, 0.9, 0.0], "fallback_origin");
+        return (None, UNLOCALIZED_POSITION_SOURCE);
     }
 
     let mut weight_sum = 0.0;
@@ -73,7 +90,84 @@ fn estimate_person_world_position(
         position[2] += 0.8;
     }
 
-    (position, "sensor_geometry")
+    let source = if is_synthetic_dev_source(&update.source) {
+        SYNTHETIC_DEV_POSE_SOURCE
+    } else {
+        SENSOR_GEOMETRY_POSE_SOURCE
+    };
+
+    (Some(position), source)
+}
+
+fn mean_keypoint_x(keypoints: &[PoseKeypoint], indexes: &[usize]) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for &idx in indexes {
+        if let Some(kp) = keypoints.get(idx) {
+            if kp.x.is_finite() {
+                sum += kp.x;
+                count += 1;
+            }
+        }
+    }
+    (count > 0).then_some(sum / count as f64)
+}
+
+fn metric_keypoints_from_legacy(
+    keypoints: &[PoseKeypoint],
+    position_m: [f64; 3],
+) -> Option<Vec<PoseKeypoint>> {
+    if keypoints.len() < 17 || !is_localized_position(&position_m) {
+        return None;
+    }
+
+    let min_y = keypoints
+        .iter()
+        .map(|kp| kp.y)
+        .filter(|v| v.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let max_y = keypoints
+        .iter()
+        .map(|kp| kp.y)
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let height_px = max_y - min_y;
+    if !height_px.is_finite() || height_px < 80.0 {
+        return None;
+    }
+
+    let hip_x = mean_keypoint_x(keypoints, &[11, 12])
+        .or_else(|| mean_keypoint_x(keypoints, &[5, 6]))
+        .unwrap_or_else(|| keypoints.iter().map(|kp| kp.x).sum::<f64>() / keypoints.len() as f64);
+    let center_z = keypoints.iter().map(|kp| kp.z).sum::<f64>() / keypoints.len() as f64;
+    let y_scale = (HUMAN_HEIGHT_M - FOOT_CLEARANCE_M) / height_px;
+
+    let keypoints_m: Vec<PoseKeypoint> = keypoints
+        .iter()
+        .map(|kp| PoseKeypoint {
+            name: kp.name.clone(),
+            x: position_m[0] + (kp.x - hip_x) * y_scale,
+            y: FOOT_CLEARANCE_M + (max_y - kp.y) * y_scale,
+            z: position_m[2] + (kp.z - center_z) * y_scale,
+            confidence: kp.confidence,
+        })
+        .collect();
+
+    let foot_y = keypoints_m
+        .get(15)
+        .zip(keypoints_m.get(16))
+        .map(|(l, r)| l.y.min(r.y))
+        .unwrap_or(f64::INFINITY);
+    let derived_height = keypoints_m
+        .iter()
+        .map(|kp| kp.y)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - foot_y;
+    if (1.45..=1.95).contains(&derived_height) && (0.0..=0.12).contains(&foot_y) {
+        Some(keypoints_m)
+    } else {
+        None
+    }
 }
 
 pub fn derive_single_person_pose(
@@ -237,11 +331,21 @@ pub fn derive_single_person_pose(
     let max_y = ys.iter().cloned().fold(f64::MIN, f64::max) + 10.0;
     let (position_m, position_source) =
         estimate_person_world_position(update, person_idx, total_persons);
+    let keypoints_m =
+        position_m.and_then(|position| metric_keypoints_from_legacy(&keypoints, position));
+    let pose_source = if keypoints_m.is_some() {
+        position_source
+    } else if is_synthetic_dev_source(&update.source) {
+        SYNTHETIC_DEV_POSE_SOURCE
+    } else {
+        position_source
+    };
 
     PersonDetection {
         id: (person_idx + 1) as u32,
         confidence: cls.confidence * conf_decay,
         keypoints,
+        keypoints_m,
         bbox: BoundingBox {
             x: min_x,
             y: min_y,
@@ -249,9 +353,10 @@ pub fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
-        position_m: Some(position_m),
-        position: Some(position_m),
+        position_m,
+        position: position_m,
         position_source: Some(position_source.to_string()),
+        pose_source: Some(pose_source.to_string()),
     }
 }
 

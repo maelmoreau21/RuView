@@ -182,14 +182,17 @@ pub struct PersonDetection {
     pub id: u32,
     pub confidence: f64,
     pub keypoints: Vec<PoseKeypoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keypoints_m: Option<Vec<PoseKeypoint>>,
     pub bbox: BoundingBox,
     pub zone: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub position_m: Option<[f64; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<[f64; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pose_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

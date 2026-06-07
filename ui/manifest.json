@@ -2,7 +2,7 @@
   "name": "RuView - WiFi DensePose",
   "short_name": "RuView",
   "description": "WiFi-based human pose estimation, vital sign detection, and presence sensing through walls",
-  "start_url": "/",
+  "start_url": "/ui/index.html",
   "display": "standalone",
   "background_color": "#1f2121",
   "theme_color": "#21808d",

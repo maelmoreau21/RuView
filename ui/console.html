@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#07110f">
+  <meta name="description" content="Console live RuvSense Edge pour master Raspberry Pi et nœuds ESP32-C6">
+  <title>RuvSense Console</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="manifest" href="manifest.json">
+</head>
+<body>
+  <a href="#main" class="skip-to-content">Aller au contenu principal</a>
+
+  <header class="topbar" aria-live="polite">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <p>RuvSense Edge</p>
+        <h1>Console live</h1>
+      </div>
+    </div>
+    <div class="status-grid">
+      <div class="status-cell status-master" id="master-status"><span></span><strong>offline</strong><small>master</small></div>
+      <div class="status-cell"><strong id="active-nodes">0</strong><small>nœuds live</small></div>
+      <div class="status-cell"><strong id="enabled-modules">0</strong><small>modules on</small></div>
+      <div class="status-cell"><strong id="fusion-mode">offline</strong><small>fusion</small></div>
+      <div class="status-cell"><strong id="source-mode">offline</strong><small>source</small></div>
+      <div class="status-cell"><strong id="scan-interface">wlan0</strong><small>scan</small></div>
+    </div>
+    <nav class="global-nav" aria-label="Navigation globale">
+      <a href="/ui/index.html">Accueil</a>
+      <a class="is-active" href="/ui/console.html#fleet">Console live</a>
+      <a href="/ui/observatory.html">Environnement 3D</a>
+      <a href="/ui/pose-fusion.html">Pose Fusion</a>
+      <a href="/ui/console.html#diagnostics">Diagnostics/API</a>
+    </nav>
+  </header>
+
+  <main id="main" class="console-shell">
+    <nav class="console-rail" aria-label="Vues console">
+      <button class="rail-button is-active" type="button" data-panel="fleet" title="Parc">Parc</button>
+      <a class="rail-button" href="/ui/observatory.html" title="Environnement 3D">3D</a>
+      <button class="rail-button" type="button" data-panel="modules" title="Modules">Modules</button>
+      <button class="rail-button" type="button" data-panel="vitals" title="Signes vitaux">Vitaux</button>
+      <button class="rail-button" type="button" data-panel="calibration" title="Calibration">Cal.</button>
+      <button class="rail-button" type="button" data-panel="diagnostics" title="Diagnostics">Diag</button>
+    </nav>
+
+    <section class="topology-pane" aria-labelledby="topology-title">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Topologie live</p>
+          <h2 id="topology-title">Matériel détecté</h2>
+        </div>
+        <div class="inline-metrics">
+          <span id="room-size">--</span>
+          <span id="readiness-label">not ready</span>
+          <span id="frame-rate">0.0 Hz</span>
+        </div>
+      </div>
+
+      <div id="topology-stage" class="topology-stage" aria-label="Topologie des AP et nœuds ESP32-C6 détectés"></div>
+
+      <div class="topology-legend">
+        <span><i class="legend-dot legend-node"></i>ESP32-C6</span>
+        <span><i class="legend-line"></i>Lien estimé</span>
+        <span><i class="legend-hint"></i>Position estimée</span>
+      </div>
+    </section>
+
+    <aside class="side-panel" aria-label="Détails console">
+      <div class="panel-tabs">
+        <button class="is-active" type="button" data-panel="fleet">Parc</button>
+        <a href="/ui/observatory.html">3D</a>
+        <button type="button" data-panel="modules">Modules</button>
+        <button type="button" data-panel="vitals">Vitaux</button>
+        <button type="button" data-panel="calibration">Calibration</button>
+        <button type="button" data-panel="diagnostics">Diagnostics</button>
+      </div>
+
+      <section class="panel-view is-active" data-view="fleet">
+        <div class="section-head compact">
+          <div>
+            <p class="eyebrow">Raspberry Pi 4/5</p>
+            <h2>Parc live</h2>
+          </div>
+          <span id="fleet-summary" class="badge">0 live</span>
+        </div>
+        <div class="split-list">
+          <section>
+            <h3>Nœuds ESP32-C6</h3>
+            <div id="node-list" class="dense-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel-view" data-view="modules">
+        <div class="section-head compact">
+          <div>
+            <p class="eyebrow">Capacités</p>
+            <h2>Modules</h2>
+          </div>
+          <span id="module-summary" class="badge">0 active</span>
+        </div>
+        <div class="filter-row">
+          <input id="module-filter" type="search" placeholder="Filtrer les modules" autocomplete="off">
+          <select id="module-category" aria-label="Catégorie module"></select>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Module</th>
+                <th>Enabled</th>
+                <th>Nœuds</th>
+                <th>Statut</th>
+                <th>Confiance</th>
+              </tr>
+            </thead>
+            <tbody id="module-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel-view" data-view="vitals">
+        <div class="section-head compact">
+          <div>
+            <p class="eyebrow">CSI-grade</p>
+            <h2>Signes vitaux</h2>
+          </div>
+          <span id="vitals-status" class="badge">waiting</span>
+        </div>
+        <dl class="metric-list">
+          <div><dt>Présence</dt><dd id="presence-state">unknown</dd></div>
+          <div><dt>Personnes</dt><dd id="person-count">0</dd></div>
+          <div><dt>Mouvement</dt><dd id="motion-level">unknown</dd></div>
+          <div><dt>Respiration</dt><dd id="breathing-rate">--</dd></div>
+          <div><dt>Cœur</dt><dd id="heart-rate">--</dd></div>
+          <div><dt>Qualité signal</dt><dd id="signal-quality">--</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel-view" data-view="calibration">
+        <div class="section-head compact">
+          <div>
+            <p class="eyebrow">Field model</p>
+            <h2>Calibration pièce vide</h2>
+          </div>
+          <span id="calibration-status" class="badge">unknown</span>
+        </div>
+        <div class="action-row">
+          <button id="start-calibration" class="primary" type="button">Start</button>
+          <button id="stop-calibration" type="button">Stop</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <tbody id="calibration-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel-view" data-view="diagnostics">
+        <div class="section-head compact">
+          <div>
+            <p class="eyebrow">Runtime</p>
+            <h2>Diagnostics/API</h2>
+          </div>
+          <span id="diagnostics-status" class="badge">live</span>
+        </div>
+        <div class="split-list">
+          <section>
+            <h3>Scan AP</h3>
+            <div id="ap-list" class="dense-list"></div>
+          </section>
+        </div>
+        <div class="advanced-links" aria-label="Vues diagnostics avancées">
+          <a href="/ui/observatory.html">Environnement 3D</a>
+          <a href="/ui/pose-fusion.html">Pose Fusion</a>
+          <a href="/metrics">Metrics</a>
+          <a href="/health/ready">Health ready</a>
+          <a href="/api/v1/nodes">Nodes JSON</a>
+          <a href="/api/v1/topology">Topology JSON</a>
+          <a href="/api/v1/modules">Modules JSON</a>
+        </div>
+      </section>
+    </aside>
+
+    <section class="bottom-log" aria-labelledby="log-title">
+      <div class="section-head compact">
+        <div>
+          <p class="eyebrow">Événements</p>
+          <h2 id="log-title">Log console</h2>
+        </div>
+        <button id="clear-log" type="button">Clear</button>
+      </div>
+      <ol id="event-log" class="event-log"></ol>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

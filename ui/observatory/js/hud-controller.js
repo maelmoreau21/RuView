@@ -102,6 +102,8 @@ export class HudController {
     this._opsFetchPending = false;
     this._fleet = null;
     this._modules = null;
+
+    this._initMobileTabs();
   }
 
   // ============================================================
@@ -177,9 +179,7 @@ export class HudController {
 
     // Buttons
     document.getElementById('btn-reset-camera').addEventListener('click', () => {
-      obs._camera.position.set(6, 5, 8);
-      obs._controls.target.set(0, 1.2, 0);
-      obs._controls.update();
+      obs._frameCameraToSensors(true);
     });
     document.getElementById('btn-export-settings').addEventListener('click', () => {
       const blob = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
@@ -208,6 +208,26 @@ export class HudController {
 
   initQuickSelect() {
     // Live-only console: no scenario selector in production.
+  }
+
+  _initMobileTabs() {
+    const tabs = document.querySelectorAll('.mobile-hud-tab');
+    if (!tabs.length) return;
+    tabs.forEach((tab) => {
+      tab.addEventListener('click', () => this._activateMobilePanel(tab.dataset.panel));
+    });
+  }
+
+  _activateMobilePanel(panelId) {
+    if (!panelId) return;
+    document.querySelectorAll('.mobile-hud-tab').forEach((tab) => {
+      const active = tab.dataset.panel === panelId;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    document.querySelectorAll('#hud-panel-layout .data-panel').forEach((panel) => {
+      panel.classList.toggle('mobile-active', panel.id === panelId);
+    });
   }
 
   // ============================================================
@@ -270,7 +290,7 @@ export class HudController {
   updateSourceBadge(status, ws) {
     const dot = document.querySelector('#data-source-badge .dot');
     const label = document.getElementById('data-source-label');
-    if (status === 'live' && ws?.readyState === WebSocket.OPEN) {
+    if (status === 'live') {
       dot.className = 'dot dot--live'; label.textContent = 'LIVE';
     } else if (status === 'degraded') {
       dot.className = 'dot dot--degraded'; label.textContent = 'DEGRADED';
@@ -511,7 +531,10 @@ export class HudController {
     const modules = Array.isArray(catalog?.modules) ? catalog.modules : [];
     if (!list || !summary || !modules.length) return;
 
-    const active = modules.filter(m => (m.effective_status || m.status) === 'active').length;
+    const active = modules.filter(m => {
+      const status = String(m.effective_status || m.status || '').toLowerCase();
+      return status === 'active' || status === 'live';
+    }).length;
     const enabled = modules.filter(m => m.enabled !== false).length;
     const categories = new Set(modules.map(m => m.category)).size;
     summary.textContent = `${modules.length} modules / ${enabled} enabled / ${active} active / ${categories} categories`;

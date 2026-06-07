@@ -27,6 +27,8 @@ COPY ui/ /app/ui/
 COPY docker/ruvsense-master-entrypoint.sh /app/ruvsense-master-entrypoint.sh
 
 RUN chmod +x /app/ruvsense-master /app/ruvsense-master-entrypoint.sh \
+ && test -f /app/ui/index.html \
+ && test -f /app/ui/console.html \
  && test -f /app/ui/observatory.html \
  && test -d /app/ui/observatory
 
