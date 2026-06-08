@@ -60,7 +60,15 @@
         </div>
       </div>
 
-      <div id="topology-stage" class="topology-stage" aria-label="Topologie des AP et nœuds ESP32-C6 détectés"></div>
+      <div class="topology-stage-wrap">
+        <div class="topology-view-controls" aria-label="Contrôles de vue topologie">
+          <button id="placement-zoom-out" type="button" title="Zoom arrière" aria-label="Zoom arrière">−</button>
+          <span id="placement-zoom-label" aria-live="polite">100%</span>
+          <button id="placement-zoom-in" type="button" title="Zoom avant" aria-label="Zoom avant">+</button>
+          <button id="placement-zoom-fit" type="button" title="Ajuster aux nœuds" aria-label="Ajuster aux nœuds">Ajuster</button>
+        </div>
+        <div id="topology-stage" class="topology-stage" aria-label="Topologie des AP et nœuds ESP32-C6 détectés"></div>
+      </div>
 
       <div class="placement-toolbar" aria-label="Placement manuel des nœuds">
         <div class="placement-detail">
@@ -164,11 +172,18 @@
           <button id="start-calibration" class="primary" type="button">Démarrer</button>
           <button id="stop-calibration" type="button">Arrêter</button>
         </div>
+        <div class="calibration-progress" aria-label="Progression calibration">
+          <div class="calibration-progress-track">
+            <span id="calibration-progress-fill"></span>
+          </div>
+          <small id="calibration-progress-label">0 / 12000 frames</small>
+        </div>
         <div class="table-wrap">
           <table class="data-table">
             <tbody id="calibration-table"></tbody>
           </table>
         </div>
+        <ol id="calibration-log" class="calibration-log" aria-live="polite"></ol>
       </section>
 
       <section class="panel-view" data-view="diagnostics">

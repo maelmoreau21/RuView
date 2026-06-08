@@ -19,15 +19,17 @@ export class PoseSystem {
     const pos = person.position || [0, 0, 0];
     const facing = person.facing || 0;
     const px = pos[0], pz = pos[2];
+    const surfaceY = Number.isFinite(Number(pos[1])) ? Number(pos[1]) : 0;
     const ms = person.motion_score || 0;
     const bp = breathPulse;
+    const fallProgress = Math.max(0, Math.min(1, Number(person.fallProgress ?? person.fall_progress ?? 0) || 0));
 
     let kps;
     switch (pose) {
-      case 'lying':       kps = this.poseLying(px, pos[1] || 0, pz, elapsed, bp); break;
+      case 'lying':       kps = this.poseLying(px, surfaceY, pz, elapsed, bp); break;
       case 'sitting':     kps = this.poseSitting(px, pz, elapsed, bp); break;
-      case 'fallen':      kps = this.poseFallen(px, pz, elapsed); break;
-      case 'falling':     kps = this.poseFalling(px, pz, elapsed, person.fallProgress || 0); break;
+      case 'fallen':      kps = this.poseFallen(px, surfaceY, pz, elapsed, bp); break;
+      case 'falling':     kps = this.poseFalling(px, surfaceY, pz, elapsed, fallProgress); break;
       case 'exercising':  kps = this.poseExercising(px, pz, elapsed, person.exerciseType, person.exerciseTime); break;
       case 'gesturing':   kps = this.poseGesturing(px, pz, elapsed, person.gestureType, person.gestureIntensity || 0); break;
       case 'crouching':   kps = this.poseCrouching(px, pz, elapsed, bp); break;
@@ -142,63 +144,35 @@ export class PoseSystem {
   }
 
   // ---- Lying -------------------------------------------------------------
-  // Subtle micro-movements, differentiate supine vs side-lying via elapsed hash
+  // Stable supine posture with subtle breathing and micro-movements.
 
   poseLying(px, surfaceY, pz, elapsed, bp) {
-    const y = (surfaceY || 0) + 0.2;
-    const chest = bp * 0.015;
+    const y = Math.max(0.04, surfaceY + 0.055);
+    const chest = bp * 0.018;
 
-    // Micro-movements -- tiny random-feeling shifts (deterministic from elapsed)
     const microX = Math.sin(elapsed * 0.17) * 0.004;
     const microZ = Math.cos(elapsed * 0.13) * 0.003;
-    const fingerTwitch = Math.sin(elapsed * 0.7) * 0.008;
+    const fingerTwitch = Math.sin(elapsed * 0.7) * 0.006;
+    const kneeRelax = Math.sin(elapsed * 0.11) * 0.01;
 
-    // Determine supine vs side-lying from a slow oscillation (stays one way for ~20s)
-    const lyingMode = Math.sin(elapsed * 0.05);
-
-    if (lyingMode > 0.3) {
-      // Side-lying (on left side)
-      const curl = Math.sin(elapsed * 0.1) * 0.02; // slight fetal curl
-      return [
-        [px - 0.72 + microX, y + 0.12, pz - 0.08],                     // 0 nose (turned)
-        [px - 0.70, y + 0.14, pz - 0.10],                               // 1 left eye
-        [px - 0.70, y + 0.16, pz - 0.06],                               // 2 right eye (up)
-        [px - 0.76, y + 0.11, pz - 0.12],                               // 3 left ear (down)
-        [px - 0.76, y + 0.14, pz - 0.04],                               // 4 right ear
-        [px - 0.45, y + chest + 0.05, pz - 0.12],                       // 5 left shoulder (down)
-        [px - 0.45, y + chest + 0.2, pz + 0.04],                        // 6 right shoulder (up)
-        [px - 0.38, y + 0.02, pz - 0.28 + curl],                        // 7 left elbow
-        [px - 0.35, y + 0.18, pz + 0.15 + fingerTwitch],                // 8 right elbow
-        [px - 0.20, y - 0.01, pz - 0.30 + curl],                        // 9 left wrist
-        [px - 0.18, y + 0.12, pz + 0.25 + fingerTwitch],                // 10 right wrist
-        [px + 0.05 + microX, y + chest * 0.4 + 0.03, pz - 0.08],        // 11 left hip
-        [px + 0.05 + microX, y + chest * 0.4 + 0.12, pz + 0.06],        // 12 right hip
-        [px + 0.40 + curl * 2, y + 0.02, pz - 0.14 + curl],             // 13 left knee
-        [px + 0.38 + curl * 2, y + 0.10, pz + 0.10 + curl],             // 14 right knee
-        [px + 0.75, y - 0.01, pz - 0.12],                                // 15 left ankle
-        [px + 0.72, y + 0.04, pz + 0.08],                                // 16 right ankle
-      ];
-    }
-
-    // Supine (face up) -- default
     return [
-      [px - 0.75 + microX, y + 0.08, pz + microZ],                     // 0 nose
-      [px - 0.72, y + 0.1, pz - 0.02 + microZ],                        // 1 left eye
-      [px - 0.72, y + 0.1, pz + 0.02 + microZ],                        // 2 right eye
-      [px - 0.78, y + 0.08, pz - 0.05],                                 // 3 left ear
-      [px - 0.78, y + 0.08, pz + 0.05],                                 // 4 right ear
-      [px - 0.45, y + chest, pz - 0.18],                                // 5 left shoulder
-      [px - 0.45, y + chest, pz + 0.18],                                // 6 right shoulder
-      [px - 0.42, y, pz - 0.35 + fingerTwitch],                         // 7 left elbow
-      [px - 0.42, y, pz + 0.35 - fingerTwitch],                         // 8 right elbow
-      [px - 0.2, y - 0.02, pz - 0.38 + fingerTwitch],                   // 9 left wrist
-      [px - 0.2, y - 0.02, pz + 0.38 - fingerTwitch],                   // 10 right wrist
-      [px + 0.05 + microX, y + chest * 0.5, pz - 0.1],                  // 11 left hip
-      [px + 0.05 + microX, y + chest * 0.5, pz + 0.1],                  // 12 right hip
-      [px + 0.45, y, pz - 0.11],                                         // 13 left knee
-      [px + 0.45, y, pz + 0.11],                                         // 14 right knee
-      [px + 0.82, y - 0.02, pz - 0.1],                                   // 15 left ankle
-      [px + 0.82, y - 0.02, pz + 0.1],                                   // 16 right ankle
+      [px - 0.82 + microX, y + 0.13, pz + microZ],                      // 0 nose
+      [px - 0.80 + microX, y + 0.15, pz - 0.03 + microZ],               // 1 left eye
+      [px - 0.80 + microX, y + 0.15, pz + 0.03 + microZ],               // 2 right eye
+      [px - 0.86 + microX, y + 0.12, pz - 0.06],                        // 3 left ear
+      [px - 0.86 + microX, y + 0.12, pz + 0.06],                        // 4 right ear
+      [px - 0.52, y + 0.09 + chest, pz - 0.19],                         // 5 left shoulder
+      [px - 0.52, y + 0.09 + chest, pz + 0.19],                         // 6 right shoulder
+      [px - 0.36, y + 0.045, pz - 0.39 + fingerTwitch],                 // 7 left elbow
+      [px - 0.36, y + 0.045, pz + 0.39 - fingerTwitch],                 // 8 right elbow
+      [px - 0.10, y + 0.035, pz - 0.41 + fingerTwitch],                 // 9 left wrist
+      [px - 0.10, y + 0.035, pz + 0.41 - fingerTwitch],                 // 10 right wrist
+      [px + 0.02 + microX, y + 0.065 + chest * 0.45, pz - 0.11],        // 11 left hip
+      [px + 0.02 + microX, y + 0.065 + chest * 0.45, pz + 0.11],        // 12 right hip
+      [px + 0.43, y + 0.05 + kneeRelax, pz - 0.12],                     // 13 left knee
+      [px + 0.43, y + 0.05 - kneeRelax, pz + 0.12],                     // 14 right knee
+      [px + 0.82, y + 0.04, pz - 0.11],                                 // 15 left ankle
+      [px + 0.82, y + 0.04, pz + 0.11],                                 // 16 right ankle
     ];
   }
 
@@ -243,49 +217,43 @@ export class PoseSystem {
   // ---- Fallen ------------------------------------------------------------
   // Occasional twitch/attempt to move, asymmetric breathing
 
-  poseFallen(px, pz, elapsed) {
-    // Irregular twitch -- sharper, less periodic
-    const twitchArm = Math.sin(elapsed * 0.3) * 0.003 +
-                      Math.sin(elapsed * 1.7) * 0.008 * Math.max(0, Math.sin(elapsed * 0.15));
-    const twitchLeg = Math.cos(elapsed * 0.4) * 0.005 *
-                      Math.max(0, Math.sin(elapsed * 0.2 + 1.0));
-
-    // Asymmetric breathing (one side of chest rises more)
-    const breathL = Math.sin(elapsed * 0.8) * 0.006;
-    const breathR = Math.sin(elapsed * 0.8 + 0.3) * 0.004;
-
-    // Attempt to move (slow reach every ~10s)
+  poseFallen(px, surfaceY, pz, elapsed, bp = 0) {
+    const y = Math.max(0.035, surfaceY + 0.045);
+    const twitchArm = Math.sin(elapsed * 1.7) * 0.009 * Math.max(0, Math.sin(elapsed * 0.15));
+    const twitchLeg = Math.cos(elapsed * 0.4) * 0.006 * Math.max(0, Math.sin(elapsed * 0.2 + 1.0));
+    const breathL = bp * 0.012 + Math.sin(elapsed * 0.8) * 0.004;
+    const breathR = bp * 0.009 + Math.sin(elapsed * 0.8 + 0.3) * 0.003;
     const attemptCycle = elapsed % 10.0;
     const attempting = attemptCycle > 8.0 && attemptCycle < 9.5;
-    const attemptAmt = attempting ? Math.sin((attemptCycle - 8.0) * Math.PI / 1.5) * 0.05 : 0;
+    const attemptAmt = attempting ? Math.sin((attemptCycle - 8.0) * Math.PI / 1.5) * 0.045 : 0;
 
     return [
-      [px + 0.35, 0.12, pz + 0.15 + twitchArm],                        // 0 nose
-      [px + 0.33, 0.14, pz + 0.13],                                      // 1 left eye
-      [px + 0.37, 0.14, pz + 0.17],                                      // 2 right eye
-      [px + 0.38, 0.11, pz + 0.1],                                       // 3 left ear
-      [px + 0.38, 0.11, pz + 0.2],                                       // 4 right ear
-      [px + 0.15, 0.15 + breathL, pz - 0.1],                             // 5 left shoulder
-      [px + 0.15, 0.2 + breathR, pz + 0.25],                             // 6 right shoulder
-      [px - 0.05, 0.08, pz - 0.25 + twitchArm],                          // 7 left elbow
-      [px + 0.3, 0.22 + attemptAmt * 0.5, pz + 0.45 + attemptAmt],       // 8 right elbow (reaching)
-      [px - 0.15, 0.05, pz - 0.3 + twitchArm * 1.5],                     // 9 left wrist
-      [px + 0.4, 0.15 + attemptAmt, pz + 0.5 + attemptAmt * 1.5],        // 10 right wrist (reaching)
-      [px - 0.05, 0.12, pz - 0.05],                                       // 11 left hip
-      [px - 0.05, 0.12, pz + 0.15],                                       // 12 right hip
-      [px - 0.2, 0.08 + twitchLeg, pz - 0.3],                            // 13 left knee
-      [px - 0.15, 0.15, pz + 0.35 + twitchLeg],                          // 14 right knee
-      [px - 0.35, 0.04, pz - 0.2],                                        // 15 left ankle
-      [px - 0.3, 0.04, pz + 0.5],                                         // 16 right ankle
+      [px + 0.70, y + 0.13, pz + 0.08 + twitchArm],                     // 0 nose
+      [px + 0.68, y + 0.15, pz + 0.04],                                 // 1 left eye
+      [px + 0.72, y + 0.15, pz + 0.10],                                 // 2 right eye
+      [px + 0.74, y + 0.11, pz + 0.00],                                 // 3 left ear
+      [px + 0.74, y + 0.11, pz + 0.15],                                 // 4 right ear
+      [px + 0.34, y + 0.11 + breathL, pz - 0.19],                       // 5 left shoulder
+      [px + 0.34, y + 0.15 + breathR, pz + 0.19],                       // 6 right shoulder
+      [px + 0.05, y + 0.06, pz - 0.43 + twitchArm],                     // 7 left elbow
+      [px + 0.42, y + 0.16 + attemptAmt * 0.4, pz + 0.45 + attemptAmt], // 8 right elbow
+      [px - 0.18, y + 0.045, pz - 0.52 + twitchArm * 1.4],              // 9 left wrist
+      [px + 0.68, y + 0.12 + attemptAmt, pz + 0.55 + attemptAmt],       // 10 right wrist
+      [px - 0.12, y + 0.07, pz - 0.10],                                 // 11 left hip
+      [px - 0.12, y + 0.08, pz + 0.10],                                 // 12 right hip
+      [px - 0.55, y + 0.05 + twitchLeg, pz - 0.20],                     // 13 left knee
+      [px - 0.40, y + 0.08, pz + 0.35 + twitchLeg],                     // 14 right knee
+      [px - 0.90, y + 0.04, pz - 0.10],                                 // 15 left ankle
+      [px - 0.68, y + 0.05, pz + 0.55],                                 // 16 right ankle
     ];
   }
 
   // ---- Falling -----------------------------------------------------------
   // Flailing arms, head snap, non-linear easing (cubic ease-in)
 
-  poseFalling(px, pz, elapsed, progress) {
+  poseFalling(px, surfaceY, pz, elapsed, progress) {
     const standing = this.poseStanding(px, pz, elapsed, 0, 0);
-    const fallen = this.poseFallen(px, pz, elapsed);
+    const fallen = this.poseFallen(px, surfaceY, pz, elapsed, 0);
 
     // Cubic ease-in for realistic acceleration
     const t = progress * progress * progress;

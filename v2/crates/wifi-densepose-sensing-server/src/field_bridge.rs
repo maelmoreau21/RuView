@@ -30,11 +30,15 @@ const ENERGY_THRESH_3: f64 = 25.0;
 /// reliable — genuine higher counts come from the multistatic fusion path.
 const MAX_SINGLE_LINK_OCCUPANCY: usize = 3;
 
+/// Minimum empty-room CSI frames required before the field model can finalize.
+pub const FIELD_MODEL_MIN_CALIBRATION_FRAMES: usize = 12_000;
+
 /// Create a FieldModelConfig for single-link mode (one ESP32 node = one link).
 /// This avoids the DimensionMismatch error when feeding single-frame observations.
 pub fn single_link_config() -> FieldModelConfig {
     FieldModelConfig {
         n_links: 1,
+        min_calibration_frames: FIELD_MODEL_MIN_CALIBRATION_FRAMES,
         ..FieldModelConfig::default()
     }
 }

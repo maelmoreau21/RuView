@@ -15,6 +15,7 @@ import { NebulaBackground } from './nebula-background.js';
 import { PostProcessing } from './post-processing.js';
 import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
+import { ScenarioProps } from './scenario-props.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION } from './hud-controller.js';
 
 // ---- Palette ----
@@ -24,6 +25,7 @@ const C = {
   greenDim:   0x0a6b3a,
   amber:      0xffb020,
   blueSignal: 0x2090ff,
+  obstacleHot:0xff5a1f,
   redAlert:   0xff3040,
   redHeart:   0xff4060,
   bgDeep:     0x080c14,
@@ -31,6 +33,33 @@ const C = {
 
 const MAX_SCENE_PERSONS = 8;
 const PERSON_DEDUPE_RADIUS_M = 0.65;
+const SLEEP_BED_CENTER = [3.5, 0.54, -3.5];
+const SLEEP_BED_YAW = 0;
+const SLEEP_BED_POSES = new Set(['lying', 'fallen']);
+const KNOWN_POSES = new Set([
+  'standing', 'walking', 'lying', 'sitting', 'fallen', 'falling',
+  'exercising', 'gesturing', 'crouching',
+]);
+const POSE_ALIASES = new Map([
+  ['stand', 'standing'],
+  ['upright', 'standing'],
+  ['still', 'standing'],
+  ['moving', 'walking'],
+  ['laying', 'lying'],
+  ['laying_down', 'lying'],
+  ['lying_down', 'lying'],
+  ['supine', 'lying'],
+  ['recumbent', 'lying'],
+  ['seated', 'sitting'],
+  ['sit', 'sitting'],
+  ['fall', 'fallen'],
+  ['down', 'fallen'],
+  ['collapsed', 'fallen'],
+  ['on_floor', 'fallen'],
+  ['fall_detected', 'fallen'],
+  ['falling_down', 'falling'],
+  ['crouched', 'crouching'],
+]);
 
 // SCENARIO_NAMES, DEFAULTS, SETTINGS_VERSION, PRESETS imported from hud-controller.js
 
@@ -104,11 +133,15 @@ class Observatory {
     this._wsReconnectTimer = null;
     this._lastLiveAt = 0;
     this._lastEdgeVitals = null;
+    this._currentScenario = null;
+    this._obstacleSummary = null;
+    this._linkRaycaster = new THREE.Raycaster();
 
     // Build scene
     this._setupLighting();
     this._nebula = new NebulaBackground(this._scene);
     this._buildRoom();
+    this._scenarioProps = new ScenarioProps(this._scene);
     this._buildTopologyDevices();
     this._poseSystem = new PoseSystem();
     this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
@@ -208,6 +241,8 @@ class Observatory {
     this._floor = new THREE.Mesh(floorGeo, this._floorMat);
     this._floor.rotation.x = -Math.PI / 2;
     this._floor.receiveShadow = true;
+    this._floor.userData.obstacleName = 'Sol de la pièce';
+    this._floor.userData.isFloorObstacle = true;
     this._scene.add(this._floor);
 
   }
@@ -295,13 +330,16 @@ class Observatory {
   _buildTopologyDevices() {
     this._topologyGroup = new THREE.Group();
     this._linkGroup = new THREE.Group();
+    this._impactGroup = new THREE.Group();
     this._coverageGroup = new THREE.Group();
     this._deviceMeshes = new Map();
     this._linkMeshes = new Map();
+    this._impactMarkers = new Map();
     this._coverageMeshes = new Map();
     this._wifiWaves = [];
     this._scene.add(this._coverageGroup);
     this._scene.add(this._linkGroup);
+    this._scene.add(this._impactGroup);
     this._scene.add(this._topologyGroup);
   }
 
@@ -389,11 +427,14 @@ class Observatory {
   _clearTopology() {
     for (const [, entry] of this._deviceMeshes) entry.group.visible = false;
     for (const [, line] of this._linkMeshes) line.visible = false;
+    this._hideImpactMarkers();
     for (const [, entry] of this._coverageMeshes) entry.group.visible = false;
     for (const waves of this._wifiWaves) {
       waves.active = false;
       for (const shell of waves.shells) shell.mesh.visible = false;
     }
+    this._obstacleSummary = null;
+    this._hud?.updateObstacleAttenuation?.();
   }
 
   _parseVector3(value) {
@@ -532,6 +573,49 @@ class Observatory {
     return Number.isFinite(confidence) ? confidence : 0;
   }
 
+  _normalizePoseName(value) {
+    const raw = String(value ?? '').trim().toLowerCase();
+    if (!raw) return null;
+    const slug = raw.replace(/[\s-]+/g, '_');
+    return POSE_ALIASES.get(slug) || (KNOWN_POSES.has(slug) ? slug : null);
+  }
+
+  _framePose(frame) {
+    return this._normalizePoseName(frame?.posture) || this._normalizePoseName(frame?.pose);
+  }
+
+  _personPose(person, frame) {
+    return this._normalizePoseName(person?.pose)
+      || this._normalizePoseName(person?.posture)
+      || this._framePose(frame);
+  }
+
+  _fallProgress(person, frame) {
+    const progress = this._numberOrNull(
+      person?.fallProgress ?? person?.fall_progress ?? frame?.fallProgress ?? frame?.fall_progress,
+    );
+    return progress == null ? null : Math.max(0, Math.min(1, progress));
+  }
+
+  _shouldSnapToSleepBed(data, person) {
+    const scenario = String(data?.scenario || this._currentScenario || '').toLowerCase();
+    return scenario === 'sleep_monitoring' && SLEEP_BED_POSES.has(person?.pose);
+  }
+
+  _snapToSleepBed(data, person) {
+    if (!this._shouldSnapToSleepBed(data, person)) return person;
+    const position = SLEEP_BED_CENTER.slice();
+    return {
+      ...person,
+      position,
+      ...(person.position_m ? { position_m: position.slice() } : {}),
+      position_source: 'observatory_layout',
+      facing: SLEEP_BED_YAW,
+      keypoints: undefined,
+      keypoints_m: undefined,
+    };
+  }
+
   _dedupePersons(persons, renderLimit) {
     const byId = new Map();
     persons.forEach((person, index) => {
@@ -578,6 +662,11 @@ class Observatory {
     };
   }
 
+  _updateScenarioProps(data) {
+    this._currentScenario = data?.scenario || this._currentScenario || null;
+    this._scenarioProps.update(data, this._currentScenario);
+  }
+
   _mergeEdgeVitals(frame, edgeFrame) {
     const edgeVitals = this._edgeVitalsFromFrame(edgeFrame);
     if (!edgeVitals) return frame;
@@ -597,6 +686,7 @@ class Observatory {
       if (!normalized) return;
       this._liveData = normalized;
       this._lastLiveAt = performance.now();
+      this._updateScenarioProps(normalized);
       this._syncTopology(normalized);
       return;
     }
@@ -662,15 +752,22 @@ class Observatory {
     if (!rawFrame || typeof rawFrame !== 'object') return null;
     const frame = this._lastEdgeVitals ? this._mergeEdgeVitals(rawFrame, this._lastEdgeVitals) : { ...rawFrame };
     const rawPersons = Array.isArray(frame.persons) ? frame.persons : [];
-    let persons = rawPersons.slice(0, MAX_SCENE_PERSONS).map((person, index) => ({
-      ...person,
-      id: this._personIdentity(person, index),
-    }));
+    let persons = rawPersons.slice(0, MAX_SCENE_PERSONS).map((person, index) => {
+      const pose = this._personPose(person, frame);
+      const fallProgress = this._fallProgress(person, frame);
+      return {
+        ...person,
+        id: this._personIdentity(person, index),
+        ...(pose ? { pose } : {}),
+        ...(fallProgress != null ? { fallProgress } : {}),
+      };
+    });
 
     if (!persons.length) {
       const keypoints = this._keypointObjects(frame.pose_keypoints);
       if (keypoints) {
         const confidence = this._numberOrNull(frame.classification?.confidence) ?? 0.5;
+        const pose = this._framePose(frame);
         persons.push({
           id: 'pose_1',
           confidence,
@@ -678,6 +775,7 @@ class Observatory {
           position: this._fallbackPersonPosition(0, 1),
           position_source: 'observatory_layout',
           pose_source: 'pose_keypoints',
+          ...(pose ? { pose } : {}),
         });
       }
     }
@@ -731,12 +829,13 @@ class Observatory {
         || this._positionOf(person)
         || this._fallbackPersonPosition(index, inputPersons.length);
       const keypointsM = this._transformMetricKeypoints(person.keypoints_m);
-      return {
+      const scenePerson = {
         ...person,
         position,
         ...(person.position_m ? { position_m: position } : {}),
         ...(keypointsM ? { keypoints_m: keypointsM } : {}),
       };
+      return this._snapToSleepBed(data, scenePerson);
     }).filter(Boolean);
     let evidence = this._countEvidence({ ...data, persons });
     const inferredPersons = this._inferredPersonsFromCount(data, evidence, persons.length);
@@ -825,7 +924,7 @@ class Observatory {
     entry.group.visible = true;
   }
 
-  _upsertLink(key, from, to, active) {
+  _upsertLink(key, from, to, active, collision = null) {
     let line = this._linkMeshes.get(key);
     if (!line) {
       const geo = new THREE.BufferGeometry();
@@ -838,13 +937,115 @@ class Observatory {
       this._linkGroup.add(line);
       this._linkMeshes.set(key, line);
     }
+    const obstructed = active && Boolean(collision);
+    const nextBlending = obstructed ? THREE.AdditiveBlending : THREE.NormalBlending;
     line.geometry.setFromPoints([
       new THREE.Vector3(from[0], from[1], from[2]),
       new THREE.Vector3(to[0], to[1], to[2]),
     ]);
-    line.material.opacity = active ? 0.55 : 0.16;
-    line.material.color.set(active ? C.blueSignal : 0x385060);
+    line.material.opacity = !active ? 0.16 : (obstructed ? 0.95 : 0.55);
+    line.material.color.set(!active ? 0x385060 : (obstructed ? C.obstacleHot : C.blueSignal));
+    line.material.depthWrite = !obstructed;
+    if (line.material.blending !== nextBlending) {
+      line.material.blending = nextBlending;
+      line.material.needsUpdate = true;
+    }
     line.visible = true;
+  }
+
+  _linkCollisionTargets() {
+    if (!this.settings.obstacles) return [];
+    const targets = this._scenarioProps?.getActiveCollisionMeshes?.() || [];
+    if (this._floor) targets.push(this._floor);
+    return targets;
+  }
+
+  _detectLinkCollision(from, to, targets) {
+    if (!targets.length) return null;
+    const origin = new THREE.Vector3(from[0], from[1], from[2]);
+    const target = new THREE.Vector3(to[0], to[1], to[2]);
+    const delta = target.sub(origin);
+    const length = delta.length();
+    if (length <= 0.001) return null;
+
+    const endpointMargin = Math.min(0.18, length * 0.18);
+    if (length <= endpointMargin * 2) return null;
+
+    this._linkRaycaster.set(origin, delta.normalize());
+    this._linkRaycaster.near = endpointMargin;
+    this._linkRaycaster.far = length - endpointMargin;
+
+    const hit = this._linkRaycaster
+      .intersectObjects(targets, false)
+      .find(intersection => (
+        intersection.distance > endpointMargin
+        && intersection.distance < length - endpointMargin
+      ));
+    if (!hit) return null;
+
+    return {
+      point: hit.point.clone(),
+      obstacleName: this._obstacleNameFromHit(hit),
+      distance: hit.distance,
+    };
+  }
+
+  _obstacleNameFromHit(hit) {
+    let obj = hit?.object || null;
+    while (obj) {
+      if (obj.userData?.obstacleName) return obj.userData.obstacleName;
+      obj = obj.parent;
+    }
+    return 'Obstacle';
+  }
+
+  _upsertImpactMarker(key, collision, active) {
+    let entry = this._impactMarkers.get(key);
+    if (!active || !collision) {
+      if (entry) entry.group.visible = false;
+      return;
+    }
+
+    if (!entry) {
+      const group = new THREE.Group();
+      const mat = new THREE.MeshStandardMaterial({
+        color: C.obstacleHot,
+        emissive: C.obstacleHot,
+        emissiveIntensity: 2.4,
+        roughness: 0.25,
+        transparent: true,
+        opacity: 0.95,
+      });
+      const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.095, 20, 14), mat);
+      const glow = new THREE.PointLight(C.obstacleHot, 1.6, 1.8, 1.4);
+      group.add(sphere);
+      group.add(glow);
+      this._impactGroup.add(group);
+      entry = { group, sphere, glow };
+      this._impactMarkers.set(key, entry);
+    }
+
+    entry.group.position.copy(collision.point);
+    entry.group.userData.obstacleName = collision.obstacleName;
+    entry.group.visible = true;
+  }
+
+  _hideImpactMarkers(visibleKeys = new Set()) {
+    for (const [key, entry] of this._impactMarkers || []) {
+      if (!visibleKeys.has(key)) entry.group.visible = false;
+    }
+  }
+
+  obstacleAttenuation() {
+    if (!this.settings.obstacles || !this._obstacleSummary) return null;
+    return this._obstacleSummary;
+  }
+
+  _refreshObstacleMode() {
+    const frame = this._currentData || this._liveData || this._emptyLiveFrame();
+    const data = this._sceneFrameData(frame);
+    this._updateScenarioProps(data);
+    this._syncTopology(data);
   }
 
   _coverageBand(node, apById, env) {
@@ -927,6 +1128,9 @@ class Observatory {
     const visibleDevices = new Set();
     const visibleLinks = new Set();
     const visibleCoverage = new Set();
+    const visibleImpacts = new Set();
+    const collisions = [];
+    const collisionTargets = this._linkCollisionTargets();
 
     for (const ap of env.access_points || []) {
       const position = this._positionOf(ap);
@@ -963,7 +1167,13 @@ class Observatory {
       const to = this._positionOf(node);
       if (!from || !to) continue;
       visibleLinks.add(key);
-      this._upsertLink(key, from, to, active);
+      const collision = active ? this._detectLinkCollision(from, to, collisionTargets) : null;
+      if (collision) {
+        visibleImpacts.add(key);
+        collisions.push(collision);
+      }
+      this._upsertLink(key, from, to, active, collision);
+      this._upsertImpactMarker(key, collision, active);
     }
 
     for (const [key, entry] of this._deviceMeshes) {
@@ -972,6 +1182,11 @@ class Observatory {
     for (const [key, line] of this._linkMeshes) {
       if (!visibleLinks.has(key)) line.visible = false;
     }
+    this._hideImpactMarkers(visibleImpacts);
+    this._obstacleSummary = collisions.length
+      ? { obstacleName: collisions[0].obstacleName, count: collisions.length }
+      : null;
+    this._hud?.updateObstacleAttenuation?.();
     for (const [key, entry] of this._coverageMeshes) {
       if (!visibleCoverage.has(key)) entry.group.visible = false;
     }
@@ -1249,6 +1464,7 @@ class Observatory {
 
     // Updates
     this._nebula.update(dt, elapsed);
+    this._updateScenarioProps(data);
     this._figurePool.update(data, elapsed);
     this._updateDotMatrixMist(data, elapsed);
     this._updateParticleTrail(data, dt, elapsed);

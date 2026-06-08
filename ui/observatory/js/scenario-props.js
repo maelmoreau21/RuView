@@ -24,6 +24,19 @@ const SCENARIO_PROPS = {
   security_patrol:  ['camera1', 'camera2'],
 };
 
+const PROP_OBSTACLE_NAMES = {
+  bed: 'Lit de soin',
+  chair: 'Fauteuil',
+  exerciseMat: 'Tapis de fitness',
+  door: 'Porte',
+  rubbleWall: 'Mur de décombres',
+  screen: 'Écran',
+  desk: 'Table',
+  desk2: 'Table',
+  camera1: 'Caméra de sécurité',
+  camera2: 'Caméra de sécurité',
+};
+
 export class ScenarioProps {
   constructor(scene) {
     this._scene = scene;
@@ -84,6 +97,21 @@ export class ScenarioProps {
     this._buildDesks(darkMat, metalMat, accentMat);
     this._buildCameras(metalMat);
     this._buildAlertSystem();
+    this._tagCollisionMeshes();
+  }
+
+  _tagCollisionMeshes() {
+    for (const [name, prop] of Object.entries(this._props)) {
+      const obstacleName = PROP_OBSTACLE_NAMES[name] || name;
+      prop.userData.obstacleName = obstacleName;
+      prop.traverse((obj) => {
+        if (obj.isMesh) {
+          obj.userData.obstacleName = obstacleName;
+          obj.userData.scenarioPropName = name;
+          obj.userData.isScenarioObstacle = true;
+        }
+      });
+    }
   }
 
   // ---- BED (sleep monitoring) ----
@@ -735,5 +763,18 @@ export class ScenarioProps {
       }
       dPos.needsUpdate = true;
     }
+  }
+
+  getActiveCollisionMeshes() {
+    const meshes = [];
+    for (const prop of Object.values(this._props)) {
+      if (!prop.visible) continue;
+      prop.traverse((obj) => {
+        if (obj.isMesh && obj.visible !== false && obj.userData.isScenarioObstacle) {
+          meshes.push(obj);
+        }
+      });
+    }
+    return meshes;
   }
 }

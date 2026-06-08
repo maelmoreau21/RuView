@@ -6978,12 +6978,15 @@ async fn calibration_start(State(state): State<SharedState>) -> Json<serde_json:
                     "success": false,
                     "error": "Calibration already in progress. Call /calibration/stop first.",
                     "frame_count": fm.calibration_frame_count(),
+                    "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
                 }));
             }
             CalibrationStatus::Fresh => {
                 return Json(serde_json::json!({
                     "success": false,
                     "error": "A fresh calibration already exists. Call /calibration/stop or wait for expiry.",
+                    "frame_count": fm.calibration_frame_count(),
+                    "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
                 }));
             }
             _ => {} // Stale/Expired/Uncalibrated — ok to recalibrate
@@ -6994,6 +6997,8 @@ async fn calibration_start(State(state): State<SharedState>) -> Json<serde_json:
             s.field_model = Some(fm);
             Json(serde_json::json!({
                 "success": true,
+                "frame_count": 0,
+                "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
                 "message": "Calibration started — keep room empty while frames accumulate.",
             }))
         }
@@ -7018,6 +7023,7 @@ async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::
                     "baseline_eigenvalue_count": baseline,
                     "variance_explained": variance_explained,
                     "frame_count": fm.calibration_frame_count(),
+                    "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
                 }))
             }
             Err(e) => Json(serde_json::json!({
@@ -7040,10 +7046,13 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
             "active": true,
             "status": format!("{:?}", fm.status()),
             "frame_count": fm.calibration_frame_count(),
+            "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
         })),
         None => Json(serde_json::json!({
             "active": false,
             "status": "none",
+            "frame_count": 0,
+            "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
         })),
     }
 }
@@ -8300,9 +8309,16 @@ async fn calibration_overview_endpoint(
         .as_ref()
         .map(|fm| format!("{:?}", fm.status()))
         .unwrap_or_else(|| "not_started".to_string());
+    let frame_count = s
+        .field_model
+        .as_ref()
+        .map(|fm| fm.calibration_frame_count())
+        .unwrap_or(0);
     Json(serde_json::json!({
         "status": status,
         "enabled": s.field_model.is_some(),
+        "frame_count": frame_count,
+        "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
         "active_nodes": active_node_count(&s, std::time::Instant::now()),
         "min_nodes": s.min_nodes,
         "dedup_factor": s.dedup_factor,

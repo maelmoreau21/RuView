@@ -12,6 +12,7 @@ export class WebSocketService {
     
     // Configuration
     this.config = {
+      autoReconnect: true,
       heartbeatInterval: 30000, // 30 seconds
       connectionTimeout: 10000, // 10 seconds
       maxReconnectAttempts: 10,
@@ -414,8 +415,8 @@ export class WebSocketService {
   shouldReconnect(url) {
     const attempts = this.reconnectAttempts.get(url) || 0;
     const maxAttempts = this.config.maxReconnectAttempts;
-    this.logger.debug('Checking if should reconnect', { url, attempts, maxAttempts });
-    return attempts < maxAttempts;
+    this.logger.debug('Checking if should reconnect', { url, attempts, maxAttempts, autoReconnect: this.config.autoReconnect });
+    return this.config.autoReconnect && attempts < maxAttempts;
   }
 
   scheduleReconnect(url) {
@@ -590,6 +591,49 @@ export class WebSocketService {
   disableDebugLogging() {
     this.config.enableDebugLogging = false;
     this.logger.info('Debug logging disabled');
+  }
+
+  updateConfig(newConfig = {}) {
+    const next = { ...this.config };
+
+    if ('autoReconnect' in newConfig) next.autoReconnect = Boolean(newConfig.autoReconnect);
+    for (const key of ['heartbeatInterval', 'connectionTimeout']) {
+      if (key in newConfig) {
+        const value = Number(newConfig[key]);
+        if (Number.isFinite(value) && value >= 1000) next[key] = value;
+      }
+    }
+    if ('maxReconnectAttempts' in newConfig) {
+      const value = Number(newConfig.maxReconnectAttempts);
+      if (Number.isFinite(value) && value >= 0) next.maxReconnectAttempts = Math.floor(value);
+    }
+    if ('enableDebugLogging' in newConfig) {
+      next.enableDebugLogging = Boolean(newConfig.enableDebugLogging);
+    }
+
+    const heartbeatChanged = next.heartbeatInterval !== this.config.heartbeatInterval;
+    this.config = next;
+
+    for (const connection of this.connections.values()) {
+      const attempts = this.reconnectAttempts.get(connection.url) || 0;
+      const reconnectDisallowed = !this.config.autoReconnect || attempts >= this.config.maxReconnectAttempts;
+      if (reconnectDisallowed && connection.reconnectTimer) {
+        clearTimeout(connection.reconnectTimer);
+        connection.reconnectTimer = null;
+      }
+    }
+
+    if (heartbeatChanged) {
+      for (const connection of this.connections.values()) {
+        if (connection.heartbeatTimer) {
+          clearInterval(connection.heartbeatTimer);
+          connection.heartbeatTimer = null;
+        }
+        if (connection.status === 'connected') this.startHeartbeat(connection.url);
+      }
+    }
+
+    this.logger.info('Configuration updated', { config: this.config });
   }
 
   getAllConnectionStats() {

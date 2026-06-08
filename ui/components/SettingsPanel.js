@@ -59,6 +59,7 @@ export class SettingsPanel {
 
       // Model settings
       defaultModelPath: 'data/models/',
+      modelSaveDirectory: 'data/models/',
       autoLoadModel: false,
       inferenceDevice: 'CPU',
       inferenceThreads: 4,
@@ -111,6 +112,8 @@ export class SettingsPanel {
     
     // Update UI with current settings
     this.updateUI();
+
+    this.applyToServices({ silent: true });
     
     this.logger.info('SettingsPanel component initialized successfully');
   }
@@ -267,6 +270,10 @@ export class SettingsPanel {
             <div class="setting-row">
               <label for="default-model-path-${this.containerId}">Default Model Path:</label>
               <input type="text" id="default-model-path-${this.containerId}" class="setting-input setting-input-wide" placeholder="data/models/">
+            </div>
+            <div class="setting-row">
+              <label for="model-save-directory-${this.containerId}">Model Save Directory:</label>
+              <input type="text" id="model-save-directory-${this.containerId}" class="setting-input setting-input-wide" placeholder="data/models/">
             </div>
             <div class="setting-row">
               <label for="auto-load-model-${this.containerId}">Auto-load Model on Startup:</label>
@@ -648,7 +655,7 @@ export class SettingsPanel {
     });
 
     // Text inputs
-    const textInputs = ['default-model-path', 'checkpoint-directory', 'recording-directory'];
+    const textInputs = ['default-model-path', 'model-save-directory', 'checkpoint-directory', 'recording-directory'];
     textInputs.forEach(id => {
       const input = document.getElementById(`${id}-${this.containerId}`);
       input?.addEventListener('change', (e) => {
@@ -681,6 +688,7 @@ export class SettingsPanel {
   updateSetting(key, value) {
     this.settings[key] = value;
     this.saveSettings();
+    this.applyToServices({ silent: true });
     this.notifyCallback('onSettingsChange', { key, value, settings: this.settings });
     this.updateStatus(`Updated ${key}`);
     this.logger.debug('Setting updated', { key, value });
@@ -736,6 +744,7 @@ export class SettingsPanel {
       this.settings = this.getDefaultSettings();
       this.updateUI();
       this.saveSettings();
+      this.applyToServices({ silent: true });
       this.notifyCallback('onSettingsChange', { reset: true, settings: this.settings });
       this.updateStatus('Settings reset to defaults');
       this.logger.info('Settings reset to defaults');
@@ -775,6 +784,7 @@ export class SettingsPanel {
           this.settings = { ...this.getDefaultSettings(), ...data.settings };
           this.updateUI();
           this.saveSettings();
+          this.applyToServices({ silent: true });
           this.notifyCallback('onSettingsChange', { imported: true, settings: this.settings });
           this.notifyCallback('onImport', data);
           this.updateStatus('Settings imported successfully');
@@ -844,6 +854,7 @@ export class SettingsPanel {
       maxReconnectAttempts: 10,
       enableSmoothing: true,
       defaultModelPath: 'data/models/',
+      modelSaveDirectory: 'data/models/',
       autoLoadModel: false,
       inferenceDevice: 'CPU',
       inferenceThreads: 4,
@@ -896,26 +907,30 @@ export class SettingsPanel {
   }
 
   // Apply settings to services
-  applyToServices() {
+  applyToServices(options = {}) {
     try {
       // Apply pose service settings
       poseService.updateConfig({
         enableValidation: this.settings.enableValidation,
         enablePerformanceTracking: this.settings.enablePerformanceTracking,
         confidenceThreshold: this.settings.confidenceThreshold,
-        maxPersons: this.settings.maxPersons
+        keypointConfidenceThreshold: this.settings.keypointConfidenceThreshold,
+        maxPersons: this.settings.maxPersons,
+        maxFps: this.settings.maxFps
       });
 
       // Apply WebSocket service settings
       if (wsService.updateConfig) {
         wsService.updateConfig({
+          autoReconnect: this.settings.autoReconnect,
+          connectionTimeout: this.settings.connectionTimeout,
           enableDebugLogging: this.settings.enableDebugLogging,
           heartbeatInterval: this.settings.heartbeatInterval,
           maxReconnectAttempts: this.settings.maxReconnectAttempts
         });
       }
 
-      this.updateStatus('Settings applied to services');
+      if (!options.silent) this.updateStatus('Settings applied to services');
       this.logger.info('Settings applied to services');
     } catch (error) {
       this.logger.error('Error applying settings to services', { error: error.message });

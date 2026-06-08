@@ -18,11 +18,11 @@ export const DEFAULTS = {
   boneThick: 0.018, jointSize: 0.035, glow: 0.3, trail: 0.35,
   wireColor: '#00d878', jointColor: '#ff4060', aura: 0.02,
   field: 0.45, waves: 0.4, ambient: 0.7, reflect: 0.2,
-  fov: 50, orbitSpeed: 0.15, grid: true, room: true,
+  fov: 50, orbitSpeed: 0.15, grid: true, room: true, obstacles: false,
   dataSource: 'ws', wsUrl: '',
 };
 
-export const SETTINGS_VERSION = '7';
+export const SETTINGS_VERSION = '8';
 
 export const PRESETS = {
   foundation: {},
@@ -176,6 +176,10 @@ export class HudController {
     document.getElementById('opt-room').addEventListener('change', (e) => {
       s.room = e.target.checked; obs._roomWire.visible = e.target.checked; this.saveSettings();
     });
+    document.getElementById('opt-obstacles').checked = s.obstacles;
+    document.getElementById('opt-obstacles').addEventListener('change', (e) => {
+      s.obstacles = e.target.checked; obs._refreshObstacleMode(); this.saveSettings();
+    });
 
     // Buttons
     document.getElementById('btn-reset-camera').addEventListener('click', () => {
@@ -270,6 +274,8 @@ export class HudController {
     if (gridEl) { gridEl.checked = obs.settings.grid; obs._grid.visible = obs.settings.grid; }
     const roomEl = document.getElementById('opt-room');
     if (roomEl) { roomEl.checked = obs.settings.room; obs._roomWire.visible = obs.settings.room; }
+    const obstaclesEl = document.getElementById('opt-obstacles');
+    if (obstaclesEl) { obstaclesEl.checked = obs.settings.obstacles; obs._refreshObstacleMode(); }
     document.getElementById('opt-wire-color').value = obs.settings.wireColor;
     document.getElementById('opt-joint-color').value = obs.settings.jointColor;
     obs._applyPostSettings();
@@ -343,6 +349,7 @@ export class HudController {
     this._setText('rssi-value', `${Math.round(feat.mean_rssi || 0)} dBm`);
     this._setText('var-value', (feat.variance || 0).toFixed(2));
     this._setText('motion-value', (feat.motion_band_power || 0).toFixed(3));
+    this.updateObstacleAttenuation();
 
     // Mini person-count dots. Prefer the conservative rendered count when the
     // backend provides anti-duplicate evidence.
@@ -375,6 +382,16 @@ export class HudController {
 
     this._updateFleetFromData(data);
     this._refreshOperationalData();
+  }
+
+  updateObstacleAttenuation() {
+    const attenuation = this._obs.obstacleAttenuation?.();
+    this._setText(
+      'attenuation-value',
+      attenuation
+        ? `Atténuation : ${attenuation.obstacleName}${attenuation.count > 1 ? ` +${attenuation.count - 1}` : ''}`
+        : '--'
+    );
   }
 
   // ============================================================

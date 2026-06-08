@@ -18,10 +18,19 @@ const state = {
   placementDirty: false,
   placementError: '',
   placementServerError: '',
+  placementZoom: 1.0,
+  placementPan: { x: 0, z: 0 },
   draggingNodeId: null,
+  placementPanDrag: null,
+  calibrationLastStatus: null,
+  calibrationEvents: [],
 };
 
 const VALID_PANELS = new Set(['fleet', 'modules', 'vitals', 'calibration', 'diagnostics']);
+const PLACEMENT_MIN_ZOOM = 0.25;
+const PLACEMENT_MAX_ZOOM = 8;
+const PLACEMENT_FIT_PADDING = 1.25;
+const CALIBRATION_MIN_FRAMES_FALLBACK = 12000;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
@@ -183,24 +192,122 @@ function roomBounds() {
 
 function pointToStage(pos) {
   const [width, , depth] = roomDims();
+  const zoom = state.placementZoom || 1;
   return {
-    left: Math.max(4, Math.min(96, ((pos.x / width) + 0.5) * 100)),
-    top: Math.max(4, Math.min(96, (0.5 - (pos.z / depth)) * 100)),
+    left: 50 + (((pos.x - state.placementPan.x) / width) * 100 * zoom),
+    top: 50 - (((pos.z - state.placementPan.z) / depth) * 100 * zoom),
+  };
+}
+
+function stagePointToWorld(stage, clientX, clientY) {
+  const rect = stage.getBoundingClientRect();
+  const [width, , depth] = roomDims();
+  const zoom = Math.max(PLACEMENT_MIN_ZOOM, state.placementZoom || 1);
+  const left = (clientX - rect.left) / Math.max(1, rect.width);
+  const top = (clientY - rect.top) / Math.max(1, rect.height);
+  return {
+    x: state.placementPan.x + ((left - 0.5) * width / zoom),
+    z: state.placementPan.z + ((0.5 - top) * depth / zoom),
   };
 }
 
 function stageToPosition(stage, clientX, clientY, current) {
-  const rect = stage.getBoundingClientRect();
-  const [width, , depth] = roomDims();
-  const leftPct = clamp((clientX - rect.left) / Math.max(1, rect.width), 0.04, 0.96);
-  const topPct = clamp((clientY - rect.top) / Math.max(1, rect.height), 0.04, 0.96);
+  const point = stagePointToWorld(stage, clientX, clientY);
   return {
     ...clonePosition(current),
-    x: (leftPct - 0.5) * width,
-    z: (0.5 - topPct) * depth,
+    x: point.x,
+    z: point.z,
     source: 'manual',
     confidence: 1,
   };
+}
+
+function updatePlacementViewControls() {
+  setText('placement-zoom-label', `${Math.round((state.placementZoom || 1) * 100)}%`);
+  const zoomIn = $('#placement-zoom-in');
+  const zoomOut = $('#placement-zoom-out');
+  if (zoomIn) zoomIn.disabled = state.placementZoom >= PLACEMENT_MAX_ZOOM - 0.001;
+  if (zoomOut) zoomOut.disabled = state.placementZoom <= PLACEMENT_MIN_ZOOM + 0.001;
+}
+
+function updateStageViewportStyle(stage) {
+  const rect = stage.getBoundingClientRect();
+  const [width, , depth] = roomDims();
+  const zoom = Math.max(PLACEMENT_MIN_ZOOM, state.placementZoom || 1);
+  const gridX = clamp((rect.width / Math.max(1, width)) * zoom, 8, 180);
+  const gridY = clamp((rect.height / Math.max(1, depth)) * zoom, 8, 180);
+  const originX = rect.width * (0.5 - ((state.placementPan.x / width) * zoom));
+  const originY = rect.height * (0.5 + ((state.placementPan.z / depth) * zoom));
+  stage.style.setProperty('--topology-grid-x', `${gridX}px`);
+  stage.style.setProperty('--topology-grid-y', `${gridY}px`);
+  stage.style.setProperty('--topology-grid-origin-x', `${originX}px`);
+  stage.style.setProperty('--topology-grid-origin-y', `${originY}px`);
+  updatePlacementViewControls();
+}
+
+function renderPlacementRoomFrame(stage) {
+  const [width, , depth] = roomDims();
+  const topLeft = pointToStage({ x: -width / 2, y: 0, z: depth / 2 });
+  const frame = create('div', 'topology-room-frame');
+  frame.style.left = `${topLeft.left}%`;
+  frame.style.top = `${topLeft.top}%`;
+  frame.style.width = `${100 * (state.placementZoom || 1)}%`;
+  frame.style.height = `${100 * (state.placementZoom || 1)}%`;
+  stage.append(frame);
+}
+
+function zoomPlacementAt(stage, clientX, clientY, factor) {
+  const before = stagePointToWorld(stage, clientX, clientY);
+  const nextZoom = clamp((state.placementZoom || 1) * factor, PLACEMENT_MIN_ZOOM, PLACEMENT_MAX_ZOOM);
+  if (Math.abs(nextZoom - state.placementZoom) < 0.0001) return;
+  state.placementZoom = nextZoom;
+  const after = stagePointToWorld(stage, clientX, clientY);
+  state.placementPan.x += before.x - after.x;
+  state.placementPan.z += before.z - after.z;
+  renderTopology();
+}
+
+function zoomPlacementBy(factor) {
+  const stage = $('#topology-stage');
+  if (!stage) return;
+  const rect = stage.getBoundingClientRect();
+  zoomPlacementAt(stage, rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+}
+
+function resetPlacementView() {
+  state.placementZoom = 1.0;
+  state.placementPan = { x: 0, z: 0 };
+  renderTopology();
+}
+
+function fitPlacementViewToNodes() {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  if (!nodes.length) {
+    resetPlacementView();
+    return;
+  }
+
+  const positions = nodes.map(currentNodePosition);
+  const [roomWidth, , roomDepth] = roomDims();
+  const xs = positions.map((pos) => pos.x);
+  const zs = positions.map((pos) => pos.z);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minZ = Math.min(...zs);
+  const maxZ = Math.max(...zs);
+  const spanX = Math.max(maxX - minX, roomWidth * 0.25);
+  const spanZ = Math.max(maxZ - minZ, roomDepth * 0.25);
+
+  state.placementPan = {
+    x: (minX + maxX) / 2,
+    z: (minZ + maxZ) / 2,
+  };
+  state.placementZoom = clamp(
+    Math.min(roomWidth / (spanX * PLACEMENT_FIT_PADDING), roomDepth / (spanZ * PLACEMENT_FIT_PADDING)),
+    PLACEMENT_MIN_ZOOM,
+    PLACEMENT_MAX_ZOOM,
+  );
+  renderTopology();
 }
 
 function positionsEqual(a, b) {
@@ -226,9 +333,7 @@ function validatePosition(pos) {
     return 'Coordonnées invalides.';
   }
   const b = roomBounds();
-  if (pos.x < b.minX || pos.x > b.maxX) return `X doit rester entre ${b.minX.toFixed(2)} m et ${b.maxX.toFixed(2)} m.`;
   if (pos.y < b.minY || pos.y > b.maxY) return `Y hauteur doit rester entre ${b.minY.toFixed(2)} m et ${b.maxY.toFixed(2)} m.`;
-  if (pos.z < b.minZ || pos.z > b.maxZ) return `Z doit rester entre ${b.minZ.toFixed(2)} m et ${b.maxZ.toFixed(2)} m.`;
   return '';
 }
 
@@ -239,16 +344,21 @@ function refreshPlacementDirty() {
 function setPlacementInputValues(pos) {
   const b = roomBounds();
   const fields = [
-    ['placement-x', 'x', b.minX, b.maxX],
+    ['placement-x', 'x', null, null],
     ['placement-y', 'y', b.minY, b.maxY],
-    ['placement-z', 'z', b.minZ, b.maxZ],
+    ['placement-z', 'z', null, null],
   ];
   for (const [id, axis, min, max] of fields) {
     const input = document.getElementById(id);
     if (!(input instanceof HTMLInputElement)) continue;
     input.disabled = !pos;
-    input.min = min.toFixed(2);
-    input.max = max.toFixed(2);
+    if (min === null || max === null) {
+      input.removeAttribute('min');
+      input.removeAttribute('max');
+    } else {
+      input.min = min.toFixed(2);
+      input.max = max.toFixed(2);
+    }
     input.step = '0.01';
     input.setAttribute('aria-invalid', state.placementError ? 'true' : 'false');
     if (!pos) {
@@ -407,6 +517,8 @@ function renderTopology() {
   if (!stage) return;
   stage.replaceChildren();
   syncPlacementState();
+  updateStageViewportStyle(stage);
+  renderPlacementRoomFrame(stage);
 
   const aps = Array.isArray(state.topology?.access_points) ? state.topology.access_points : [];
   const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
@@ -628,14 +740,58 @@ function renderVitals() {
   setText('vitals-status', breathing || heart || presence ? 'live' : 'attente');
 }
 
+function recordCalibrationEvent(message, level = 'info') {
+  state.calibrationEvents.unshift({
+    message,
+    level,
+    time: new Date().toLocaleTimeString(),
+  });
+  state.calibrationEvents = state.calibrationEvents.slice(0, 6);
+}
+
+function renderCalibrationLog() {
+  const log = $('#calibration-log');
+  clear(log);
+  for (const event of state.calibrationEvents) {
+    const item = create('li', event.level === 'info' ? '' : event.level);
+    item.append(create('time', '', event.time), create('span', '', event.message));
+    log?.append(item);
+  }
+}
+
+function noteCalibrationStatus(status, data) {
+  if (state.calibrationLastStatus === null) {
+    state.calibrationLastStatus = status;
+    return;
+  }
+  if (state.calibrationLastStatus === status) return;
+  const frames = Number(data.frame_count || 0);
+  const suffix = frames > 0 ? ` (${frames} frame(s))` : '';
+  recordCalibrationEvent(`Calibration ${state.calibrationLastStatus} -> ${status}${suffix}`);
+  state.calibrationLastStatus = status;
+}
+
 function renderCalibration() {
   const data = state.calibration || {};
   const status = text(data.status, 'unknown');
+  const frameCount = Math.max(0, Number(data.frame_count || 0));
+  const minFrames = Math.max(1, Number(data.min_frames || CALIBRATION_MIN_FRAMES_FALLBACK));
+  const progress = status === 'Fresh'
+    ? 100
+    : status === 'Collecting'
+      ? Math.min(100, Math.round((frameCount / minFrames) * 100))
+      : 0;
   const table = $('#calibration-table');
   clear(table);
+  noteCalibrationStatus(status, { ...data, frame_count: frameCount });
   setText('calibration-status', status);
+  setText('calibration-progress-label', `${frameCount} / ${minFrames} frames`);
+  const progressFill = $('#calibration-progress-fill');
+  if (progressFill) progressFill.style.width = `${progress}%`;
   const rows = [
     ['actif', data.enabled],
+    ['frame_count', frameCount],
+    ['min_frames', minFrames],
     ['active_nodes', data.active_nodes],
     ['min_nodes', data.min_nodes],
     ['dedup_factor', data.dedup_factor],
@@ -649,9 +805,12 @@ function renderCalibration() {
   const ready = Boolean(state.topology?.readiness?.ready);
   const start = $('#start-calibration');
   if (start) {
-    start.disabled = !ready;
+    start.disabled = !ready || status === 'Collecting';
     start.title = ready ? 'Démarrer la calibration pièce vide' : 'Attendre au moins un nœud ESP32-C6 live';
   }
+  const stop = $('#stop-calibration');
+  if (stop) stop.disabled = !data.enabled;
+  renderCalibrationLog();
 }
 
 function renderAll() {
@@ -770,6 +929,7 @@ function updatePositionFromInputs() {
 }
 
 function beginNodeDrag(event) {
+  if (event.button !== undefined && event.button !== 0) return;
   const target = event.target instanceof Element ? event.target : null;
   const markerEl = target?.closest('.topology-marker.node');
   if (!markerEl) return;
@@ -778,6 +938,27 @@ function beginNodeDrag(event) {
   event.preventDefault();
   state.draggingNodeId = nodeId;
   selectNode(nodeId);
+}
+
+function beginPlacementPan(event) {
+  if (event.button !== undefined && event.button !== 0) return;
+  const stage = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  const target = event.target instanceof Element ? event.target : null;
+  if (!stage || target?.closest('.topology-marker')) return;
+  event.preventDefault();
+  state.placementPanDrag = {
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startPan: { ...state.placementPan },
+    moved: false,
+  };
+  stage.classList.add('is-panning');
+  try {
+    stage.setPointerCapture(event.pointerId);
+  } catch (_error) {
+    // Pointer capture is best-effort; window-level listeners keep panning active.
+  }
 }
 
 function updateNodeDrag(event) {
@@ -794,8 +975,57 @@ function updateNodeDrag(event) {
   renderFleet();
 }
 
+function updatePlacementPan(event) {
+  const drag = state.placementPanDrag;
+  if (!drag) return;
+  const stage = $('#topology-stage');
+  if (!stage) return;
+  event.preventDefault();
+  const rect = stage.getBoundingClientRect();
+  const [width, , depth] = roomDims();
+  const zoom = Math.max(PLACEMENT_MIN_ZOOM, state.placementZoom || 1);
+  const dx = event.clientX - drag.startClientX;
+  const dy = event.clientY - drag.startClientY;
+  state.placementPan = {
+    x: drag.startPan.x - ((dx / Math.max(1, rect.width)) * width / zoom),
+    z: drag.startPan.z + ((dy / Math.max(1, rect.height)) * depth / zoom),
+  };
+  drag.moved = drag.moved || Math.hypot(dx, dy) > 3;
+  renderTopology();
+}
+
 function endNodeDrag() {
   state.draggingNodeId = null;
+}
+
+function endPlacementPan(event) {
+  const drag = state.placementPanDrag;
+  if (!drag) return;
+  const stage = $('#topology-stage');
+  if (stage) {
+    stage.classList.remove('is-panning');
+    try {
+      stage.releasePointerCapture(drag.pointerId);
+    } catch (_error) {
+      // Matching best-effort capture release.
+    }
+  }
+  state.placementPanDrag = null;
+  if (drag.moved && event?.type === 'pointerup') event.preventDefault();
+}
+
+function handlePlacementWheel(event) {
+  const stage = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  if (!stage) return;
+  event.preventDefault();
+  const direction = event.deltaY < 0 ? 1 : -1;
+  const factor = direction > 0 ? 1.15 : 1 / 1.15;
+  zoomPlacementAt(stage, event.clientX, event.clientY, factor);
+}
+
+function handlePlacementDoubleClick(event) {
+  event.preventDefault();
+  fitPlacementViewToNodes();
 }
 
 function resetPlacement() {
@@ -894,26 +1124,60 @@ function bindActions() {
   });
   $('#start-calibration')?.addEventListener('click', async () => {
     try {
-      await fetchJson('/api/v1/calibration/start', { method: 'POST' });
+      const result = await fetchJson('/api/v1/calibration/start', { method: 'POST' });
+      if (result.success === false) throw new Error(result.error || 'Calibration start rejected');
+      state.calibration = {
+        ...(state.calibration || {}),
+        ...result,
+        status: 'Collecting',
+        enabled: true,
+        frame_count: Number(result.frame_count || 0),
+      };
+      recordCalibrationEvent('Calibration démarrée');
       logEvent('Calibration démarrée');
+      renderCalibration();
       await refreshRest();
     } catch (error) {
+      recordCalibrationEvent(error.message, 'warn');
       logEvent(error.message, 'warn');
+      renderCalibration();
     }
   });
   $('#stop-calibration')?.addEventListener('click', async () => {
     try {
-      await fetchJson('/api/v1/calibration/stop', { method: 'POST' });
+      const result = await fetchJson('/api/v1/calibration/stop', { method: 'POST' });
+      if (result.success === false) throw new Error(result.error || 'Calibration stop rejected');
+      state.calibration = {
+        ...(state.calibration || {}),
+        ...result,
+        status: 'Fresh',
+        enabled: true,
+      };
+      recordCalibrationEvent(`Calibration arrêtée (${Number(result.frame_count || 0)} frame(s))`);
       logEvent('Calibration arrêtée');
+      renderCalibration();
       await refreshRest();
     } catch (error) {
+      recordCalibrationEvent(error.message, 'warn');
       logEvent(error.message, 'warn');
+      renderCalibration();
     }
   });
-  $('#topology-stage')?.addEventListener('pointerdown', beginNodeDrag);
+  const topologyStage = $('#topology-stage');
+  topologyStage?.addEventListener('pointerdown', beginNodeDrag);
+  topologyStage?.addEventListener('pointerdown', beginPlacementPan);
+  topologyStage?.addEventListener('wheel', handlePlacementWheel, { passive: false });
+  topologyStage?.addEventListener('dblclick', handlePlacementDoubleClick);
   window.addEventListener('pointermove', updateNodeDrag);
+  window.addEventListener('pointermove', updatePlacementPan);
   window.addEventListener('pointerup', endNodeDrag);
+  window.addEventListener('pointerup', endPlacementPan);
   window.addEventListener('pointercancel', endNodeDrag);
+  window.addEventListener('pointercancel', endPlacementPan);
+  window.addEventListener('resize', renderTopology);
+  $('#placement-zoom-in')?.addEventListener('click', () => zoomPlacementBy(1.2));
+  $('#placement-zoom-out')?.addEventListener('click', () => zoomPlacementBy(1 / 1.2));
+  $('#placement-zoom-fit')?.addEventListener('click', fitPlacementViewToNodes);
   $('#reset-placement')?.addEventListener('click', resetPlacement);
   $('#save-placement')?.addEventListener('click', persistPlacement);
   for (const id of ['placement-x', 'placement-y', 'placement-z']) {
@@ -981,6 +1245,9 @@ window.__ruvsenseConsoleTestApi = {
   selectNode,
   changedPlacementNodes: () => changedPlacementNodes().map(({ id, pos }) => ({ id, position_m: [pos.x, pos.y, pos.z] })),
   updatePositionFromInputs,
+  fitPlacementViewToNodes,
+  resetPlacementView,
+  placementView: () => ({ zoom: state.placementZoom, pan: { ...state.placementPan } }),
 };
 
 async function init() {

@@ -325,6 +325,13 @@ body {
   color: var(--blue-signal);
 }
 
+#attenuation-value {
+  max-width: 150px;
+  color: var(--amber);
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
 #rssi-sparkline {
   width: 100%;
   height: 48px;
