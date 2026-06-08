@@ -860,6 +860,16 @@ body {
   box-shadow: 0 0 4px rgba(0, 216, 120, 0.4);
 }
 
+.persons-dots--ambiguous .person-dot--active {
+  background: var(--amber);
+  border-color: var(--amber);
+  box-shadow: 0 0 5px rgba(255, 176, 32, 0.46);
+}
+
+.signal-value.ambiguous-count {
+  color: var(--amber);
+}
+
 /* ---- Vital Value Color Transitions ---- */
 .vital-value span:first-child {
   transition: color 0.6s ease;

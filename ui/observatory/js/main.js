@@ -30,6 +30,7 @@ const C = {
 };
 
 const MAX_SCENE_PERSONS = 8;
+const PERSON_DEDUPE_RADIUS_M = 0.65;
 
 // SCENARIO_NAMES, DEFAULTS, SETTINGS_VERSION, PRESETS imported from hud-controller.js
 
@@ -491,6 +492,73 @@ class Observatory {
     return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
   }
 
+  _countEvidence(frame) {
+    const evidence = frame?.count_evidence && typeof frame.count_evidence === 'object'
+      ? frame.count_evidence
+      : null;
+    const personCount = Array.isArray(frame?.persons) ? frame.persons.length : 0;
+    const raw = this._integerOrZero(evidence?.raw_estimated_persons ?? frame?.estimated_persons ?? personCount);
+    let rendered = this._integerOrZero(evidence?.rendered_persons ?? evidence?.stable_persons ?? frame?.estimated_persons ?? personCount);
+    if (!evidence && rendered === 0 && personCount > 0) rendered = personCount;
+    rendered = Math.min(rendered, MAX_SCENE_PERSONS);
+    const stable = this._integerOrZero(evidence?.stable_persons ?? rendered);
+
+    return {
+      stable_persons: Math.min(stable, MAX_SCENE_PERSONS),
+      raw_estimated_persons: raw,
+      rendered_persons: rendered,
+      active_nodes: this._integerOrZero(evidence?.active_nodes ?? frame?.nodes?.length ?? 0),
+      supporting_nodes: this._integerOrZero(evidence?.supporting_nodes ?? 0),
+      ambiguous: Boolean(evidence?.ambiguous || raw > rendered),
+      reason: String(evidence?.reason || (raw > rendered ? 'ambiguous_multipath' : 'stable')),
+    };
+  }
+
+  _personIdentity(person, index) {
+    const id = person?.id ?? person?.track_id ?? person?.person_id;
+    return id == null || id === '' ? `person_${index + 1}` : String(id);
+  }
+
+  _personDedupePosition(person) {
+    return this._parseVector3(person?.position_m) || this._parseVector3(person?.position);
+  }
+
+  _personConfidence(person) {
+    const confidence = Number(person?.confidence ?? person?.tracking_confidence ?? person?.score ?? 0);
+    return Number.isFinite(confidence) ? confidence : 0;
+  }
+
+  _dedupePersons(persons, renderLimit) {
+    const byId = new Map();
+    persons.forEach((person, index) => {
+      const id = this._personIdentity(person, index);
+      const current = byId.get(id);
+      if (!current || this._personConfidence(person) >= this._personConfidence(current)) {
+        byId.set(id, { ...person, id });
+      }
+    });
+
+    const merged = [];
+    for (const person of byId.values()) {
+      const pos = this._personDedupePosition(person);
+      const closeIndex = pos
+        ? merged.findIndex((existing) => {
+          const other = this._personDedupePosition(existing);
+          if (!other) return false;
+          return Math.hypot(pos[0] - other[0], pos[1] - other[1], pos[2] - other[2]) < PERSON_DEDUPE_RADIUS_M;
+        })
+        : -1;
+      if (closeIndex < 0) {
+        merged.push(person);
+      } else if (this._personConfidence(person) >= this._personConfidence(merged[closeIndex])) {
+        merged[closeIndex] = person;
+      }
+    }
+
+    const limit = Math.max(0, Math.min(MAX_SCENE_PERSONS, this._integerOrZero(renderLimit)));
+    return limit > 0 ? merged.slice(0, limit) : [];
+  }
+
   _edgeVitalsFromFrame(frame) {
     if (!frame || typeof frame !== 'object') return null;
     const br = this._numberOrNull(frame.breathing_rate_bpm ?? frame.breathing_bpm);
@@ -570,9 +638,9 @@ class Observatory {
     if (!rawFrame || typeof rawFrame !== 'object') return null;
     const frame = this._lastEdgeVitals ? this._mergeEdgeVitals(rawFrame, this._lastEdgeVitals) : { ...rawFrame };
     const rawPersons = Array.isArray(frame.persons) ? frame.persons : [];
-    const persons = rawPersons.slice(0, MAX_SCENE_PERSONS).map((person, index) => ({
+    let persons = rawPersons.slice(0, MAX_SCENE_PERSONS).map((person, index) => ({
       ...person,
-      id: person?.id ?? person?.track_id ?? `person_${index + 1}`,
+      id: this._personIdentity(person, index),
     }));
 
     if (!persons.length) {
@@ -590,7 +658,19 @@ class Observatory {
       }
     }
 
-    const estimatedPersons = Math.max(this._integerOrZero(frame.estimated_persons), persons.length);
+    const evidence = this._countEvidence({ ...frame, persons });
+    const hasCountEvidence = Boolean(frame.count_evidence && typeof frame.count_evidence === 'object');
+    const renderLimit = hasCountEvidence
+      ? evidence.rendered_persons
+      : Math.max(evidence.rendered_persons, persons.length);
+    persons = this._dedupePersons(persons, renderLimit);
+    const renderedPersons = hasCountEvidence ? evidence.rendered_persons : (persons.length || evidence.rendered_persons);
+    const countEvidence = {
+      ...evidence,
+      rendered_persons: renderedPersons,
+      stable_persons: Math.min(evidence.stable_persons || renderedPersons, renderedPersons),
+      ambiguous: Boolean(evidence.ambiguous || evidence.raw_estimated_persons > renderedPersons),
+    };
     const classification = {
       ...(frame.classification || {}),
     };
@@ -605,7 +685,8 @@ class Observatory {
       type: 'sensing_update',
       msg_type: frame.msg_type || 'sensing_update',
       persons,
-      estimated_persons: estimatedPersons,
+      estimated_persons: renderedPersons,
+      count_evidence: countEvidence,
       classification,
     };
   }
@@ -613,7 +694,7 @@ class Observatory {
   _sceneFrameData(data) {
     if (!data) return data;
     const inputPersons = Array.isArray(data.persons) ? data.persons.slice(0, MAX_SCENE_PERSONS) : [];
-    const persons = inputPersons.map((person, index) => {
+    let persons = inputPersons.map((person, index) => {
       const layoutPosition = String(person?.position_source || '').toLowerCase() === 'observatory_layout'
         ? this._parseVector3(person.position)
         : null;
@@ -628,11 +709,24 @@ class Observatory {
         ...(keypointsM ? { keypoints_m: keypointsM } : {}),
       };
     }).filter(Boolean);
-    const estimatedPersons = Math.max(this._integerOrZero(data.estimated_persons), persons.length);
+    const evidence = this._countEvidence({ ...data, persons });
+    const hasCountEvidence = Boolean(data.count_evidence && typeof data.count_evidence === 'object');
+    const renderLimit = hasCountEvidence
+      ? evidence.rendered_persons
+      : Math.max(evidence.rendered_persons, persons.length);
+    persons = this._dedupePersons(persons, renderLimit);
+    const renderedPersons = hasCountEvidence ? evidence.rendered_persons : (persons.length || evidence.rendered_persons);
+    const countEvidence = {
+      ...evidence,
+      rendered_persons: renderedPersons,
+      stable_persons: Math.min(evidence.stable_persons || renderedPersons, renderedPersons),
+      ambiguous: Boolean(evidence.ambiguous || evidence.raw_estimated_persons > renderedPersons),
+    };
     return {
       ...data,
       persons,
-      estimated_persons: estimatedPersons,
+      estimated_persons: renderedPersons,
+      count_evidence: countEvidence,
       classification: {
         ...(data.classification || {}),
         presence: Boolean(data.classification?.presence || persons.length),
@@ -1319,4 +1413,9 @@ class Observatory {
   }
 }
 
-new Observatory();
+const observatory = new Observatory();
+window.__ruvsenseObservatoryTestApi = {
+  ingestFrame: (frame) => observatory._ingestSocketFrame(frame),
+  normalizeFrame: (frame) => observatory._normalizeSensingFrame(frame),
+  sceneFrameData: (frame) => observatory._sceneFrameData(observatory._normalizeSensingFrame(frame)),
+};

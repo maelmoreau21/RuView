@@ -344,12 +344,21 @@ export class HudController {
     this._setText('var-value', (feat.variance || 0).toFixed(2));
     this._setText('motion-value', (feat.motion_band_power || 0).toFixed(3));
 
-    // Mini person-count dots
-    const personCount = Math.max(
-      Number(data.estimated_persons || 0),
-      Array.isArray(data.persons) ? data.persons.length : 0,
-    );
-    this._updatePersonDots(personCount);
+    // Mini person-count dots. Prefer the conservative rendered count when the
+    // backend provides anti-duplicate evidence.
+    const evidence = data.count_evidence && typeof data.count_evidence === 'object' ? data.count_evidence : null;
+    const renderedCount = Number(evidence?.rendered_persons ?? data.estimated_persons ?? 0);
+    const rawCount = Number(evidence?.raw_estimated_persons ?? data.estimated_persons ?? renderedCount);
+    const fallbackCount = Array.isArray(data.persons) ? data.persons.length : 0;
+    const personCount = Math.max(0, Number.isFinite(renderedCount) ? renderedCount : fallbackCount);
+    const ambiguous = Boolean(evidence?.ambiguous || rawCount > personCount);
+    this._updatePersonDots(personCount, {
+      ambiguous,
+      label: ambiguous && rawCount > personCount ? `${personCount} / raw ${rawCount}` : String(personCount),
+      title: ambiguous
+        ? `Ambiguous multipath: raw ${rawCount}, rendered ${personCount}`
+        : `Rendered persons: ${personCount}`,
+    });
 
     const presEl = document.getElementById('presence-indicator');
     const presLabel = document.getElementById('presence-label');
@@ -598,13 +607,15 @@ export class HudController {
     });
   }
 
-  _updatePersonDots(count) {
+  _updatePersonDots(count, options = {}) {
     const container = document.getElementById('persons-dots');
     if (!container) {
       // Fall back to text-only display
-      this._setText('persons-value', count);
+      this._setText('persons-value', options.label ?? count);
       return;
     }
+    container.classList.toggle('persons-dots--ambiguous', Boolean(options.ambiguous));
+    if (options.title) container.title = options.title;
     // Build dot icons: filled for detected persons, dim for empty slots (max 8)
     const maxDots = 8;
     const clamped = Math.min(count, maxDots);
@@ -614,7 +625,12 @@ export class HudController {
       html += `<span class="person-dot${active ? ' person-dot--active' : ''}"></span>`;
     }
     container.innerHTML = html;
-    this._setText('persons-value', count);
+    const value = document.getElementById('persons-value');
+    if (value) {
+      value.classList.toggle('ambiguous-count', Boolean(options.ambiguous));
+      value.title = options.title || '';
+      value.textContent = options.label ?? count;
+    }
   }
 
 }

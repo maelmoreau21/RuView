@@ -380,6 +380,22 @@ h3 {
   pointer-events: none;
 }
 
+.topology-stage::after {
+  content: "X horizontal / Z profondeur";
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  border: 1px solid rgba(92, 200, 255, 0.28);
+  border-radius: 999px;
+  background: rgba(7, 17, 15, 0.86);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  padding: 3px 7px;
+  pointer-events: none;
+}
+
 .topology-empty {
   position: absolute;
   inset: 12px;
@@ -547,7 +563,7 @@ h3 {
 
 .placement-toolbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(160px, 1fr) minmax(280px, auto) auto;
   gap: 10px;
   align-items: center;
   border: 1px solid var(--line-soft);
@@ -575,11 +591,61 @@ h3 {
   font-size: 11px;
 }
 
+.placement-help {
+  color: var(--amber) !important;
+}
+
+.placement-inputs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(78px, 1fr));
+  gap: 8px;
+  align-items: end;
+}
+
+.placement-inputs label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.placement-inputs input {
+  min-width: 0;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 7px;
+  color: var(--text);
+}
+
+.placement-inputs input[aria-invalid="true"] {
+  border-color: var(--red);
+  box-shadow: 0 0 0 2px rgba(255, 107, 100, 0.14);
+}
+
 .placement-actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.placement-error {
+  grid-column: 1 / -1;
+  display: none;
+  margin: -2px 0 0;
+  border: 1px solid rgba(255, 107, 100, 0.38);
+  border-radius: 6px;
+  background: rgba(255, 107, 100, 0.11);
+  color: #ffbbb7;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 6px 8px;
+}
+
+.placement-error.is-visible {
+  display: block;
 }
 
 .side-panel {
@@ -1151,6 +1217,10 @@ select {
   .preset-grid {
     grid-template-columns: 1fr;
   }
+
+  .placement-actions {
+    justify-content: flex-start;
+  }
 }
 
 @media (max-width: 430px) {
@@ -1175,5 +1245,9 @@ select {
 
   .dense-meta {
     justify-items: start;
+  }
+
+  .placement-inputs {
+    grid-template-columns: 1fr;
   }
 }

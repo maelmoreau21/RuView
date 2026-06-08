@@ -130,7 +130,20 @@ pub struct SensingUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_persons: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_evidence: Option<CountEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub node_features: Option<Vec<PerNodeFeatureInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountEvidence {
+    pub stable_persons: usize,
+    pub raw_estimated_persons: usize,
+    pub rendered_persons: usize,
+    pub active_nodes: usize,
+    pub supporting_nodes: usize,
+    pub ambiguous: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

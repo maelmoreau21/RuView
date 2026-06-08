@@ -55,29 +55,36 @@
         </div>
         <div class="inline-metrics">
           <span id="room-size">--</span>
-          <span id="readiness-label">not ready</span>
+          <span id="readiness-label">pas prêt</span>
           <span id="frame-rate">0.0 Hz</span>
         </div>
       </div>
 
       <div id="topology-stage" class="topology-stage" aria-label="Topologie des AP et nœuds ESP32-C6 détectés"></div>
 
-      <div class="placement-toolbar" aria-label="Node placement">
+      <div class="placement-toolbar" aria-label="Placement manuel des nœuds">
         <div class="placement-detail">
-          <strong id="placement-selected">No node selected</strong>
+          <strong id="placement-selected">Aucun nœud sélectionné</strong>
           <small id="placement-coordinates">X -- / Y -- / Z --</small>
+          <small class="placement-help">Glisser sur le plan règle X/Z. Y est la hauteur en mètres.</small>
+        </div>
+        <div class="placement-inputs" aria-label="Coordonnées métriques du nœud sélectionné">
+          <label>X <input id="placement-x" type="number" inputmode="decimal" step="0.01" disabled></label>
+          <label>Y hauteur <input id="placement-y" type="number" inputmode="decimal" step="0.01" disabled></label>
+          <label>Z <input id="placement-z" type="number" inputmode="decimal" step="0.01" disabled></label>
         </div>
         <div class="placement-actions">
-          <span id="placement-state" class="badge">saved</span>
-          <button id="reset-placement" type="button">Reset</button>
-          <button id="save-placement" class="primary" type="button" disabled>Save</button>
+          <span id="placement-state" class="badge">enregistré</span>
+          <button id="reset-placement" type="button">Réinitialiser</button>
+          <button id="save-placement" class="primary" type="button" disabled>Enregistrer</button>
         </div>
+        <p id="placement-error" class="placement-error" role="status" aria-live="polite"></p>
       </div>
 
       <div class="topology-legend">
         <span><i class="legend-dot legend-node"></i>ESP32-C6</span>
         <span><i class="legend-line"></i>Distance</span>
-        <span><i class="legend-hint"></i>Manual X/Y</span>
+        <span><i class="legend-hint"></i>Plan X/Z</span>
       </div>
     </section>
 
@@ -86,7 +93,7 @@
         <div class="section-head compact">
           <div>
             <p class="eyebrow">Raspberry Pi 4/5</p>
-            <h2>System Control</h2>
+            <h2>Contrôle système</h2>
           </div>
           <span id="fleet-summary" class="badge">0 live</span>
         </div>
@@ -116,7 +123,7 @@
             <thead>
               <tr>
                 <th>Module</th>
-                <th>Enabled</th>
+                <th>Actif</th>
                 <th>Nœuds</th>
                 <th>Statut</th>
                 <th>Confiance</th>
@@ -133,7 +140,7 @@
             <p class="eyebrow">CSI-grade</p>
             <h2>Signes vitaux</h2>
           </div>
-          <span id="vitals-status" class="badge">waiting</span>
+          <span id="vitals-status" class="badge">attente</span>
         </div>
         <dl class="metric-list">
           <div><dt>Présence</dt><dd id="presence-state">unknown</dd></div>
@@ -154,8 +161,8 @@
           <span id="calibration-status" class="badge">unknown</span>
         </div>
         <div class="action-row">
-          <button id="start-calibration" class="primary" type="button">Start</button>
-          <button id="stop-calibration" type="button">Stop</button>
+          <button id="start-calibration" class="primary" type="button">Démarrer</button>
+          <button id="stop-calibration" type="button">Arrêter</button>
         </div>
         <div class="table-wrap">
           <table class="data-table">
@@ -181,10 +188,10 @@
         <div class="advanced-links" aria-label="Vues diagnostics avancées">
           <a href="/ui/observatory.html">Environnement 3D</a>
           <a href="/ui/pose-fusion.html">Pose Fusion</a>
-          <a href="/metrics">Metrics</a>
-          <a href="/health/ready">Health ready</a>
-          <a href="/api/v1/nodes">Nodes JSON</a>
-          <a href="/api/v1/topology">Topology JSON</a>
+          <a href="/metrics">Métriques</a>
+          <a href="/health/ready">Santé ready</a>
+          <a href="/api/v1/nodes">Nœuds JSON</a>
+          <a href="/api/v1/topology">Topologie JSON</a>
           <a href="/api/v1/modules">Modules JSON</a>
         </div>
       </section>
@@ -196,7 +203,7 @@
           <p class="eyebrow">Événements</p>
           <h2 id="log-title">Log console</h2>
         </div>
-        <button id="clear-log" type="button">Clear</button>
+        <button id="clear-log" type="button">Effacer</button>
       </div>
       <ol id="event-log" class="event-log"></ol>
     </section>

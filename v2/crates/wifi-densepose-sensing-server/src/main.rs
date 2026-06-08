@@ -373,9 +373,23 @@ struct SensingUpdate {
     /// Estimated person count from CSI feature heuristics (1-3 for single ESP32).
     #[serde(skip_serializing_if = "Option::is_none")]
     estimated_persons: Option<usize>,
+    /// Conservative count evidence used by live UIs to avoid multipath ghosts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_evidence: Option<CountEvidence>,
     /// Per-node feature breakdown for multi-node deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     node_features: Option<Vec<PerNodeFeatureInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CountEvidence {
+    stable_persons: usize,
+    raw_estimated_persons: usize,
+    rendered_persons: usize,
+    active_nodes: usize,
+    supporting_nodes: usize,
+    ambiguous: bool,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2381,6 +2395,12 @@ struct AppStateInner {
     pose_tracker: PoseTracker,
     /// Instant of last tracker update (for computing dt).
     last_tracker_instant: Option<std::time::Instant>,
+    /// Conservative person count currently safe to render.
+    stable_rendered_person_count: usize,
+    /// Candidate multi-person count waiting for corroboration.
+    count_candidate_persons: usize,
+    /// First instant at which `count_candidate_persons` was observed.
+    count_candidate_since: Option<std::time::Instant>,
     /// Attention-weighted multi-node CSI fusion engine.
     multistatic_fuser: MultistaticFuser,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
@@ -3882,6 +3902,13 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             s.prev_person_count = 0;
             0
         };
+        let count_evidence = resolve_rendered_person_count(
+            &mut s,
+            classification.presence,
+            est_persons,
+            std::time::Instant::now(),
+        );
+        let rendered_persons = count_evidence.rendered_persons;
 
         let mut update = SensingUpdate {
             msg_type: "sensing_update".to_string(),
@@ -3915,11 +3942,12 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             pose_keypoints: None,
             model_status: None,
             persons: None,
-            estimated_persons: if est_persons > 0 {
-                Some(est_persons)
+            estimated_persons: if rendered_persons > 0 {
+                Some(rendered_persons)
             } else {
                 None
             },
+            count_evidence: Some(count_evidence),
             node_features: None,
         };
 
@@ -4043,6 +4071,13 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         s.prev_person_count = 0;
         0
     };
+    let count_evidence = resolve_rendered_person_count(
+        &mut s,
+        classification.presence,
+        est_persons,
+        std::time::Instant::now(),
+    );
+    let rendered_persons = count_evidence.rendered_persons;
 
     let mut update = SensingUpdate {
         msg_type: "sensing_update".to_string(),
@@ -4076,11 +4111,12 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         pose_keypoints: None,
         model_status: None,
         persons: None,
-        estimated_persons: if est_persons > 0 {
-            Some(est_persons)
+        estimated_persons: if rendered_persons > 0 {
+            Some(rendered_persons)
         } else {
             None
         },
+        count_evidence: Some(count_evidence),
         node_features: None,
     };
 
@@ -4861,7 +4897,8 @@ fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
 }
 
 /// Combine the activity-score-derived aggregate count with the count-aware
-/// per-node estimates (issue #803).
+/// per-node estimates (issue #803). This remains the raw signal-side estimate;
+/// `resolve_rendered_person_count` applies the conservative live rendering gate.
 ///
 /// The aggregate `s.person_count()` is driven by `smoothed_person_score`, an
 /// EMA-smoothed *activity* score (amplitude variance / motion / spectral
@@ -4887,6 +4924,161 @@ fn aggregate_person_count(
         .max()
         .unwrap_or(0);
     activity_count.max(node_max)
+}
+
+const MAX_RENDERED_PERSONS: usize = 3;
+const MULTI_PERSON_CONFIRMATION_MS: u128 = 1_500;
+
+fn supporting_nodes_for_count(
+    node_states: &std::collections::HashMap<u8, NodeState>,
+    now: std::time::Instant,
+    target: usize,
+) -> usize {
+    node_states
+        .values()
+        .filter(|node| is_node_active(node, now))
+        .filter(|node| node.prev_person_count >= target)
+        .count()
+}
+
+fn count_candidate_for_raw_estimate(
+    s: &AppStateInner,
+    raw_estimated_persons: usize,
+    now: std::time::Instant,
+) -> (usize, usize, &'static str) {
+    let active_nodes = active_node_count(s, now);
+    let raw_target = raw_estimated_persons.clamp(1, MAX_RENDERED_PERSONS);
+
+    if raw_target >= 3 {
+        let supporting_nodes = supporting_nodes_for_count(&s.node_states, now, 3);
+        if active_nodes >= 3 && supporting_nodes >= 3 {
+            return (3, supporting_nodes, "corroborated_three_persons");
+        }
+    }
+
+    if raw_target >= 2 {
+        let supporting_nodes = supporting_nodes_for_count(&s.node_states, now, 2);
+        if active_nodes >= 2 && supporting_nodes >= 2 {
+            return (2, supporting_nodes, "corroborated_two_persons");
+        }
+        let reason = if active_nodes < 2 {
+            "insufficient_active_nodes"
+        } else {
+            "needs_multi_node_corroboration"
+        };
+        let raw_support = supporting_nodes_for_count(&s.node_states, now, raw_target);
+        return (1, raw_support, reason);
+    }
+
+    let supporting_nodes = supporting_nodes_for_count(&s.node_states, now, 1);
+    let fallback_support = if active_nodes > 0 { 1 } else { 0 };
+    (1, supporting_nodes.max(fallback_support), "single_person")
+}
+
+fn resolve_rendered_person_count(
+    s: &mut AppStateInner,
+    presence: bool,
+    raw_estimated_persons: usize,
+    now: std::time::Instant,
+) -> CountEvidence {
+    let active_nodes = active_node_count(s, now);
+    let (candidate, supporting_nodes, reason) = if presence && raw_estimated_persons > 0 {
+        count_candidate_for_raw_estimate(s, raw_estimated_persons, now)
+    } else {
+        (0, 0, "absent")
+    };
+
+    resolve_rendered_person_count_core(
+        &mut s.stable_rendered_person_count,
+        &mut s.count_candidate_persons,
+        &mut s.count_candidate_since,
+        presence,
+        raw_estimated_persons,
+        active_nodes,
+        supporting_nodes,
+        candidate,
+        reason,
+        now,
+    )
+}
+
+fn resolve_rendered_person_count_core(
+    stable_rendered_person_count: &mut usize,
+    count_candidate_persons: &mut usize,
+    count_candidate_since: &mut Option<std::time::Instant>,
+    presence: bool,
+    raw_estimated_persons: usize,
+    active_nodes: usize,
+    supporting_nodes: usize,
+    candidate: usize,
+    mut reason: &'static str,
+    now: std::time::Instant,
+) -> CountEvidence {
+    if !presence || raw_estimated_persons == 0 {
+        *stable_rendered_person_count = 0;
+        *count_candidate_persons = 0;
+        *count_candidate_since = None;
+        return CountEvidence {
+            stable_persons: 0,
+            raw_estimated_persons,
+            rendered_persons: 0,
+            active_nodes,
+            supporting_nodes: 0,
+            ambiguous: false,
+            reason: "absent".to_string(),
+        };
+    }
+
+    let raw_estimated_persons = raw_estimated_persons.max(1);
+    let raw_target = raw_estimated_persons.clamp(1, MAX_RENDERED_PERSONS);
+    let mut stable = (*stable_rendered_person_count).max(1);
+
+    if candidate <= 1 {
+        stable = 1;
+        *count_candidate_persons = 0;
+        *count_candidate_since = None;
+    } else if candidate < stable {
+        stable = candidate.max(1);
+        *count_candidate_persons = 0;
+        *count_candidate_since = None;
+        reason = "downshifted_count";
+    } else if candidate > stable {
+        if *count_candidate_persons != candidate {
+            *count_candidate_persons = candidate;
+            *count_candidate_since = Some(now);
+            reason = "confirming_multi_person";
+        } else {
+            let elapsed_ms = count_candidate_since
+                .as_ref()
+                .and_then(|since| now.checked_duration_since(*since))
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0);
+            if elapsed_ms >= MULTI_PERSON_CONFIRMATION_MS {
+                stable = candidate;
+                *count_candidate_persons = 0;
+                *count_candidate_since = None;
+                reason = "confirmed_multi_person";
+            } else {
+                reason = "confirming_multi_person";
+            }
+        }
+    } else {
+        *count_candidate_persons = 0;
+        *count_candidate_since = None;
+    }
+
+    *stable_rendered_person_count = stable;
+    let ambiguous = raw_target > stable || candidate > stable;
+
+    CountEvidence {
+        stable_persons: stable,
+        raw_estimated_persons,
+        rendered_persons: stable,
+        active_nodes,
+        supporting_nodes,
+        ambiguous,
+        reason: reason.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -4965,6 +5157,173 @@ mod aggregate_person_count_tests {
         );
 
         assert_eq!(aggregate_person_count(1, &nodes, now), 1);
+    }
+
+    fn resolve_count(
+        stable: &mut usize,
+        candidate_persons: &mut usize,
+        candidate_since: &mut Option<Instant>,
+        presence: bool,
+        raw: usize,
+        active_nodes: usize,
+        supporting_nodes: usize,
+        candidate: usize,
+        now: Instant,
+    ) -> CountEvidence {
+        resolve_rendered_person_count_core(
+            stable,
+            candidate_persons,
+            candidate_since,
+            presence,
+            raw,
+            active_nodes,
+            supporting_nodes,
+            candidate,
+            "test",
+            now,
+        )
+    }
+
+    #[test]
+    fn uncorroborated_four_person_spike_renders_one_ambiguous_person() {
+        let now = Instant::now();
+        let mut stable = 1;
+        let mut candidate_persons = 0;
+        let mut candidate_since = None;
+
+        let evidence = resolve_count(
+            &mut stable,
+            &mut candidate_persons,
+            &mut candidate_since,
+            true,
+            4,
+            1,
+            1,
+            1,
+            now,
+        );
+
+        assert_eq!(evidence.raw_estimated_persons, 4);
+        assert_eq!(evidence.rendered_persons, 1);
+        assert_eq!(evidence.stable_persons, 1);
+        assert!(evidence.ambiguous);
+    }
+
+    #[test]
+    fn two_corroborating_nodes_promote_after_stability_window() {
+        let now = Instant::now();
+        let later = now.checked_add(Duration::from_millis(1_600)).unwrap();
+        let mut stable = 1;
+        let mut candidate_persons = 0;
+        let mut candidate_since = None;
+
+        let warming = resolve_count(
+            &mut stable,
+            &mut candidate_persons,
+            &mut candidate_since,
+            true,
+            2,
+            2,
+            2,
+            2,
+            now,
+        );
+        assert_eq!(warming.rendered_persons, 1);
+        assert!(warming.ambiguous);
+
+        let promoted = resolve_count(
+            &mut stable,
+            &mut candidate_persons,
+            &mut candidate_since,
+            true,
+            2,
+            2,
+            2,
+            2,
+            later,
+        );
+
+        assert_eq!(promoted.rendered_persons, 2);
+        assert_eq!(promoted.stable_persons, 2);
+        assert!(!promoted.ambiguous);
+        assert_eq!(promoted.reason, "confirmed_multi_person");
+    }
+
+    #[test]
+    fn alternating_one_two_due_to_multipath_stays_single_person() {
+        let now = Instant::now();
+        let later = now.checked_add(Duration::from_millis(800)).unwrap();
+        let final_tick = now.checked_add(Duration::from_millis(1_700)).unwrap();
+        let mut stable = 1;
+        let mut candidate_persons = 0;
+        let mut candidate_since = None;
+
+        let first_spike = resolve_count(
+            &mut stable,
+            &mut candidate_persons,
+            &mut candidate_since,
+            true,
+            2,
+            2,
+            2,
+            2,
+            now,
+        );
+        assert_eq!(first_spike.rendered_persons, 1);
+
+        let single = resolve_count(
+            &mut stable,
+            &mut candidate_persons,
+            &mut candidate_since,
+            true,
+            1,
+            2,
+            2,
+            1,
+            later,
+        );
+        assert_eq!(single.rendered_persons, 1);
+        assert_eq!(candidate_persons, 0);
+
+        let second_spike = resolve_count(
+            &mut stable,
+            &mut candidate_persons,
+            &mut candidate_since,
+            true,
+            2,
+            2,
+            2,
+            2,
+            final_tick,
+        );
+        assert_eq!(second_spike.rendered_persons, 1);
+        assert_eq!(second_spike.reason, "confirming_multi_person");
+    }
+
+    #[test]
+    fn absence_resets_stable_and_pending_counts_immediately() {
+        let now = Instant::now();
+        let mut stable = 2;
+        let mut candidate_persons = 3;
+        let mut candidate_since = Some(now);
+
+        let evidence = resolve_count(
+            &mut stable,
+            &mut candidate_persons,
+            &mut candidate_since,
+            false,
+            0,
+            2,
+            0,
+            0,
+            now,
+        );
+
+        assert_eq!(evidence.rendered_persons, 0);
+        assert_eq!(stable, 0);
+        assert_eq!(candidate_persons, 0);
+        assert!(candidate_since.is_none());
+        assert!(!evidence.ambiguous);
     }
 }
 
@@ -5426,6 +5785,7 @@ mod person_detection_contract_tests {
             model_status: None,
             persons: None,
             estimated_persons: Some(1),
+            count_evidence: None,
             node_features: None,
         }
     }
@@ -8469,6 +8829,13 @@ async fn udp_receiver_task(
                         (vitals.presence_score as f64).min(1.0),
                         &[],
                     );
+                    let count_evidence = resolve_rendered_person_count(
+                        &mut s,
+                        classification.presence,
+                        total_persons,
+                        now,
+                    );
+                    let rendered_persons = count_evidence.rendered_persons;
 
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
@@ -8503,11 +8870,12 @@ async fn udp_receiver_task(
                         pose_keypoints: None,
                         model_status: None,
                         persons: None,
-                        estimated_persons: if total_persons > 0 {
-                            Some(total_persons)
+                        estimated_persons: if rendered_persons > 0 {
+                            Some(rendered_persons)
                         } else {
                             None
                         },
+                        count_evidence: Some(count_evidence),
                         // ADR-084 Pass 3.6: surface per-node novelty_score
                         // (and the rest of the per-node feature snapshot)
                         // on the WebSocket envelope so cluster-Pi consumers
@@ -8881,6 +9249,13 @@ async fn udp_receiver_task(
                         s.prev_person_count = 0;
                         0
                     };
+                    let count_evidence = resolve_rendered_person_count(
+                        &mut s,
+                        classification.presence,
+                        total_persons,
+                        now,
+                    );
+                    let rendered_persons = count_evidence.rendered_persons;
 
                     // Feed field model calibration only from live CSI. Interpolated
                     // frames stabilize runtime DSP but never alter baselines.
@@ -8952,11 +9327,12 @@ async fn udp_receiver_task(
                         pose_keypoints: None,
                         model_status: None,
                         persons: None,
-                        estimated_persons: if total_persons > 0 {
-                            Some(total_persons)
+                        estimated_persons: if rendered_persons > 0 {
+                            Some(rendered_persons)
                         } else {
                             None
                         },
+                        count_evidence: Some(count_evidence),
                         // ADR-084 Pass 3.6: surface per-node novelty_score
                         // (and the rest of the per-node feature snapshot)
                         // on the WebSocket envelope so cluster-Pi consumers
@@ -9188,6 +9564,9 @@ async fn handle_delivered_esp32_frame(
         s.prev_person_count = 0;
         0
     };
+    let count_evidence =
+        resolve_rendered_person_count(&mut s, classification.presence, total_persons, now);
+    let rendered_persons = count_evidence.rendered_persons;
 
     if is_live_frame {
         if let Some(frame_history) = s
@@ -9255,11 +9634,12 @@ async fn handle_delivered_esp32_frame(
         pose_keypoints: None,
         model_status: None,
         persons: None,
-        estimated_persons: if total_persons > 0 {
-            Some(total_persons)
+        estimated_persons: if rendered_persons > 0 {
+            Some(rendered_persons)
         } else {
             None
         },
+        count_evidence: Some(count_evidence),
         node_features: build_node_features(&s.node_states, now),
     };
 
@@ -9364,6 +9744,13 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             s.prev_person_count = 0;
             0
         };
+        let count_evidence = resolve_rendered_person_count(
+            &mut s,
+            classification.presence,
+            est_persons,
+            std::time::Instant::now(),
+        );
+        let rendered_persons = count_evidence.rendered_persons;
 
         let mut update = SensingUpdate {
             msg_type: "sensing_update".to_string(),
@@ -9407,11 +9794,12 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 None
             },
             persons: None,
-            estimated_persons: if est_persons > 0 {
-                Some(est_persons)
+            estimated_persons: if rendered_persons > 0 {
+                Some(rendered_persons)
             } else {
                 None
             },
+            count_evidence: Some(count_evidence),
             node_features: None,
         };
 
@@ -10567,6 +10955,9 @@ async fn main() {
         // Accuracy sprint
         pose_tracker: PoseTracker::new(),
         last_tracker_instant: None,
+        stable_rendered_person_count: 0,
+        count_candidate_persons: 0,
+        count_candidate_since: None,
         multistatic_fuser: {
             let mut fuser = MultistaticFuser::with_config(MultistaticConfig {
                 min_nodes: 1, // single-node passthrough

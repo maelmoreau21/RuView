@@ -16,6 +16,8 @@ const state = {
   placementOriginal: new Map(),
   placementSelectedId: null,
   placementDirty: false,
+  placementError: '',
+  placementServerError: '',
   draggingNodeId: null,
 };
 
@@ -133,7 +135,7 @@ function roomDims() {
 }
 
 function positionOf(item) {
-  const pos = item?.position || {};
+  const pos = item?.position ?? item?.position_m ?? {};
   if (Array.isArray(pos)) return { x: Number(pos[0]) || 0, y: Number(pos[1]) || 0, z: Number(pos[2]) || 0, source: 'configured', confidence: 0.9 };
   return {
     x: Number(pos.x) || 0,
@@ -167,26 +169,100 @@ function currentNodePosition(node) {
   return state.placementDraft.get(id) || clonePosition(positionOf(node));
 }
 
+function roomBounds() {
+  const [width, height, depth] = roomDims();
+  return {
+    minX: -width / 2,
+    maxX: width / 2,
+    minY: 0,
+    maxY: height,
+    minZ: -depth / 2,
+    maxZ: depth / 2,
+  };
+}
+
 function pointToStage(pos) {
-  const [width, height] = roomDims();
+  const [width, , depth] = roomDims();
   return {
     left: Math.max(4, Math.min(96, ((pos.x / width) + 0.5) * 100)),
-    top: Math.max(4, Math.min(96, (0.5 - (pos.y / height)) * 100)),
+    top: Math.max(4, Math.min(96, (0.5 - (pos.z / depth)) * 100)),
   };
 }
 
 function stageToPosition(stage, clientX, clientY, current) {
   const rect = stage.getBoundingClientRect();
-  const [width, height] = roomDims();
+  const [width, , depth] = roomDims();
   const leftPct = clamp((clientX - rect.left) / Math.max(1, rect.width), 0.04, 0.96);
   const topPct = clamp((clientY - rect.top) / Math.max(1, rect.height), 0.04, 0.96);
   return {
     ...clonePosition(current),
     x: (leftPct - 0.5) * width,
-    y: (0.5 - topPct) * height,
+    z: (0.5 - topPct) * depth,
     source: 'manual',
     confidence: 1,
   };
+}
+
+function positionsEqual(a, b) {
+  return ['x', 'y', 'z'].every((axis) => Math.abs((Number(a?.[axis]) || 0) - (Number(b?.[axis]) || 0)) < 0.005);
+}
+
+function changedPlacementNodes() {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const changed = [];
+  for (const node of nodes) {
+    const id = nodeIdOf(node);
+    const draft = state.placementDraft.get(id);
+    const original = state.placementOriginal.get(id) || clonePosition(positionOf(node));
+    if (draft && !positionsEqual(draft, original)) {
+      changed.push({ node, id, pos: draft });
+    }
+  }
+  return changed;
+}
+
+function validatePosition(pos) {
+  if (!pos || !['x', 'y', 'z'].every((axis) => Number.isFinite(Number(pos[axis])))) {
+    return 'Coordonnées invalides.';
+  }
+  const b = roomBounds();
+  if (pos.x < b.minX || pos.x > b.maxX) return `X doit rester entre ${b.minX.toFixed(2)} m et ${b.maxX.toFixed(2)} m.`;
+  if (pos.y < b.minY || pos.y > b.maxY) return `Y hauteur doit rester entre ${b.minY.toFixed(2)} m et ${b.maxY.toFixed(2)} m.`;
+  if (pos.z < b.minZ || pos.z > b.maxZ) return `Z doit rester entre ${b.minZ.toFixed(2)} m et ${b.maxZ.toFixed(2)} m.`;
+  return '';
+}
+
+function refreshPlacementDirty() {
+  state.placementDirty = changedPlacementNodes().length > 0;
+}
+
+function setPlacementInputValues(pos) {
+  const b = roomBounds();
+  const fields = [
+    ['placement-x', 'x', b.minX, b.maxX],
+    ['placement-y', 'y', b.minY, b.maxY],
+    ['placement-z', 'z', b.minZ, b.maxZ],
+  ];
+  for (const [id, axis, min, max] of fields) {
+    const input = document.getElementById(id);
+    if (!(input instanceof HTMLInputElement)) continue;
+    input.disabled = !pos;
+    input.min = min.toFixed(2);
+    input.max = max.toFixed(2);
+    input.step = '0.01';
+    input.setAttribute('aria-invalid', state.placementError ? 'true' : 'false');
+    if (!pos) {
+      input.value = '';
+    } else if (document.activeElement !== input) {
+      input.value = Number(pos[axis]).toFixed(2);
+    }
+  }
+}
+
+function parsePlacementInput(id) {
+  const input = document.getElementById(id);
+  if (!(input instanceof HTMLInputElement)) return NaN;
+  return Number(String(input.value).trim().replace(',', '.'));
 }
 
 function syncPlacementState(force = false) {
@@ -207,10 +283,15 @@ function syncPlacementState(force = false) {
       if (state.placementSelectedId === id) state.placementSelectedId = null;
     }
   }
+  refreshPlacementDirty();
 }
 
 function markPlacementDirty() {
-  state.placementDirty = true;
+  state.placementServerError = '';
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const selected = nodes.find((node) => nodeIdOf(node) === state.placementSelectedId);
+  state.placementError = selected ? validatePosition(currentNodePosition(selected)) : '';
+  refreshPlacementDirty();
   renderPlacementControls();
 }
 
@@ -229,7 +310,7 @@ function renderStatus() {
   if (master) {
     master.classList.toggle('is-ready', ready);
     master.classList.toggle('is-degraded', !ready && activeNodes > 0);
-    master.querySelector('strong').textContent = ready ? 'ready' : activeNodes > 0 ? 'limited' : 'offline';
+    master.querySelector('strong').textContent = ready ? 'prêt' : activeNodes > 0 ? 'limité' : 'hors ligne';
   }
   setText('active-nodes', `${activeNodes}/${Number(readiness.min_nodes || 1)}`);
   setText('enabled-modules', String(enabledModules));
@@ -237,7 +318,7 @@ function renderStatus() {
   setText('source-mode', source);
   setText('scan-interface', text(topology?.wifi_scan?.interface, 'wlan0'));
   setText('room-size', `${w.toFixed(1)} x ${h.toFixed(1)} x ${d.toFixed(1)} m`);
-  setText('readiness-label', ready ? 'ready' : activeNodes > 0 ? 'limited' : 'not ready');
+  setText('readiness-label', ready ? 'prêt' : activeNodes > 0 ? 'limité' : 'pas prêt');
   setText('frame-rate', fmtHz(frameRate));
   setText('fleet-summary', `${activeNodes} live`);
 }
@@ -264,11 +345,11 @@ function marker(kind, item, compact) {
 }
 
 function renderLink(stage, link, apsByBssid, nodesById) {
-  const ap = apsByBssid.get(String(link.ap_bssid || '').toLowerCase());
+  const ap = apsByBssid.get(String(link.ap_bssid || link.ap_id || '').toLowerCase());
   const node = nodesById.get(Number(link.node_id));
   if (!ap || !node) return;
   const a = pointToStage(positionOf(ap));
-  const b = pointToStage(positionOf(node));
+  const b = pointToStage(currentNodePosition(node));
   const dx = b.left - a.left;
   const dy = b.top - a.top;
   const line = create('div', `rf-link ${statusClass(link.source)}`);
@@ -329,6 +410,7 @@ function renderTopology() {
 
   const aps = Array.isArray(state.topology?.access_points) ? state.topology.access_points : [];
   const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const links = Array.isArray(state.topology?.links) ? state.topology.links : [];
   const compact = nodes.length > 24 || window.innerWidth < 520;
 
   if (!aps.length && !nodes.length) {
@@ -336,6 +418,14 @@ function renderTopology() {
     return;
   }
 
+  const apsByBssid = new Map();
+  for (const ap of aps) {
+    for (const key of [ap.bssid, ap.ap_id, ap.id].filter(Boolean)) {
+      apsByBssid.set(String(key).toLowerCase(), ap);
+    }
+  }
+  const nodesById = new Map(nodes.map((node) => [nodeIdOf(node), node]));
+  for (const link of links) renderLink(stage, link, apsByBssid, nodesById);
   renderNodeDistances(stage, nodes);
   for (const ap of aps) stage.append(marker('ap', ap, compact && (aps.length > 12 || window.innerWidth < 520)));
   for (const node of nodes) stage.append(marker('node', node, compact));
@@ -346,15 +436,28 @@ function renderPlacementControls() {
   const selected = nodes.find((node) => nodeIdOf(node) === state.placementSelectedId);
   const selectedLabel = selected
     ? text(selected.display_label || selected.label, `ESP32-C6 #${selected.node_id}`)
-    : 'No node selected';
+    : 'Aucun nœud sélectionné';
   const pos = selected ? currentNodePosition(selected) : null;
+  const activeInputInvalid = ['placement-x', 'placement-y', 'placement-z'].some((id) => {
+    const input = document.getElementById(id);
+    return document.activeElement === input && !Number.isFinite(parsePlacementInput(id));
+  });
+  const validationError = pos
+    ? activeInputInvalid ? state.placementError || 'Coordonnées invalides.' : validatePosition(pos)
+    : '';
+  state.placementError = state.placementServerError || validationError;
+  refreshPlacementDirty();
   setText('placement-selected', selectedLabel);
   setText('placement-coordinates', pos
-    ? `X ${pos.x.toFixed(2)} m / Y ${pos.y.toFixed(2)} m / Z ${pos.z.toFixed(2)} m`
+    ? `X ${pos.x.toFixed(2)} m / Y hauteur ${pos.y.toFixed(2)} m / Z ${pos.z.toFixed(2)} m`
     : 'X -- / Y -- / Z --');
-  setText('placement-state', state.placementDirty ? 'unsaved' : 'saved');
+  setText('placement-state', state.placementError ? 'erreur' : state.placementDirty ? 'à enregistrer' : 'enregistré');
+  setText('placement-error', state.placementError || '');
+  const error = $('#placement-error');
+  if (error) error.classList.toggle('is-visible', Boolean(state.placementError));
+  setPlacementInputValues(pos);
   const save = $('#save-placement');
-  if (save) save.disabled = !state.placementDirty || !nodes.length;
+  if (save) save.disabled = !state.placementDirty || Boolean(state.placementError) || !nodes.length;
   const reset = $('#reset-placement');
   if (reset) reset.disabled = !state.placementDirty;
 }
@@ -386,7 +489,7 @@ function renderFleet() {
       const status = text(node.health_status || node.status, node.active ? 'live' : 'offline');
       nodeList?.append(denseRow(
         text(node.display_label || node.label, `ESP32-C6 #${node.node_id}`),
-        `node_id ${node.node_id} / ${text(node.remote_addr, 'no addr')} / X ${pos.x.toFixed(2)} Y ${pos.y.toFixed(2)}`,
+        `node_id ${node.node_id} / ${text(node.remote_addr, 'no addr')} / X ${pos.x.toFixed(2)} Y ${pos.y.toFixed(2)} Z ${pos.z.toFixed(2)}`,
         [fmtHz(node.frame_rate_hz), `CSI ${fmtAge(node.last_csi_ms ?? node.last_seen_ms)}`, fmtPct(pos.confidence)],
         status
       ));
@@ -456,11 +559,11 @@ function renderModules() {
     });
   const active = state.modules.filter((mod) => mod.status === 'active').length;
   const enabled = state.modules.filter((mod) => mod.enabled !== false).length;
-  setText('module-summary', `${enabled} enabled / ${active} active`);
+  setText('module-summary', `${enabled} actifs / ${active} live`);
 
   if (!modules.length) {
     const row = create('tr');
-    const cell = create('td', '', 'No modules');
+    const cell = create('td', '', 'Aucun module');
     cell.colSpan = 5;
     row.append(cell);
     body?.append(row);
@@ -474,7 +577,7 @@ function renderModules() {
     checkbox.type = 'checkbox';
     checkbox.checked = mod.enabled !== false;
     checkbox.dataset.moduleId = mod.id;
-    checkbox.setAttribute('aria-label', `${text(mod.name, mod.id)} enabled`);
+    checkbox.setAttribute('aria-label', `${text(mod.name, mod.id)} actif`);
     toggle.append(checkbox);
     row.append(
       tableCell(`${text(mod.name, mod.id)}`, text(mod.category, 'General')),
@@ -511,18 +614,18 @@ function renderVitals() {
   const edge = String(state.latest?.type || '').includes('vitals') ? state.latest : {};
   const presence = firstDefined(state.latest?.classification?.presence, edge.presence, false);
   const motion = firstDefined(state.latest?.classification?.motion_level, edge.motion ? 'motion' : undefined, 'unknown');
-  const persons = firstDefined(state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
+  const persons = firstDefined(state.latest?.count_evidence?.rendered_persons, state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
   const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, edgeVitals.breathing_rate_bpm, vitals.breathing_rate_bpm);
   const heart = firstDefined(latestVitals.heart_rate_bpm, edge.heartrate_bpm, edgeVitals.heartrate_bpm, vitals.heart_rate_bpm);
   const quality = firstDefined(latestVitals.signal_quality, edge.presence_score, edgeVitals.presence_score, vitals.signal_quality);
 
-  setText('presence-state', presence ? 'present' : 'absent');
+  setText('presence-state', presence ? 'présence' : 'absent');
   setText('person-count', String(persons || 0));
   setText('motion-level', text(motion, 'unknown'));
   setText('breathing-rate', breathing ? `${Number(breathing).toFixed(1)} bpm` : '--');
   setText('heart-rate', heart ? `${Number(heart).toFixed(1)} bpm` : '--');
   setText('signal-quality', fmtPct(quality));
-  setText('vitals-status', breathing || heart || presence ? 'live' : 'waiting');
+  setText('vitals-status', breathing || heart || presence ? 'live' : 'attente');
 }
 
 function renderCalibration() {
@@ -532,7 +635,7 @@ function renderCalibration() {
   clear(table);
   setText('calibration-status', status);
   const rows = [
-    ['enabled', data.enabled],
+    ['actif', data.enabled],
     ['active_nodes', data.active_nodes],
     ['min_nodes', data.min_nodes],
     ['dedup_factor', data.dedup_factor],
@@ -547,7 +650,7 @@ function renderCalibration() {
   const start = $('#start-calibration');
   if (start) {
     start.disabled = !ready;
-    start.title = ready ? 'Start empty-room baseline' : 'Wait for at least one live ESP32-C6 node';
+    start.title = ready ? 'Démarrer la calibration pièce vide' : 'Attendre au moins un nœud ESP32-C6 live';
   }
 }
 
@@ -608,7 +711,7 @@ function connectWs() {
   state.ws = ws;
 
   ws.onopen = () => {
-    logEvent('WebSocket sensing connected');
+    logEvent('WebSocket sensing connecté');
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
   };
   ws.onmessage = (event) => {
@@ -616,12 +719,12 @@ function connectWs() {
       state.latest = JSON.parse(event.data);
       renderVitals();
     } catch (error) {
-      logEvent(`Bad sensing frame: ${error.message}`, 'warn');
+      logEvent(`Frame sensing invalide: ${error.message}`, 'warn');
     }
   };
   ws.onclose = () => {
     state.ws = null;
-    logEvent('WebSocket sensing disconnected', 'warn');
+    logEvent('WebSocket sensing déconnecté', 'warn');
     state.reconnectTimer = setTimeout(connectWs, 3000);
   };
   ws.onerror = () => ws.close();
@@ -629,7 +732,40 @@ function connectWs() {
 
 function selectNode(nodeId) {
   state.placementSelectedId = nodeId;
+  state.placementError = '';
+  state.placementServerError = '';
   renderTopology();
+  renderPlacementControls();
+}
+
+function updatePositionFromInputs() {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const selected = nodes.find((node) => nodeIdOf(node) === state.placementSelectedId);
+  if (!selected) return;
+  const x = parsePlacementInput('placement-x');
+  const y = parsePlacementInput('placement-y');
+  const z = parsePlacementInput('placement-z');
+  state.placementServerError = '';
+  if (![x, y, z].every(Number.isFinite)) {
+    state.placementError = 'Coordonnées invalides.';
+    refreshPlacementDirty();
+    renderPlacementControls();
+    return;
+  }
+  const id = nodeIdOf(selected);
+  const next = {
+    ...clonePosition(currentNodePosition(selected)),
+    x,
+    y,
+    z,
+    source: 'manual',
+    confidence: 1,
+  };
+  state.placementDraft.set(id, next);
+  state.placementError = validatePosition(next);
+  refreshPlacementDirty();
+  renderTopology();
+  renderFleet();
   renderPlacementControls();
 }
 
@@ -652,6 +788,7 @@ function updateNodeDrag(event) {
   if (!stage || !node) return;
   const next = stageToPosition(stage, event.clientX, event.clientY, currentNodePosition(node));
   state.placementDraft.set(state.draggingNodeId, next);
+  state.placementError = validatePosition(next);
   markPlacementDirty();
   renderTopology();
   renderFleet();
@@ -663,6 +800,8 @@ function endNodeDrag() {
 
 function resetPlacement() {
   state.placementDirty = false;
+  state.placementError = '';
+  state.placementServerError = '';
   state.placementDraft.clear();
   state.placementOriginal.clear();
   syncPlacementState(true);
@@ -670,25 +809,35 @@ function resetPlacement() {
 }
 
 async function persistPlacement() {
-  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
-  if (!nodes.length) return;
-  const payload = nodes.map((node) => {
-    const pos = currentNodePosition(node);
+  const changed = changedPlacementNodes();
+  if (!changed.length) return;
+  const invalid = changed.find(({ pos }) => validatePosition(pos));
+  if (invalid) {
+    state.placementError = validatePosition(invalid.pos);
+    renderPlacementControls();
+    return;
+  }
+  const payload = changed.map(({ id, pos }) => {
     return {
-      node_id: nodeIdOf(node),
+      node_id: id,
       position_m: [pos.x, pos.y, pos.z],
     };
   });
   const save = $('#save-placement');
   if (save) save.disabled = true;
+  state.placementServerError = '';
   try {
     await saveNodePositions(payload);
     state.placementDirty = false;
+    state.placementError = '';
+    state.placementServerError = '';
     state.placementOriginal.clear();
     state.placementDraft.clear();
-    logEvent('Node positions saved');
+    logEvent(`${payload.length} position(s) ESP32 enregistrée(s)`);
     await refreshRest();
   } catch (error) {
+    state.placementServerError = error.message;
+    state.placementError = error.message;
     logEvent(error.message, 'warn');
     renderPlacementControls();
   }
@@ -720,7 +869,7 @@ function bindActions() {
     button.disabled = true;
     try {
       await setEnabledModules(preset.module_ids || preset.modules || []);
-      logEvent(`${text(preset.label, preset.id)} preset applied`);
+      logEvent(`Preset ${text(preset.label, preset.id)} appliqué`);
       await refreshRest();
     } catch (error) {
       logEvent(error.message, 'warn');
@@ -734,7 +883,7 @@ function bindActions() {
     input.disabled = true;
     try {
       await setModuleEnabled(input.dataset.moduleId, input.checked);
-      logEvent(`${input.dataset.moduleId} ${input.checked ? 'enabled' : 'disabled'}`);
+      logEvent(`${input.dataset.moduleId} ${input.checked ? 'activé' : 'désactivé'}`);
       await refreshRest();
     } catch (error) {
       input.checked = !input.checked;
@@ -746,7 +895,7 @@ function bindActions() {
   $('#start-calibration')?.addEventListener('click', async () => {
     try {
       await fetchJson('/api/v1/calibration/start', { method: 'POST' });
-      logEvent('Calibration started');
+      logEvent('Calibration démarrée');
       await refreshRest();
     } catch (error) {
       logEvent(error.message, 'warn');
@@ -755,7 +904,7 @@ function bindActions() {
   $('#stop-calibration')?.addEventListener('click', async () => {
     try {
       await fetchJson('/api/v1/calibration/stop', { method: 'POST' });
-      logEvent('Calibration stopped');
+      logEvent('Calibration arrêtée');
       await refreshRest();
     } catch (error) {
       logEvent(error.message, 'warn');
@@ -767,6 +916,11 @@ function bindActions() {
   window.addEventListener('pointercancel', endNodeDrag);
   $('#reset-placement')?.addEventListener('click', resetPlacement);
   $('#save-placement')?.addEventListener('click', persistPlacement);
+  for (const id of ['placement-x', 'placement-y', 'placement-z']) {
+    const input = document.getElementById(id);
+    input?.addEventListener('input', updatePositionFromInputs);
+    input?.addEventListener('change', updatePositionFromInputs);
+  }
 }
 
 function fixtureTopology(count = 3) {
@@ -820,6 +974,13 @@ window.__ruvsenseRenderFixture = (count = 3) => {
   state.topology = fixtureTopology(Number(count) || 0);
   renderAll();
   return state.topology;
+};
+
+window.__ruvsenseConsoleTestApi = {
+  state,
+  selectNode,
+  changedPlacementNodes: () => changedPlacementNodes().map(({ id, pos }) => ({ id, position_m: [pos.x, pos.y, pos.z] })),
+  updatePositionFromInputs,
 };
 
 async function init() {
