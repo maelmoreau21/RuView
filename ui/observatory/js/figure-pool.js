@@ -437,6 +437,36 @@ export class FigurePool {
     fig.labelMat.opacity = 0.94;
   }
 
+  _isPresenceHold(data, person) {
+    return String(data?.count_evidence?.reason || person?.detection_state || '').toLowerCase()
+      === 'presence_hold'
+      || String(person?.detection_state || '').toLowerCase() === 'held';
+  }
+
+  _presenceOpacity(data, person) {
+    if (!this._isPresenceHold(data, person)) return 1;
+    const confidence = this._firstFinite(
+      person?.confidence,
+      data?.classification?.confidence,
+      0.35,
+    ) ?? 0.35;
+    return Math.max(0.35, Math.min(0.68, confidence));
+  }
+
+  _applyPresenceOpacity(fig, opacity) {
+    if (opacity >= 0.99) return;
+    for (const joint of fig.joints) {
+      joint.material.opacity *= opacity;
+      if (joint._haloMat) joint._haloMat.opacity *= opacity;
+      if (joint._glow) joint._glow.intensity *= opacity;
+    }
+    for (const bone of fig.bones) bone.mesh.material.opacity *= opacity;
+    for (const seg of fig.bodySegments) seg.mat.opacity *= opacity;
+    fig.auraMat.opacity *= opacity;
+    fig.personLight.intensity *= opacity;
+    fig.labelMat.opacity *= opacity;
+  }
+
   /**
    * Update all figures based on current data frame.
    * @param {object} data - Current sensing data with persons[], vital_signs, classification
@@ -467,6 +497,7 @@ export class FigurePool {
           || this._poseSystem.generateKeypoints({ ...p, position }, elapsed, breathPulse);
         this.applyKeypoints(fig, kps, breathPulse, position, elapsed, p.pose);
         this._updateVitalsBillboard(fig, p, data, position);
+        this._applyPresenceOpacity(fig, this._presenceOpacity(data, p));
         fig.visible = true;
       } else {
         if (fig.visible) {

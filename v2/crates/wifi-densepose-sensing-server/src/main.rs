@@ -2401,6 +2401,12 @@ struct AppStateInner {
     count_candidate_persons: usize,
     /// First instant at which `count_candidate_persons` was observed.
     count_candidate_since: Option<std::time::Instant>,
+    /// Last instant where the room had positive live presence evidence.
+    last_present_at: Option<std::time::Instant>,
+    /// Last conservative person count that was safe to render.
+    last_present_count: usize,
+    /// Last fused confidence used while bridging short RF dropouts.
+    last_present_confidence: f64,
     /// Attention-weighted multi-node CSI fusion engine.
     multistatic_fuser: MultistaticFuser,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
@@ -3902,12 +3908,9 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             s.prev_person_count = 0;
             0
         };
-        let count_evidence = resolve_rendered_person_count(
-            &mut s,
-            classification.presence,
-            est_persons,
-            std::time::Instant::now(),
-        );
+        let now = std::time::Instant::now();
+        let count_evidence =
+            apply_room_presence_continuity(&mut s, &mut classification, est_persons, now);
         let rendered_persons = count_evidence.rendered_persons;
 
         let mut update = SensingUpdate {
@@ -4071,12 +4074,9 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         s.prev_person_count = 0;
         0
     };
-    let count_evidence = resolve_rendered_person_count(
-        &mut s,
-        classification.presence,
-        est_persons,
-        std::time::Instant::now(),
-    );
+    let now = std::time::Instant::now();
+    let count_evidence =
+        apply_room_presence_continuity(&mut s, &mut classification, est_persons, now);
     let rendered_persons = count_evidence.rendered_persons;
 
     let mut update = SensingUpdate {
@@ -4928,6 +4928,178 @@ fn aggregate_person_count(
 
 const MAX_RENDERED_PERSONS: usize = 3;
 const MULTI_PERSON_CONFIRMATION_MS: u128 = 1_500;
+const PRESENCE_HOLD_MS: u64 = 2_500;
+const EDGE_VITALS_PRESENCE_SCORE_FLOOR: f64 = 0.35;
+const PRESENCE_HOLD_CONFIDENCE_FLOOR: f64 = 0.25;
+
+fn edge_vitals_motion_profile(vitals: &Esp32VitalsPacket) -> (&'static str, f64) {
+    if vitals.motion {
+        ("present_moving", 0.8)
+    } else if vitals.presence {
+        ("present_still", 0.3)
+    } else {
+        ("absent", 0.05)
+    }
+}
+
+fn update_node_presence_from_edge_vitals(
+    ns: &mut NodeState,
+    vitals: &Esp32VitalsPacket,
+) -> (&'static str, f64) {
+    let (motion_level, motion_score) = edge_vitals_motion_profile(vitals);
+    ns.current_motion_level = motion_level.to_string();
+    ns.smoothed_motion = ns.smoothed_motion * 0.80 + motion_score * 0.20;
+    if vitals.presence {
+        let score = (vitals.presence_score as f64).clamp(0.0, 1.0);
+        ns.smoothed_person_score =
+            (ns.smoothed_person_score * 0.75 + score * 0.25).clamp(0.0, 1.0);
+    } else {
+        ns.smoothed_person_score = (ns.smoothed_person_score * 0.75).clamp(0.0, 1.0);
+    }
+    (motion_level, motion_score)
+}
+
+fn node_presence_confidence(ns: &NodeState) -> f64 {
+    let mut confidence = ns.smoothed_person_score.clamp(0.0, 1.0);
+
+    if ns.prev_person_count > 0 {
+        confidence = confidence.max(0.40);
+    }
+    if !matches!(ns.current_motion_level.as_str(), "absent") {
+        confidence = confidence.max(0.30);
+    }
+    if let Some(vitals) = ns.edge_vitals.as_ref() {
+        confidence = confidence.max((vitals.presence_score as f64).clamp(0.0, 1.0));
+        if vitals.presence {
+            confidence = confidence.max(0.45);
+        }
+    }
+
+    confidence.clamp(0.0, 1.0)
+}
+
+fn node_supports_presence(ns: &NodeState, now: std::time::Instant) -> bool {
+    if !is_node_active(ns, now) {
+        return false;
+    }
+
+    ns.prev_person_count > 0
+        || !matches!(ns.current_motion_level.as_str(), "absent")
+        || ns.edge_vitals.as_ref().is_some_and(|vitals| {
+            vitals.presence
+                || (vitals.presence_score as f64) >= EDGE_VITALS_PRESENCE_SCORE_FLOOR
+        })
+}
+
+fn room_presence_supporting_nodes(s: &AppStateInner, now: std::time::Instant) -> usize {
+    s.node_states
+        .values()
+        .filter(|node| node_supports_presence(node, now))
+        .count()
+}
+
+fn room_presence_confidence(
+    s: &AppStateInner,
+    current_confidence: f64,
+    now: std::time::Instant,
+) -> f64 {
+    s.node_states
+        .values()
+        .filter(|node| is_node_active(node, now))
+        .map(node_presence_confidence)
+        .fold(current_confidence.clamp(0.0, 1.0), f64::max)
+        .clamp(0.0, 1.0)
+}
+
+fn held_presence_confidence(base_confidence: f64, elapsed: std::time::Duration) -> f64 {
+    let hold_secs = PRESENCE_HOLD_MS as f64 / 1_000.0;
+    let progress = (elapsed.as_secs_f64() / hold_secs).clamp(0.0, 1.0);
+    (base_confidence * (1.0 - 0.50 * progress))
+        .max(PRESENCE_HOLD_CONFIDENCE_FLOOR)
+        .clamp(0.0, 1.0)
+}
+
+fn presence_hold_elapsed(
+    last_present_at: Option<std::time::Instant>,
+    last_present_count: usize,
+    active_nodes: usize,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    if active_nodes == 0 || last_present_count == 0 {
+        return None;
+    }
+    let elapsed = last_present_at.and_then(|last_seen| now.checked_duration_since(last_seen))?;
+    (elapsed <= std::time::Duration::from_millis(PRESENCE_HOLD_MS)).then_some(elapsed)
+}
+
+fn apply_room_presence_continuity(
+    s: &mut AppStateInner,
+    classification: &mut ClassificationInfo,
+    raw_estimated_persons: usize,
+    now: std::time::Instant,
+) -> CountEvidence {
+    let active_nodes = active_node_count(s, now);
+    let supporting_nodes = room_presence_supporting_nodes(s, now);
+    let room_person_count = aggregate_person_count(raw_estimated_persons, &s.node_states, now);
+    let current_presence = classification.presence;
+    let instant_presence = current_presence || supporting_nodes > 0 || room_person_count > 0;
+
+    if instant_presence {
+        let effective_raw = room_person_count.max(raw_estimated_persons).max(1);
+        if !classification.presence {
+            classification.presence = true;
+            classification.motion_level = "present_still".to_string();
+        }
+        classification.confidence =
+            room_presence_confidence(s, classification.confidence, now).clamp(0.0, 1.0);
+        if supporting_nodes > 0 {
+            classification.confidence = classification.confidence.max(0.35);
+        }
+
+        let mut evidence = resolve_rendered_person_count(s, true, effective_raw, now);
+        if !current_presence && supporting_nodes > 0 {
+            evidence.reason = "room_fused_presence".to_string();
+        }
+
+        s.prev_person_count = evidence.rendered_persons;
+        s.last_present_at = Some(now);
+        s.last_present_count = evidence.rendered_persons.clamp(1, MAX_RENDERED_PERSONS);
+        s.last_present_confidence = classification.confidence;
+        return evidence;
+    }
+
+    if let Some(elapsed) =
+        presence_hold_elapsed(s.last_present_at, s.last_present_count, active_nodes, now)
+    {
+        let held_count = s.last_present_count.clamp(1, MAX_RENDERED_PERSONS);
+        classification.presence = true;
+        classification.motion_level = "present_still".to_string();
+        classification.confidence = held_presence_confidence(s.last_present_confidence, elapsed);
+        s.stable_rendered_person_count = held_count;
+        s.count_candidate_persons = 0;
+        s.count_candidate_since = None;
+        s.prev_person_count = held_count;
+        return CountEvidence {
+            stable_persons: held_count,
+            raw_estimated_persons: held_count,
+            rendered_persons: held_count,
+            active_nodes,
+            supporting_nodes,
+            ambiguous: true,
+            reason: "presence_hold".to_string(),
+        };
+    }
+
+    s.last_present_at = None;
+    s.last_present_count = 0;
+    s.last_present_confidence = 0.0;
+    s.prev_person_count = 0;
+    let mut evidence = resolve_rendered_person_count(s, false, 0, now);
+    if active_nodes > 0 {
+        evidence.reason = "absent_after_hold".to_string();
+    }
+    evidence
+}
 
 fn supporting_nodes_for_count(
     node_states: &std::collections::HashMap<u8, NodeState>,
@@ -5096,6 +5268,22 @@ mod aggregate_person_count_tests {
         n
     }
 
+    fn edge_vitals_packet(presence: bool, motion: bool, presence_score: f32) -> Esp32VitalsPacket {
+        Esp32VitalsPacket {
+            node_id: 7,
+            presence,
+            fall_detected: false,
+            motion,
+            breathing_rate_bpm: 14.0,
+            heartrate_bpm: 72.0,
+            rssi: -48,
+            n_persons: if presence { 1 } else { 0 },
+            motion_energy: if motion { 0.8 } else { 0.1 },
+            presence_score,
+            timestamp_ms: 42,
+        }
+    }
+
     #[test]
     fn empty_nodes_fall_back_to_activity_count() {
         let nodes: HashMap<u8, NodeState> = HashMap::new();
@@ -5157,6 +5345,61 @@ mod aggregate_person_count_tests {
         );
 
         assert_eq!(aggregate_person_count(1, &nodes, now), 1);
+    }
+
+    #[test]
+    fn edge_vitals_update_feeds_node_presence_state() {
+        let mut node = NodeState::new();
+        let vitals = edge_vitals_packet(true, true, 0.72);
+
+        let (motion_level, motion_score) =
+            update_node_presence_from_edge_vitals(&mut node, &vitals);
+
+        assert_eq!(motion_level, "present_moving");
+        assert_eq!(node.current_motion_level, "present_moving");
+        assert!(motion_score > 0.7);
+        assert!(node.smoothed_person_score > 0.15);
+    }
+
+    #[test]
+    fn edge_vitals_presence_supports_room_fusion_without_csi_count() {
+        let now = Instant::now();
+        let mut node = NodeState::new();
+        node.last_frame_time = Some(now);
+        node.edge_vitals = Some(edge_vitals_packet(true, false, 0.62));
+
+        assert!(node_supports_presence(&node, now));
+        assert!(node_presence_confidence(&node) >= 0.62);
+    }
+
+    #[test]
+    fn stale_edge_vitals_do_not_support_room_presence() {
+        let now = Instant::now();
+        let mut node = NodeState::new();
+        node.last_frame_time =
+            now.checked_sub(ESP32_OFFLINE_TIMEOUT + Duration::from_millis(1));
+        node.edge_vitals = Some(edge_vitals_packet(true, false, 0.80));
+
+        assert!(!node_supports_presence(&node, now));
+    }
+
+    #[test]
+    fn short_presence_hold_requires_active_nodes_and_fresh_latch() {
+        let now = Instant::now();
+        let recent = now.checked_sub(Duration::from_millis(2_000)).unwrap();
+        let stale = now.checked_sub(Duration::from_millis(2_600)).unwrap();
+
+        assert!(presence_hold_elapsed(Some(recent), 1, 1, now).is_some());
+        assert!(presence_hold_elapsed(Some(stale), 1, 1, now).is_none());
+        assert!(presence_hold_elapsed(Some(recent), 1, 0, now).is_none());
+        assert!(presence_hold_elapsed(Some(recent), 0, 1, now).is_none());
+    }
+
+    #[test]
+    fn held_presence_confidence_decays_without_disappearing_immediately() {
+        let decayed = held_presence_confidence(0.80, Duration::from_millis(2_000));
+        assert!(decayed < 0.80);
+        assert!(decayed >= PRESENCE_HOLD_CONFIDENCE_FLOOR);
     }
 
     fn resolve_count(
@@ -8692,24 +8935,11 @@ async fn udp_receiver_task(
                         0
                     };
                     ns.prev_person_count = node_est;
+                    let (motion_level, motion_score) =
+                        update_node_presence_from_edge_vitals(ns, &vitals);
 
                     s.tick += 1;
                     let tick = s.tick;
-
-                    let motion_level = if vitals.motion {
-                        "present_moving"
-                    } else if vitals.presence {
-                        "present_still"
-                    } else {
-                        "absent"
-                    };
-                    let motion_score = if vitals.motion {
-                        0.8
-                    } else if vitals.presence {
-                        0.3
-                    } else {
-                        0.05
-                    };
 
                     // Aggregate person count: gate on presence first (matching WiFi path).
                     let now = std::time::Instant::now();
@@ -8829,9 +9059,9 @@ async fn udp_receiver_task(
                         (vitals.presence_score as f64).min(1.0),
                         &[],
                     );
-                    let count_evidence = resolve_rendered_person_count(
+                    let count_evidence = apply_room_presence_continuity(
                         &mut s,
-                        classification.presence,
+                        &mut classification,
                         total_persons,
                         now,
                     );
@@ -9249,9 +9479,9 @@ async fn udp_receiver_task(
                         s.prev_person_count = 0;
                         0
                     };
-                    let count_evidence = resolve_rendered_person_count(
+                    let count_evidence = apply_room_presence_continuity(
                         &mut s,
-                        classification.presence,
+                        &mut classification,
                         total_persons,
                         now,
                     );
@@ -9564,8 +9794,12 @@ async fn handle_delivered_esp32_frame(
         s.prev_person_count = 0;
         0
     };
-    let count_evidence =
-        resolve_rendered_person_count(&mut s, classification.presence, total_persons, now);
+    let count_evidence = apply_room_presence_continuity(
+        &mut s,
+        &mut classification,
+        total_persons,
+        now,
+    );
     let rendered_persons = count_evidence.rendered_persons;
 
     if is_live_frame {
@@ -9744,12 +9978,9 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             s.prev_person_count = 0;
             0
         };
-        let count_evidence = resolve_rendered_person_count(
-            &mut s,
-            classification.presence,
-            est_persons,
-            std::time::Instant::now(),
-        );
+        let now = std::time::Instant::now();
+        let count_evidence =
+            apply_room_presence_continuity(&mut s, &mut classification, est_persons, now);
         let rendered_persons = count_evidence.rendered_persons;
 
         let mut update = SensingUpdate {
@@ -10958,6 +11189,9 @@ async fn main() {
         stable_rendered_person_count: 0,
         count_candidate_persons: 0,
         count_candidate_since: None,
+        last_present_at: None,
+        last_present_count: 0,
+        last_present_confidence: 0.0,
         multistatic_fuser: {
             let mut fuser = MultistaticFuser::with_config(MultistaticConfig {
                 min_nodes: 1, // single-node passthrough

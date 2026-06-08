@@ -514,6 +514,10 @@ class Observatory {
     };
   }
 
+  _isPresenceHold(data) {
+    return String(data?.count_evidence?.reason || '').toLowerCase() === 'presence_hold';
+  }
+
   _personIdentity(person, index) {
     const id = person?.id ?? person?.track_id ?? person?.person_id;
     return id == null || id === '' ? `person_${index + 1}` : String(id);
@@ -634,6 +638,26 @@ class Observatory {
     return [(index - half) * spacing, 0, zJitter];
   }
 
+  _inferredPersonsFromCount(frame, evidence, startIndex = 0) {
+    const rendered = Math.min(MAX_SCENE_PERSONS, this._integerOrZero(evidence?.rendered_persons));
+    if (rendered <= startIndex) return [];
+    const reason = String(evidence?.reason || '').toLowerCase();
+    const confidence = this._numberOrNull(frame?.classification?.confidence)
+      ?? (reason === 'presence_hold' ? 0.35 : 0.5);
+    return Array.from({ length: rendered - startIndex }, (_, offset) => {
+      const index = startIndex + offset;
+      return {
+        id: reason === 'presence_hold' ? `held_${index + 1}` : `inferred_${index + 1}`,
+        confidence,
+        position: this._fallbackPersonPosition(index, rendered),
+        position_source: 'observatory_layout',
+        pose_source: reason === 'presence_hold' ? 'presence_hold' : 'count_evidence',
+        pose: 'standing',
+        detection_state: reason === 'presence_hold' ? 'held' : 'inferred',
+      };
+    });
+  }
+
   _normalizeSensingFrame(rawFrame) {
     if (!rawFrame || typeof rawFrame !== 'object') return null;
     const frame = this._lastEdgeVitals ? this._mergeEdgeVitals(rawFrame, this._lastEdgeVitals) : { ...rawFrame };
@@ -658,7 +682,12 @@ class Observatory {
       }
     }
 
-    const evidence = this._countEvidence({ ...frame, persons });
+    let evidence = this._countEvidence({ ...frame, persons });
+    const inferredPersons = this._inferredPersonsFromCount(frame, evidence, persons.length);
+    if (inferredPersons.length) {
+      persons = persons.concat(inferredPersons);
+      evidence = this._countEvidence({ ...frame, persons });
+    }
     const hasCountEvidence = Boolean(frame.count_evidence && typeof frame.count_evidence === 'object');
     const renderLimit = hasCountEvidence
       ? evidence.rendered_persons
@@ -709,7 +738,12 @@ class Observatory {
         ...(keypointsM ? { keypoints_m: keypointsM } : {}),
       };
     }).filter(Boolean);
-    const evidence = this._countEvidence({ ...data, persons });
+    let evidence = this._countEvidence({ ...data, persons });
+    const inferredPersons = this._inferredPersonsFromCount(data, evidence, persons.length);
+    if (inferredPersons.length) {
+      persons = persons.concat(inferredPersons);
+      evidence = this._countEvidence({ ...data, persons });
+    }
     const hasCountEvidence = Boolean(data.count_evidence && typeof data.count_evidence === 'object');
     const renderLimit = hasCountEvidence
       ? evidence.rendered_persons
@@ -1250,6 +1284,7 @@ class Observatory {
   _updateDotMatrixMist(data, elapsed) {
     const persons = data?.persons || [];
     const isPresent = data?.classification?.presence || false;
+    const holdAlpha = this._isPresenceHold(data) ? 0.45 : 1.0;
     const pos = this._mistPoints.geometry.attributes.position;
     const alpha = this._mistPoints.geometry.attributes.alpha;
 
@@ -1293,7 +1328,7 @@ class Observatory {
       pos.array[i * 3 + 1] += (layerY - pos.array[i * 3 + 1]) * 0.05;
       pos.array[i * 3 + 2] += (tz - pos.array[i * 3 + 2]) * 0.05;
 
-      const targetAlpha = 0.15 + Math.sin(elapsed * 2 + i * 0.5) * 0.08;
+      const targetAlpha = (0.15 + Math.sin(elapsed * 2 + i * 0.5) * 0.08) * holdAlpha;
       alpha.array[i] += (targetAlpha - alpha.array[i]) * 0.08;
     }
     pos.needsUpdate = true;
@@ -1312,7 +1347,7 @@ class Observatory {
     }
 
     // Emit from all active persons
-    if (isPresent && persons.length > 0) {
+    if (isPresent && persons.length > 0 && !this._isPresenceHold(data)) {
       this._trailTimer += dt;
       const ms = persons[0].motion_score || 0;
       const emitRate = ms > 50 ? 0.02 : 0.08;
