@@ -17,8 +17,7 @@
       <div id="brand-logo"><span class="pi">&pi;</span> RuvSense Edge</div>
       <div id="brand-tagline">RuvSense Console / WiFi CSI Fleet</div>
       <nav id="hud-nav" aria-label="Observatory navigation">
-        <a href="/ui/index.html" class="hud-nav-link">Accueil</a>
-        <a href="/ui/console.html#fleet" class="hud-nav-link">Console</a>
+        <a href="/ui/console.html#fleet" class="hud-nav-link">Live 2D</a>
       </nav>
     </div>
 
@@ -29,10 +28,17 @@
         <span id="data-source-label">OFFLINE</span>
       </div>
       <div id="fps-counter" style="display:none">60 FPS</div>
+      <label class="hud-toggle object-detection-toggle" for="object-detection-toggle">
+        <span>Objets</span>
+        <input id="object-detection-toggle" type="checkbox" role="switch">
+        <i aria-hidden="true"></i>
+      </label>
       <button id="settings-btn" title="Settings">&#9881;</button>
     </div>
 
     <div id="hud-panel-layout">
+      <button id="collapse-left" class="panel-collapse panel-collapse--left" type="button" title="Masquer le menu gauche" aria-label="Masquer le menu gauche" aria-expanded="true">&lt;&lt;</button>
+      <button id="collapse-right" class="panel-collapse panel-collapse--right" type="button" title="Masquer le menu droit" aria-label="Masquer le menu droit" aria-expanded="true">&gt;&gt;</button>
       <div id="mobile-hud-tabs" role="tablist" aria-label="HUD panels">
         <button class="mobile-hud-tab active" type="button" role="tab" aria-selected="true" data-panel="panel-fleet">Fleet</button>
         <button class="mobile-hud-tab" type="button" role="tab" aria-selected="false" data-panel="panel-signal">Signal</button>

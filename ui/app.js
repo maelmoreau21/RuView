@@ -30,6 +30,7 @@ const state = {
   autoPlacementLastKey: '',
   autoPlacementStableCount: 0,
   autoPlacementSaving: false,
+  placementAutoMode: localStorage.getItem('ruvsense:placement-mode') !== 'manual',
 };
 
 const VALID_PANELS = new Set(['fleet', 'modules', 'vitals', 'calibration', 'diagnostics']);
@@ -370,6 +371,7 @@ function refreshPlacementDirty() {
 
 function setPlacementInputValues(pos) {
   const b = roomBounds();
+  const manual = !state.placementAutoMode;
   const fields = [
     ['placement-x', 'x', null, null],
     ['placement-y', 'y', b.minY, b.maxY],
@@ -378,7 +380,7 @@ function setPlacementInputValues(pos) {
   for (const [id, axis, min, max] of fields) {
     const input = document.getElementById(id);
     if (!(input instanceof HTMLInputElement)) continue;
-    input.disabled = !pos;
+    input.disabled = !pos || !manual;
     if (min === null || max === null) {
       input.removeAttribute('min');
       input.removeAttribute('max');
@@ -812,6 +814,7 @@ function renderTopology() {
   if (!stage) return;
   stage.replaceChildren();
   syncPlacementState();
+  stage.classList.toggle('is-auto-placement', state.placementAutoMode);
   updateStageViewportStyle(stage);
   renderPlacementRoomFrame(stage);
 
@@ -862,13 +865,18 @@ function renderPlacementControls() {
     : 'X -- / Y -- / Z --');
   setText('placement-state', state.placementError ? 'erreur' : state.placementDirty ? 'à enregistrer' : 'enregistré');
   setText('placement-error', state.placementError || '');
+  setText('placement-mode-label', state.placementAutoMode ? 'auto' : 'manuel');
+  const modeToggle = $('#placement-auto-mode');
+  if (modeToggle instanceof HTMLInputElement) modeToggle.checked = state.placementAutoMode;
   const error = $('#placement-error');
   if (error) error.classList.toggle('is-visible', Boolean(state.placementError));
   setPlacementInputValues(pos);
   const save = $('#save-placement');
-  if (save) save.disabled = !state.placementDirty || Boolean(state.placementError) || !nodes.length;
+  if (save) save.disabled = state.placementAutoMode || !state.placementDirty || Boolean(state.placementError) || !nodes.length;
   const reset = $('#reset-placement');
-  if (reset) reset.disabled = !state.placementDirty;
+  if (reset) reset.disabled = state.placementAutoMode || !state.placementDirty;
+  const autoNow = $('#auto-place-now');
+  if (autoNow) autoNow.disabled = !state.placementAutoMode;
 }
 
 function denseRow(title, subtitle, meta, status) {
@@ -1236,6 +1244,7 @@ function selectNode(nodeId) {
 }
 
 function updatePositionFromInputs() {
+  if (state.placementAutoMode) return;
   const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
   const selected = nodes.find((node) => nodeIdOf(node) === state.placementSelectedId);
   if (!selected) return;
@@ -1267,6 +1276,7 @@ function updatePositionFromInputs() {
 }
 
 function beginNodeDrag(event) {
+  if (state.placementAutoMode) return;
   if (event.button !== undefined && event.button !== 0) return;
   const target = event.target instanceof Element ? event.target : null;
   const markerEl = target?.closest('.topology-marker.node');
@@ -1431,6 +1441,7 @@ function autoPositionFor(index, total) {
 }
 
 function autoPlacementPayload() {
+  if (!state.placementAutoMode) return [];
   const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
   const candidates = nodes.filter(nodeNeedsAutoPlacement);
   return candidates.map((node, index) => {
@@ -1472,6 +1483,10 @@ async function autoPlaceUnknownNodes({ persist = false } = {}) {
 }
 
 async function maybeAutoPersistPlacement() {
+  if (!state.placementAutoMode) {
+    setText('auto-placement-status', 'mode manuel');
+    return;
+  }
   if (state.autoPlacementSaving || state.placementDirty) return;
   const payload = autoPlacementPayload();
   if (!payload.length) {
@@ -1492,6 +1507,23 @@ async function maybeAutoPersistPlacement() {
   } finally {
     state.autoPlacementSaving = false;
   }
+}
+
+function setPlacementAutoMode(enabled) {
+  state.placementAutoMode = Boolean(enabled);
+  localStorage.setItem('ruvsense:placement-mode', state.placementAutoMode ? 'auto' : 'manual');
+  state.placementError = '';
+  state.placementServerError = '';
+  if (state.placementAutoMode) {
+    state.placementDirty = false;
+    state.placementDraft.clear();
+    state.placementOriginal.clear();
+    syncPlacementState(true);
+    void maybeAutoPersistPlacement();
+  }
+  renderTopology();
+  renderFleet();
+  renderPlacementControls();
 }
 
 function bindActions() {
@@ -1638,6 +1670,9 @@ function bindActions() {
   $('#placement-zoom-in')?.addEventListener('click', () => zoomPlacementBy(1.2));
   $('#placement-zoom-out')?.addEventListener('click', () => zoomPlacementBy(1 / 1.2));
   $('#placement-zoom-fit')?.addEventListener('click', fitPlacementViewToNodes);
+  $('#placement-auto-mode')?.addEventListener('change', (event) => {
+    setPlacementAutoMode(Boolean(event.target.checked));
+  });
   $('#auto-place-now')?.addEventListener('click', async () => {
     await autoPlaceUnknownNodes({ persist: true });
   });
@@ -1755,6 +1790,7 @@ window.__ruvsenseConsoleTestApi = {
   resetPlacementView,
   autoPlacementPayload,
   autoPlaceUnknownNodes,
+  setPlacementAutoMode,
   placementView: () => ({ zoom: state.placementZoom, pan: { ...state.placementPan } }),
 };
 

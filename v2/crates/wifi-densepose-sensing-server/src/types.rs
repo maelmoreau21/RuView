@@ -128,11 +128,32 @@ pub struct SensingUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persons: Option<Vec<PersonDetection>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<TrackingState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_persons: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count_evidence: Option<CountEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_features: Option<Vec<PerNodeFeatureInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackingState {
+    pub coordinate_system: String,
+    pub timestamp_ms: u64,
+    pub node_count: usize,
+    pub persons: Vec<TrackedPersonState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackedPersonState {
+    pub id: u32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub position_m: [f64; 3],
+    pub confidence: f64,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

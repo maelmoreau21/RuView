@@ -30,7 +30,6 @@
       <div class="status-cell"><strong id="vitals-optin-status">off</strong><small>vitals</small></div>
     </div>
     <nav class="global-nav" aria-label="Navigation globale">
-      <a href="/ui/index.html">Accueil</a>
       <a class="is-active" href="/ui/console.html#fleet">Console live</a>
       <a href="/ui/observatory.html">Environnement 3D</a>
       <a href="/ui/pose-fusion.html">Pose Fusion</a>
@@ -92,6 +91,14 @@
           <small id="placement-coordinates">X -- / Y -- / Z --</small>
           <small class="placement-help">Glisser sur le plan règle X/Z. Y est la hauteur en mètres.</small>
         </div>
+        <label class="placement-mode-toggle" for="placement-auto-mode">
+          <span>
+            <strong>Placement</strong>
+            <small id="placement-mode-label">auto</small>
+          </span>
+          <input id="placement-auto-mode" type="checkbox" role="switch" checked>
+          <i aria-hidden="true"></i>
+        </label>
         <div class="placement-inputs" aria-label="Coordonnées métriques du nœud sélectionné">
           <label>X <input id="placement-x" type="number" inputmode="decimal" step="0.01" disabled></label>
           <label>Y hauteur <input id="placement-y" type="number" inputmode="decimal" step="0.01" disabled></label>

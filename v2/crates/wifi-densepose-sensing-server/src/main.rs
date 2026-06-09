@@ -24,7 +24,9 @@ mod vital_signs;
 
 // Training pipeline modules (exposed via lib.rs)
 use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, trainer};
-use wifi_densepose_sensing_server::localization::{self, NodePosition, PersonLocation};
+use wifi_densepose_sensing_server::localization::{
+    self, LocationSmoother, NodePosition, NodeSignalReading, PersonLocation,
+};
 
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -371,6 +373,9 @@ struct SensingUpdate {
     /// Detected persons from WiFi sensing (multi-person support).
     #[serde(skip_serializing_if = "Option::is_none")]
     persons: Option<Vec<PersonDetection>>,
+    /// Centralized room state consumed by both 2D and 3D clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<TrackingState>,
     /// Estimated person count from CSI feature heuristics (1-3 for single ESP32).
     #[serde(skip_serializing_if = "Option::is_none")]
     estimated_persons: Option<usize>,
@@ -380,6 +385,25 @@ struct SensingUpdate {
     /// Per-node feature breakdown for multi-node deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     node_features: Option<Vec<PerNodeFeatureInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrackingState {
+    coordinate_system: String,
+    timestamp_ms: u64,
+    node_count: usize,
+    persons: Vec<TrackedPersonState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrackedPersonState {
+    id: u32,
+    x: f64,
+    y: f64,
+    z: f64,
+    position_m: [f64; 3],
+    confidence: f64,
+    source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1112,6 +1136,12 @@ fn localization_snapshot(
 }
 
 fn location_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::Value {
+    if let Some(update) = s.latest_update.as_ref() {
+        if let Some(payload) = location_payload_from_update(update) {
+            return payload;
+        }
+    }
+
     let timestamp_ms = unix_timestamp_ms();
     let (location, node_count, node_positions) = localization_snapshot(s, now, timestamp_ms);
     let persons: Vec<serde_json::Value> = location
@@ -1119,7 +1149,10 @@ fn location_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::V
             vec![serde_json::json!({
                 "x": loc.x,
                 "y": loc.y,
+                "z": 0.9,
+                "position_m": [loc.x, 0.9_f32, loc.y],
                 "confidence": loc.confidence,
+                "source": "rssi_csi_trilateration",
             })]
         })
         .unwrap_or_default();
@@ -1132,6 +1165,49 @@ fn location_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::V
     })
 }
 
+fn location_payload_from_update(update: &SensingUpdate) -> Option<serde_json::Value> {
+    let tracking = update.state.as_ref()?;
+    let persons: Vec<serde_json::Value> = tracking
+        .persons
+        .iter()
+        .map(|person| {
+            serde_json::json!({
+                "id": person.id,
+                "x": person.position_m[0],
+                "y": person.position_m[2],
+                "z": person.position_m[1],
+                "position_m": person.position_m,
+                "confidence": person.confidence,
+                "source": person.source,
+                "timestamp_ms": tracking.timestamp_ms,
+            })
+        })
+        .collect();
+    let nodes: Vec<serde_json::Value> = update
+        .nodes
+        .iter()
+        .filter(|node| node.node_id != 0 && is_localized_position(&node.position))
+        .map(|node| {
+            serde_json::json!({
+                "node_id": node.node_id,
+                "x": node.position[0],
+                "y": node.position[2],
+                "z": node.position[1],
+                "position_m": node.position,
+                "rssi_dbm": node.rssi_dbm,
+            })
+        })
+        .collect();
+
+    Some(serde_json::json!({
+        "persons": persons,
+        "node_count": tracking.node_count,
+        "timestamp_ms": tracking.timestamp_ms,
+        "nodes": nodes,
+        "state": tracking,
+    }))
+}
+
 fn record_pose_latency(s: &mut AppStateInner, started: std::time::Instant) {
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     s.latest_pose_latency_ms = elapsed_ms;
@@ -1142,6 +1218,181 @@ fn record_dsp_latency(s: &mut AppStateInner, started: std::time::Instant) {
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     s.latest_dsp_latency_ms = elapsed_ms;
     s.dsp_latency_p95_ms.push(elapsed_ms);
+}
+
+fn finalize_persons_for_update(s: &mut AppStateInner, update: &mut SensingUpdate) {
+    attach_tracking_state(update, &mut s.location_smoother);
+
+    let pose_started = std::time::Instant::now();
+    let raw_persons = derive_pose_from_sensing(update);
+    let mut last_tracker_instant = s.last_tracker_instant.take();
+    let persons = persons_for_update(
+        update,
+        raw_persons,
+        &mut s.pose_tracker,
+        &mut last_tracker_instant,
+    );
+    s.last_tracker_instant = last_tracker_instant;
+    record_pose_latency(s, pose_started);
+    if !persons.is_empty() {
+        update.persons = Some(persons);
+    }
+}
+
+fn attach_tracking_state(update: &mut SensingUpdate, smoother: &mut LocationSmoother) {
+    if !update.classification.presence {
+        smoother.reset();
+        update.state = None;
+        return;
+    }
+
+    let timestamp_ms = unix_timestamp_ms();
+    let (readings, positions) = localization_inputs_from_update(update);
+    let node_count = localization::locatable_signal_count(&readings, &positions);
+    let Some(measurement) =
+        localization::estimate_person_location_with_signal_readings(&readings, &positions, timestamp_ms)
+    else {
+        smoother.reset();
+        update.state = None;
+        return;
+    };
+
+    let location = smoother.update(measurement);
+    let person_count = update.estimated_persons.unwrap_or(1).max(1);
+    let source = if is_synthetic_dev_source(&update.source) {
+        SYNTHETIC_DEV_POSE_SOURCE
+    } else if node_count < 2 {
+        RSSI_CSI_SINGLE_NODE_SOURCE
+    } else {
+        RSSI_CSI_POSE_SOURCE
+    };
+    let persons = tracked_person_states(&location, person_count, node_count, &positions, source);
+
+    update.state = Some(TrackingState {
+        coordinate_system: "meters_xyz_room".to_string(),
+        timestamp_ms,
+        node_count,
+        persons,
+    });
+}
+
+fn localization_inputs_from_update(
+    update: &SensingUpdate,
+) -> (Vec<NodeSignalReading>, Vec<NodePosition>) {
+    let mut readings = Vec::new();
+    let mut positions = Vec::new();
+
+    for node in update.nodes.iter().filter(|node| node.node_id != 0) {
+        if !node.rssi_dbm.is_finite() || !is_localized_position(&node.position) {
+            continue;
+        }
+        readings.push(NodeSignalReading {
+            node_id: node.node_id,
+            rssi_dbm: node.rssi_dbm as f32,
+            csi_quality: node_csi_quality(node),
+        });
+        positions.push(NodePosition {
+            node_id: node.node_id,
+            x: node.position[0] as f32,
+            y: node.position[2] as f32,
+        });
+    }
+
+    readings.sort_by_key(|reading| reading.node_id);
+    positions.sort_by_key(|position| position.node_id);
+    (readings, positions)
+}
+
+fn node_csi_quality(node: &NodeInfo) -> f32 {
+    if node.amplitude.is_empty() {
+        return 0.65;
+    }
+
+    let finite: Vec<f64> = node
+        .amplitude
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .take(56)
+        .collect();
+    if finite.is_empty() {
+        return 0.35;
+    }
+
+    let mean = finite.iter().sum::<f64>() / finite.len() as f64;
+    let variance = finite
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / finite.len().max(1) as f64;
+    let cv = if mean.abs() > 1.0e-6 {
+        variance.sqrt() / mean.abs()
+    } else {
+        0.0
+    };
+    let subcarrier_quality = (finite.len() as f32 / 56.0).clamp(0.35, 1.0);
+    let perturbation_quality = (0.45 + (cv as f32).clamp(0.0, 1.0) * 0.55).clamp(0.35, 1.0);
+    subcarrier_quality * perturbation_quality
+}
+
+fn tracked_person_states(
+    location: &PersonLocation,
+    person_count: usize,
+    node_count: usize,
+    positions: &[NodePosition],
+    source: &str,
+) -> Vec<TrackedPersonState> {
+    let (min_x, max_x, min_z, max_z) = localization_bounds(positions)
+        .unwrap_or((location.x - 1.0, location.x + 1.0, location.y - 1.0, location.y + 1.0));
+    let x_span = (max_x - min_x).abs().max(0.5);
+    let z_span = (max_z - min_z).abs().max(0.5);
+    let person_count = person_count.max(1);
+    let half = (person_count as f64 - 1.0) / 2.0;
+    let spread_x = (x_span as f64 / (person_count as f64 + 1.0)).clamp(0.35, 0.9);
+    let spread_z = (z_span as f64 * 0.06).clamp(0.0, 0.25);
+
+    (0..person_count)
+        .map(|idx| {
+            let spread_index = idx as f64 - half;
+            let x = (location.x as f64 + spread_index * spread_x)
+                .clamp(min_x as f64, max_x as f64);
+            let z = (location.y as f64 + spread_index.signum() * spread_z)
+                .clamp(min_z as f64, max_z as f64);
+            let y = 0.9_f64;
+            let confidence = if node_count < 2 {
+                0.20_f64.max(location.confidence as f64)
+            } else {
+                location.confidence as f64
+            };
+            TrackedPersonState {
+                id: (idx + 1) as u32,
+                x,
+                y,
+                z,
+                position_m: [x, y, z],
+                confidence,
+                source: source.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn localization_bounds(positions: &[NodePosition]) -> Option<(f32, f32, f32, f32)> {
+    let first = positions.first()?;
+    let mut min_x = first.x;
+    let mut max_x = first.x;
+    let mut min_z = first.y;
+    let mut max_z = first.y;
+    for position in positions.iter().skip(1) {
+        min_x = min_x.min(position.x);
+        max_x = max_x.max(position.x);
+        min_z = min_z.min(position.y);
+        max_z = max_z.max(position.y);
+    }
+    Some((min_x, max_x, min_z, max_z))
 }
 
 fn fleet_ready(s: &AppStateInner, now: std::time::Instant) -> bool {
@@ -2599,6 +2850,8 @@ struct AppStateInner {
     // ── Accuracy sprint: Kalman tracker, multistatic fusion, eigenvalue counting ──
     /// Global Kalman-based pose tracker for stable person IDs and smoothed keypoints.
     pose_tracker: PoseTracker,
+    /// Room-position alpha-beta filter for the centralized tracking state.
+    location_smoother: LocationSmoother,
     /// Instant of last tracker update (for computing dt).
     last_tracker_instant: Option<std::time::Instant>,
     /// Conservative person count currently safe to render.
@@ -4161,6 +4414,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             pose_keypoints: None,
             model_status: None,
             persons: None,
+            state: None,
             estimated_persons: if rendered_persons > 0 {
                 Some(rendered_persons)
             } else {
@@ -4170,21 +4424,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             node_features: None,
         };
 
-        // Populate persons from the sensing update (Kalman-smoothed via tracker).
-        let pose_started = std::time::Instant::now();
-        let raw_persons = derive_pose_from_sensing(&update);
-        let mut last_tracker_instant = s.last_tracker_instant.take();
-        let persons = persons_for_update(
-            &update,
-            raw_persons,
-            &mut s.pose_tracker,
-            &mut last_tracker_instant,
-        );
-        s.last_tracker_instant = last_tracker_instant;
-        record_pose_latency(&mut s, pose_started);
-        if !persons.is_empty() {
-            update.persons = Some(persons);
-        }
+        finalize_persons_for_update(&mut s, &mut update);
 
         if let Ok(json) = serde_json::to_string(&update) {
             let _ = s.tx.send(json);
@@ -4327,6 +4567,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         pose_keypoints: None,
         model_status: None,
         persons: None,
+        state: None,
         estimated_persons: if rendered_persons > 0 {
             Some(rendered_persons)
         } else {
@@ -4336,20 +4577,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         node_features: None,
     };
 
-    let pose_started = std::time::Instant::now();
-    let raw_persons = derive_pose_from_sensing(&update);
-    let mut last_tracker_instant = s.last_tracker_instant.take();
-    let persons = persons_for_update(
-        &update,
-        raw_persons,
-        &mut s.pose_tracker,
-        &mut last_tracker_instant,
-    );
-    s.last_tracker_instant = last_tracker_instant;
-    record_pose_latency(&mut s, pose_started);
-    if !persons.is_empty() {
-        update.persons = Some(persons);
-    }
+    finalize_persons_for_update(&mut s, &mut update);
 
     if let Ok(json) = serde_json::to_string(&update) {
         let _ = s.tx.send(json);
@@ -4635,6 +4863,7 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                         "pose": {
                                             "persons": persons,
                                         },
+                                        "state": sensing.state.clone(),
                                         "confidence": if sensing.classification.presence { sensing.classification.confidence } else { 0.0 },
                                         "activity": sensing.classification.motion_level,
                                         // pose_source tells the UI which estimation mode is active.
@@ -5792,6 +6021,8 @@ mod aggregate_person_count_tests {
 /// `total_persons`: total number of detected persons (for spacing calculation).
 const UNLOCALIZED_POSITION_SOURCE: &str = "unlocalized";
 const SENSOR_GEOMETRY_POSE_SOURCE: &str = "sensor_geometry";
+const RSSI_CSI_POSE_SOURCE: &str = "rssi_csi_trilateration";
+const RSSI_CSI_SINGLE_NODE_SOURCE: &str = "rssi_csi_single_node";
 const SYNTHETIC_DEV_POSE_SOURCE: &str = "synthetic_dev";
 const MODEL_METRIC_POSE_SOURCE: &str = "model_metric";
 const MODEL_PX_POSE_SOURCE: &str = "model_px";
@@ -5815,6 +6046,18 @@ fn estimate_person_world_position(
     person_idx: usize,
     total_persons: usize,
 ) -> (Option<[f64; 3]>, &'static str) {
+    if let Some(tracking) = update.state.as_ref() {
+        if let Some(person) = tracking.persons.get(person_idx) {
+            let source = match person.source.as_str() {
+                SYNTHETIC_DEV_POSE_SOURCE => SYNTHETIC_DEV_POSE_SOURCE,
+                RSSI_CSI_SINGLE_NODE_SOURCE => RSSI_CSI_SINGLE_NODE_SOURCE,
+                RSSI_CSI_POSE_SOURCE => RSSI_CSI_POSE_SOURCE,
+                _ => SENSOR_GEOMETRY_POSE_SOURCE,
+            };
+            return (Some(person.position_m), source);
+        }
+    }
+
     let nodes: Vec<&NodeInfo> = update
         .nodes
         .iter()
@@ -6243,6 +6486,7 @@ mod person_detection_contract_tests {
             pose_keypoints: None,
             model_status: None,
             persons: None,
+            state: None,
             estimated_persons: Some(1),
             count_evidence: None,
             node_features: None,
@@ -6321,6 +6565,33 @@ mod person_detection_contract_tests {
             - foot_y;
         assert!((0.0..=0.12).contains(&foot_y), "foot_y={foot_y}");
         assert!((1.45..=1.95).contains(&height), "height={height}");
+    }
+
+    #[test]
+    fn tracking_state_is_single_source_for_pose_and_location_payload() {
+        let mut update = sensing_update(
+            "esp32",
+            vec![
+                node(1, [0.0, 1.1, 0.0], -43.0),
+                node(2, [4.0, 1.1, 0.0], -62.0),
+                node(3, [2.0, 1.1, 3.5], -64.0),
+            ],
+        );
+        let mut smoother = LocationSmoother::default();
+        attach_tracking_state(&mut update, &mut smoother);
+
+        let tracked_position = update
+            .state
+            .as_ref()
+            .and_then(|state| state.persons.first())
+            .map(|person| person.position_m)
+            .expect("tracking state position");
+        let pose_person = derive_single_person_pose(&update, 0, 1);
+        assert_eq!(pose_person.position_m, Some(tracked_position));
+
+        let payload = location_payload_from_update(&update).expect("location payload");
+        assert_eq!(payload["persons"][0]["position_m"], serde_json::json!(tracked_position));
+        assert_eq!(payload["state"]["persons"][0]["position_m"], serde_json::json!(tracked_position));
     }
 
     #[test]
@@ -7549,7 +7820,36 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
     let vs = &s.latest_vitals;
     let (br_len, br_cap, hb_len, hb_cap) = s.vital_detector.buffer_status();
     let timestamp_ms = unix_timestamp_ms();
-    let (location, _, _) = localization_snapshot(&s, std::time::Instant::now(), timestamp_ms);
+    let location = s
+        .latest_update
+        .as_ref()
+        .and_then(|update| update.state.as_ref())
+        .and_then(|tracking| tracking.persons.first().map(|person| {
+            serde_json::json!({
+                "x": person.position_m[0],
+                "y": person.position_m[2],
+                "z": person.position_m[1],
+                "position_m": person.position_m,
+                "confidence": person.confidence,
+                "source": person.source,
+                "timestamp_ms": tracking.timestamp_ms,
+            })
+        }))
+        .or_else(|| {
+            localization_snapshot(&s, std::time::Instant::now(), timestamp_ms)
+                .0
+                .map(|loc| {
+                    serde_json::json!({
+                        "x": loc.x,
+                        "y": loc.y,
+                        "z": 0.9,
+                        "position_m": [loc.x, 0.9_f32, loc.y],
+                        "confidence": loc.confidence,
+                        "source": "rssi_csi_trilateration",
+                        "timestamp_ms": loc.timestamp_ms,
+                    })
+                })
+        });
     Json(serde_json::json!({
         "vital_signs": {
             "breathing_rate_bpm": vs.breathing_rate_bpm,
@@ -9511,9 +9811,7 @@ async fn udp_receiver_task(
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: configured_node(&environment, id)
-                                .map(|cfg| cfg.position_m)
-                                .unwrap_or([0.0, 0.0, 0.0]),
+                            position: configured_node_position(&environment, id),
                             amplitude: vec![],
                             subcarrier_count: 0,
                             // Vitals-only path; still expose the sync snapshot
@@ -9609,6 +9907,7 @@ async fn udp_receiver_task(
                         pose_keypoints: None,
                         model_status: None,
                         persons: None,
+                        state: None,
                         estimated_persons: if rendered_persons > 0 {
                             Some(rendered_persons)
                         } else {
@@ -9623,20 +9922,7 @@ async fn udp_receiver_task(
                         node_features: build_node_features(&s.node_states, now),
                     };
 
-                    let pose_started = std::time::Instant::now();
-                    let raw_persons = derive_pose_from_sensing(&update);
-                    let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let persons = persons_for_update(
-                        &update,
-                        raw_persons,
-                        &mut s.pose_tracker,
-                        &mut last_tracker_instant,
-                    );
-                    s.last_tracker_instant = last_tracker_instant;
-                    record_pose_latency(&mut s, pose_started);
-                    if !persons.is_empty() {
-                        update.persons = Some(persons);
-                    }
+                    finalize_persons_for_update(&mut s, &mut update);
 
                     if let Ok(json) = serde_json::to_string(&update) {
                         let _ = s.tx.send(json);
@@ -10024,9 +10310,7 @@ async fn udp_receiver_task(
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: configured_node(&environment, id)
-                                .map(|cfg| cfg.position_m)
-                                .unwrap_or([0.0, 0.0, 0.0]),
+                            position: configured_node_position(&environment, id),
                             amplitude: n
                                 .frame_history
                                 .back()
@@ -10068,6 +10352,7 @@ async fn udp_receiver_task(
                         pose_keypoints: None,
                         model_status: None,
                         persons: None,
+                        state: None,
                         estimated_persons: if rendered_persons > 0 {
                             Some(rendered_persons)
                         } else {
@@ -10082,20 +10367,7 @@ async fn udp_receiver_task(
                         node_features: build_node_features(&s.node_states, now),
                     };
 
-                    let pose_started = std::time::Instant::now();
-                    let raw_persons = derive_pose_from_sensing(&update);
-                    let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let persons = persons_for_update(
-                        &update,
-                        raw_persons,
-                        &mut s.pose_tracker,
-                        &mut last_tracker_instant,
-                    );
-                    s.last_tracker_instant = last_tracker_instant;
-                    record_pose_latency(&mut s, pose_started);
-                    if !persons.is_empty() {
-                        update.persons = Some(persons);
-                    }
+                    finalize_persons_for_update(&mut s, &mut update);
 
                     if let Ok(json) = serde_json::to_string(&update) {
                         let _ = s.tx.send(json);
@@ -10338,9 +10610,7 @@ async fn handle_delivered_esp32_frame(
         .map(|(&id, n)| NodeInfo {
             node_id: id,
             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-            position: configured_node(&environment, id)
-                .map(|cfg| cfg.position_m)
-                .unwrap_or([0.0, 0.0, 0.0]),
+            position: configured_node_position(&environment, id),
             amplitude: n
                 .frame_history
                 .back()
@@ -10381,6 +10651,7 @@ async fn handle_delivered_esp32_frame(
         pose_keypoints: None,
         model_status: None,
         persons: None,
+        state: None,
         estimated_persons: if rendered_persons > 0 {
             Some(rendered_persons)
         } else {
@@ -10390,20 +10661,7 @@ async fn handle_delivered_esp32_frame(
         node_features: build_node_features(&s.node_states, now),
     };
 
-    let pose_started = std::time::Instant::now();
-    let raw_persons = derive_pose_from_sensing(&update);
-    let mut last_tracker_instant = s.last_tracker_instant.take();
-    let persons = persons_for_update(
-        &update,
-        raw_persons,
-        &mut s.pose_tracker,
-        &mut last_tracker_instant,
-    );
-    s.last_tracker_instant = last_tracker_instant;
-    record_pose_latency(&mut s, pose_started);
-    if !persons.is_empty() {
-        update.persons = Some(persons);
-    }
+    finalize_persons_for_update(&mut s, &mut update);
 
     if let Ok(json) = serde_json::to_string(&update) {
         let _ = s.tx.send(json);
@@ -10561,6 +10819,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 None
             },
             persons: None,
+            state: None,
             estimated_persons: if rendered_persons > 0 {
                 Some(rendered_persons)
             } else {
@@ -10570,21 +10829,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             node_features,
         };
 
-        // Populate persons from the sensing update (Kalman-smoothed via tracker).
-        let pose_started = std::time::Instant::now();
-        let raw_persons = derive_pose_from_sensing(&update);
-        let mut last_tracker_instant = s.last_tracker_instant.take();
-        let persons = persons_for_update(
-            &update,
-            raw_persons,
-            &mut s.pose_tracker,
-            &mut last_tracker_instant,
-        );
-        s.last_tracker_instant = last_tracker_instant;
-        record_pose_latency(&mut s, pose_started);
-        if !persons.is_empty() {
-            update.persons = Some(persons);
-        }
+        finalize_persons_for_update(&mut s, &mut update);
 
         if update.classification.presence {
             s.total_detections += 1;
@@ -11721,6 +11966,7 @@ async fn main() {
         ap_scan_interval_secs: args.ap_scan_interval_secs.max(1),
         // Accuracy sprint
         pose_tracker: PoseTracker::new(),
+        location_smoother: LocationSmoother::default(),
         last_tracker_instant: None,
         stable_rendered_person_count: 0,
         count_candidate_persons: 0,

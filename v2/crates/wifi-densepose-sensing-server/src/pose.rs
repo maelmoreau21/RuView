@@ -22,6 +22,8 @@ const TORSO_KP: [usize; 4] = [5, 6, 11, 12];
 const EXTREMITY_KP: [usize; 4] = [9, 10, 15, 16];
 const UNLOCALIZED_POSITION_SOURCE: &str = "unlocalized";
 const SENSOR_GEOMETRY_POSE_SOURCE: &str = "sensor_geometry";
+const RSSI_CSI_POSE_SOURCE: &str = "rssi_csi_trilateration";
+const RSSI_CSI_SINGLE_NODE_SOURCE: &str = "rssi_csi_single_node";
 const SYNTHETIC_DEV_POSE_SOURCE: &str = "synthetic_dev";
 const HUMAN_HEIGHT_M: f64 = 1.70;
 const FOOT_CLEARANCE_M: f64 = 0.04;
@@ -43,6 +45,18 @@ fn estimate_person_world_position(
     person_idx: usize,
     total_persons: usize,
 ) -> (Option<[f64; 3]>, &'static str) {
+    if let Some(tracking) = update.state.as_ref() {
+        if let Some(person) = tracking.persons.get(person_idx) {
+            let source = match person.source.as_str() {
+                SYNTHETIC_DEV_POSE_SOURCE => SYNTHETIC_DEV_POSE_SOURCE,
+                RSSI_CSI_SINGLE_NODE_SOURCE => RSSI_CSI_SINGLE_NODE_SOURCE,
+                RSSI_CSI_POSE_SOURCE => RSSI_CSI_POSE_SOURCE,
+                _ => SENSOR_GEOMETRY_POSE_SOURCE,
+            };
+            return (Some(person.position_m), source);
+        }
+    }
+
     let nodes: Vec<&NodeInfo> = update
         .nodes
         .iter()

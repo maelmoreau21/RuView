@@ -104,6 +104,7 @@ export class HudController {
     this._modules = null;
 
     this._initMobileTabs();
+    this._initPanelCollapse();
   }
 
   // ============================================================
@@ -176,9 +177,12 @@ export class HudController {
     document.getElementById('opt-room').addEventListener('change', (e) => {
       s.room = e.target.checked; obs._roomWire.visible = e.target.checked; this.saveSettings();
     });
-    document.getElementById('opt-obstacles').checked = s.obstacles;
+    this._syncObjectDetectionToggles();
     document.getElementById('opt-obstacles').addEventListener('change', (e) => {
-      s.obstacles = e.target.checked; obs._refreshObstacleMode(); this.saveSettings();
+      this.setObjectDetection(e.target.checked);
+    });
+    document.getElementById('object-detection-toggle')?.addEventListener('change', (e) => {
+      this.setObjectDetection(e.target.checked);
     });
 
     // Buttons
@@ -222,6 +226,27 @@ export class HudController {
     });
   }
 
+  _initPanelCollapse() {
+    const bind = (side) => {
+      const button = document.getElementById(`collapse-${side}`);
+      if (!button) return;
+      button.addEventListener('click', () => {
+        const className = `hud-${side}-collapsed`;
+        const collapsed = !document.body.classList.contains(className);
+        document.body.classList.toggle(className, collapsed);
+        button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        button.textContent = side === 'left'
+          ? (collapsed ? '>>' : '<<')
+          : (collapsed ? '<<' : '>>');
+        button.title = collapsed
+          ? `Afficher le menu ${side === 'left' ? 'gauche' : 'droit'}`
+          : `Masquer le menu ${side === 'left' ? 'gauche' : 'droit'}`;
+      });
+    };
+    bind('left');
+    bind('right');
+  }
+
   _activateMobilePanel(panelId) {
     if (!panelId) return;
     document.querySelectorAll('.mobile-hud-tab').forEach((tab) => {
@@ -253,6 +278,22 @@ export class HudController {
     } catch {}
   }
 
+  setObjectDetection(enabled) {
+    this._obs.settings.obstacles = Boolean(enabled);
+    this._syncObjectDetectionToggles();
+    this._obs._refreshObstacleMode();
+    this.updateObstacleAttenuation();
+    this.saveSettings();
+  }
+
+  _syncObjectDetectionToggles() {
+    const enabled = Boolean(this._obs.settings.obstacles);
+    for (const id of ['opt-obstacles', 'object-detection-toggle']) {
+      const toggle = document.getElementById(id);
+      if (toggle) toggle.checked = enabled;
+    }
+  }
+
   applyPreset(preset) {
     const obs = this._obs;
     Object.assign(obs.settings, preset);
@@ -275,7 +316,7 @@ export class HudController {
     const roomEl = document.getElementById('opt-room');
     if (roomEl) { roomEl.checked = obs.settings.room; obs._roomWire.visible = obs.settings.room; }
     const obstaclesEl = document.getElementById('opt-obstacles');
-    if (obstaclesEl) { obstaclesEl.checked = obs.settings.obstacles; obs._refreshObstacleMode(); }
+    if (obstaclesEl) { this._syncObjectDetectionToggles(); obs._refreshObstacleMode(); }
     document.getElementById('opt-wire-color').value = obs.settings.wireColor;
     document.getElementById('opt-joint-color').value = obs.settings.jointColor;
     obs._applyPostSettings();
