@@ -1,3 +1,5 @@
+import { initAlerts, processAlertState } from './alerts.js';
+
 const state = {
   topology: null,
   modules: [],
@@ -39,8 +41,15 @@ const PLACEMENT_MAX_ZOOM = 8;
 const PLACEMENT_FIT_PADDING = 1.25;
 const CALIBRATION_MIN_FRAMES_FALLBACK = 12000;
 const AUTO_PLACEMENT_STABLE_REFRESHES = 2;
+const SHARED_CHANNEL_NAME = 'ruvsense';
+const SHARED_STATE_STORAGE_KEY = 'ruvsense:shared-state';
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+const sharedStateChannel = typeof BroadcastChannel !== 'undefined'
+  ? new BroadcastChannel(SHARED_CHANNEL_NAME)
+  : null;
+
+initAlerts({ source: 'console' });
 
 function text(value, fallback = '--') {
   if (value === null || value === undefined || value === '') return fallback;
@@ -1038,6 +1047,39 @@ function firstDefined(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '');
 }
 
+function appStateSnapshot(reason = 'update') {
+  return {
+    reason,
+    updatedAt: Date.now(),
+    source: 'console',
+    topology: state.topology,
+    modules: state.modules,
+    vitals: state.vitals,
+    location: state.location,
+    edgeVitals: state.edgeVitals,
+    calibration: state.calibration,
+    pose: state.pose,
+    latest: state.latest,
+    vitalsOptIn: state.vitalsOptIn,
+  };
+}
+
+function publishSharedState(reason = 'update') {
+  const snapshot = appStateSnapshot(reason);
+  processAlertState(snapshot);
+  try {
+    localStorage.setItem(SHARED_STATE_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {}
+  try {
+    sharedStateChannel?.postMessage({
+      type: 'state',
+      source: 'console',
+      state: snapshot,
+      updatedAt: snapshot.updatedAt,
+    });
+  } catch {}
+}
+
 function renderVitals() {
   const vitals = state.vitals?.vital_signs || state.vitals || {};
   const edgeVitals = state.edgeVitals?.edge_vitals || {};
@@ -1204,6 +1246,7 @@ async function refreshRest() {
   if (calibrationResult.status === 'fulfilled') state.calibration = calibrationResult.value;
   if (poseResult.status === 'fulfilled') state.pose = poseResult.value;
   renderAll();
+  publishSharedState('rest');
   await maybeAutoPersistPlacement();
 }
 
@@ -1223,6 +1266,7 @@ function connectWs() {
       renderTopology();
       renderLocationPlan();
       renderVitals();
+      publishSharedState('ws');
     } catch (error) {
       logEvent(`Frame sensing invalide: ${error.message}`, 'warn');
     }
@@ -1651,6 +1695,7 @@ function bindActions() {
     localStorage.setItem('ruvsense:vitals-opt-in', state.vitalsOptIn ? 'true' : 'false');
     renderStatus();
     renderVitals();
+    publishSharedState('vitals-opt-in');
   });
   const topologyStage = $('#topology-stage');
   topologyStage?.addEventListener('pointerdown', beginNodeDrag);
@@ -1761,7 +1806,7 @@ window.__ruvsenseRenderFixture = (count = 3) => {
     persons: [{ x: 0.3, y: 0.4, confidence: count >= 3 ? 1.0 : count === 2 ? 0.5 : 0.0 }],
     node_count: count,
     timestamp_ms: Date.now(),
-    nodes: nodes.map((node) => ({ node_id: node.node_id, x: node.position.x, y: node.position.z })),
+    nodes: (state.topology?.nodes || []).map((node) => ({ node_id: node.node_id, x: node.position.x, y: node.position.z })),
   } : null;
   state.pose = count > 0 ? {
     posture: 'standing',
@@ -1778,6 +1823,7 @@ window.__ruvsenseRenderFixture = (count = 3) => {
     auto_mode: { enabled: false, guard_state: 'blocked', recommended_action: 'enable_auto_or_start_manual', blockers: [] },
   };
   renderAll();
+  publishSharedState('fixture');
   return state.topology;
 };
 

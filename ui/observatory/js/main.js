@@ -17,6 +17,7 @@ import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION } from './hud-controller.js';
+import { initAlerts, processAlertState } from '../../alerts.js';
 
 // ---- Palette ----
 const C = {
@@ -61,6 +62,8 @@ const POSE_ALIASES = new Map([
   ['crouched', 'crouching'],
 ]);
 const ROOM_CONFIG_STORAGE_KEY = 'ruvsense:room-config';
+const SHARED_CHANNEL_NAME = 'ruvsense';
+const SHARED_STATE_STORAGE_KEY = 'ruvsense:shared-state';
 const DEFAULT_ROOM_CONFIG = {
   room_width_meters: 5.0,
   room_height_meters: 4.0,
@@ -156,6 +159,8 @@ class Observatory {
     this._presenceSilhouettes = new Map();
     this._activeRoomNodeCount = 0;
     this._sceneStatusOverlay = null;
+    this._sharedStateChannel = null;
+    this._lastSharedState = null;
 
     // Build scene
     this._setupLighting();
@@ -178,6 +183,7 @@ class Observatory {
 
     // HUD controller (settings dialog, sparkline, vital displays)
     this._hud = new HudController(this);
+    initAlerts({ source: 'observatory' });
     this._initSceneStatusOverlay();
     this._initRoomConfigPanel();
     this._loadRoomConfig();
@@ -195,7 +201,7 @@ class Observatory {
     this._ws = null;
     this._liveData = null;
     this._fetchEnvironment();
-    this._autoDetectLive();
+    this._initSharedStateChannel();
 
     // Input
     this._initKeyboard();
@@ -782,6 +788,31 @@ class Observatory {
     return 0x00d878;
   }
 
+  _presenceVitalsStatus(person, br, hr) {
+    const statusText = [
+      person?.status,
+      person?.state,
+      person?.vital_status,
+      person?.alert_status,
+      person?.event_type,
+      person?.reason,
+    ].filter(Boolean).join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const critical =
+      /\b(apnea|apnee|apneic|respiratory_arrest|cardiac_arrest|heart_stop|asystole|arret_cardiaque|critical|critique)\b/.test(statusText)
+      || person?.apnea_detected === true
+      || person?.cardiac_arrest === true
+      || person?.heart_stopped === true
+      || (br != null && br <= 3)
+      || (hr != null && hr <= 5);
+    if (critical) return { level: 'critical', label: 'ALERTE', color: '#ff3040' };
+    const warning =
+      /\b(fall|fallen|falling|chute|anomaly|anomalie|warning)\b/.test(statusText)
+      || (br != null && (br < 8 || br > 28))
+      || (hr != null && (hr < 50 || hr > 130));
+    if (warning) return { level: 'warning', label: 'ALERTE', color: '#ffe4ad' };
+    return { level: 'normal', label: 'NORMAL', color: '#b7ffd4' };
+  }
+
   _upsertPresenceSilhouette(id) {
     let entry = this._presenceSilhouettes.get(id);
     if (entry) return entry;
@@ -860,9 +891,17 @@ class Observatory {
 
       const br = this._numberOrNull(person.breathing_bpm ?? person.vitals?.breathing_bpm ?? person.vital_signs?.breathing_rate_bpm);
       const hr = this._numberOrNull(person.heart_rate_bpm ?? person.vitals?.heart_rate_bpm ?? person.vital_signs?.heart_rate_bpm);
-      const label = `BR ${br == null ? '--' : br.toFixed(1)} BPM\nHR ${hr == null ? '--' : Math.round(hr)} BPM`;
+      const vitalsStatus = this._presenceVitalsStatus(person, br, hr);
+      const displayColor = vitalsStatus.level === 'critical' ? C.redAlert : color;
+      entry.bodyMat.color.setHex(displayColor);
+      entry.bodyMat.emissive.setHex(displayColor);
+      entry.headMat.color.setHex(displayColor);
+      entry.headMat.emissive.setHex(displayColor);
+      const label = `BR ${br == null ? '--' : br.toFixed(1)} BPM\nHR ${hr == null ? '--' : Math.round(hr)} BPM\n${vitalsStatus.label}`;
       if (entry.lastLabel !== label) {
-        this._updateTextSprite(entry.label, label, confidence < 0.4 ? '#ffb3ba' : confidence < 0.7 ? '#ffe4ad' : '#b7ffd4');
+        this._updateTextSprite(entry.label, label, vitalsStatus.level === 'normal'
+          ? (confidence < 0.4 ? '#ffb3ba' : confidence < 0.7 ? '#ffe4ad' : '#b7ffd4')
+          : vitalsStatus.color);
         entry.lastLabel = label;
       }
     });
@@ -2128,6 +2167,203 @@ class Observatory {
   }
 
   // ---- WebSocket live data ----
+
+  _initSharedStateChannel() {
+    this._setSceneStatus('connecting', 'En attente de la console 2D...');
+    this._hud.updateSourceBadge('connecting', null);
+    this._loadStoredSharedState();
+
+    if (typeof BroadcastChannel === 'undefined') return;
+    this._sharedStateChannel = new BroadcastChannel(SHARED_CHANNEL_NAME);
+    this._sharedStateChannel.addEventListener('message', (event) => {
+      const message = event.data || {};
+      if (message.type === 'state' && message.state) {
+        this._ingestSharedState(message.state);
+      }
+    });
+  }
+
+  _loadStoredSharedState() {
+    try {
+      const raw = localStorage.getItem(SHARED_STATE_STORAGE_KEY);
+      if (raw) this._ingestSharedState(JSON.parse(raw));
+    } catch {}
+  }
+
+  _environmentFromSharedState(shared) {
+    const topology = shared?.topology;
+    if (!topology || typeof topology !== 'object') return null;
+
+    const accessPoints = (topology.access_points || []).map((ap, index) => {
+      const apId = String(ap.ap_id || ap.bssid || ap.id || `ap-${index + 1}`);
+      return {
+        ...ap,
+        ap_id: apId,
+        label: ap.label || ap.ssid || ap.bssid || apId,
+        position_m: ap.position_m || ap.position,
+        active: ap.active !== false && ap.status !== 'offline',
+      };
+    });
+    const apIdByBssid = new Map(accessPoints.map((ap) => [String(ap.bssid || ap.ap_id).toLowerCase(), ap.ap_id]));
+    const nodes = this._nodesFromSharedState(shared);
+
+    const links = (topology.links || []).map((link, index) => {
+      const apId = link.ap_id
+        || apIdByBssid.get(String(link.ap_bssid || link.bssid || '').toLowerCase())
+        || link.ap_bssid
+        || link.bssid
+        || accessPoints[0]?.ap_id
+        || `ap-${index + 1}`;
+      return {
+        ...link,
+        ap_id: String(apId),
+        node_id: Number(link.node_id ?? link.node ?? nodes[index % Math.max(1, nodes.length)]?.node_id ?? index + 1),
+        link_id: link.link_id || `${apId}:node-${link.node_id ?? index + 1}`,
+      };
+    });
+
+    return {
+      ...topology,
+      room: topology.room || { dimensions_m: [5.2, 2.6, 4.8] },
+      access_points: accessPoints,
+      nodes,
+      links,
+    };
+  }
+
+  _nodesFromSharedState(shared) {
+    const topologyNodes = Array.isArray(shared?.topology?.nodes) ? shared.topology.nodes : [];
+    const latestNodes = Array.isArray(shared?.latest?.nodes) ? shared.latest.nodes : [];
+    const nodesById = new Map();
+    for (const node of [...topologyNodes, ...latestNodes]) {
+      const nodeId = Number(node?.node_id ?? node?.id);
+      if (!Number.isFinite(nodeId)) continue;
+      const status = String(node.health_status || node.status || '').toLowerCase();
+      const previous = nodesById.get(nodeId) || {};
+      nodesById.set(nodeId, {
+        ...previous,
+        ...node,
+        node_id: nodeId,
+        id: nodeId,
+        label: node.display_label || node.label || previous.label || `C6-${nodeId}`,
+        position_m: node.position_m || node.position || previous.position_m || previous.position,
+        active: node.active !== false && !['offline', 'stale', 'sync_only'].includes(status),
+      });
+    }
+    return [...nodesById.values()];
+  }
+
+  _primaryVitalsFromSharedState(shared) {
+    const latestVitals = shared?.latest?.vital_signs || {};
+    const restVitals = shared?.vitals?.vital_signs || shared?.vitals || {};
+    const edgeVitals = shared?.edgeVitals?.edge_vitals || shared?.edgeVitals || {};
+    const heart = this._numberOrNull(
+      latestVitals.heart_rate_bpm ?? latestVitals.heartrate_bpm
+      ?? edgeVitals.heart_rate_bpm ?? edgeVitals.heartrate_bpm
+      ?? restVitals.heart_rate_bpm ?? restVitals.heartrate_bpm,
+    );
+    const breathing = this._numberOrNull(
+      latestVitals.breathing_rate_bpm ?? latestVitals.breathing_bpm
+      ?? edgeVitals.breathing_rate_bpm ?? edgeVitals.breathing_bpm
+      ?? restVitals.breathing_rate_bpm ?? restVitals.breathing_bpm,
+    );
+    const quality = this._numberOrNull(
+      latestVitals.signal_quality ?? latestVitals.presence_score
+      ?? edgeVitals.signal_quality ?? edgeVitals.presence_score
+      ?? restVitals.signal_quality ?? restVitals.presence_score,
+    );
+    if (heart == null && breathing == null && quality == null) return null;
+    return {
+      ...(heart != null ? { heart_rate_bpm: heart } : {}),
+      ...(breathing != null ? { breathing_rate_bpm: breathing } : {}),
+      ...(quality != null ? { signal_quality: quality } : {}),
+    };
+  }
+
+  _personsFromSharedState(shared) {
+    const latestPersons = Array.isArray(shared?.latest?.persons) ? shared.latest.persons : [];
+    const posePersons = Array.isArray(shared?.pose?.persons) ? shared.pose.persons : [];
+    const locationPersons = Array.isArray(shared?.location?.persons) ? shared.location.persons : [];
+    if (latestPersons.length) return latestPersons;
+    if (posePersons.length) return posePersons;
+
+    return locationPersons.map((person, index) => {
+      const x = this._numberOrNull(person.x) ?? this._numberOrNull(person.position?.x) ?? 0;
+      const z = this._numberOrNull(person.y) ?? this._numberOrNull(person.z) ?? this._numberOrNull(person.position?.z) ?? 0;
+      const confidence = this._numberOrNull(person.confidence) ?? 0.35;
+      return {
+        id: person.id || `location_${index + 1}`,
+        confidence,
+        position: [x, 0, z],
+        position_m: [x, 0, z],
+        position_source: 'shared_location',
+        pose: 'standing',
+      };
+    });
+  }
+
+  _frameFromSharedState(shared) {
+    if (!shared || typeof shared !== 'object') return null;
+    const latest = shared.latest && typeof shared.latest === 'object' ? { ...shared.latest } : {};
+    const nodes = this._nodesFromSharedState(shared);
+    const persons = this._personsFromSharedState(shared);
+    const vitalSigns = this._primaryVitalsFromSharedState(shared) || latest.vital_signs || null;
+    const activeNodes = nodes.filter((node) => node.active !== false).length;
+    const classification = {
+      ...(latest.classification || {}),
+      presence: latest.classification?.presence ?? persons.length > 0,
+      motion_level: latest.classification?.motion_level || (persons.length ? 'present' : 'absent'),
+      confidence: latest.classification?.confidence ?? persons[0]?.confidence ?? 0,
+    };
+
+    return {
+      ...latest,
+      type: 'sensing_update',
+      msg_type: 'sensing_update',
+      source: latest.source || 'shared_state',
+      system_status: latest.system_status || (activeNodes > 0 ? 'live' : 'no_nodes'),
+      timestamp_ms: latest.timestamp_ms || shared.updatedAt || Date.now(),
+      node_count: latest.node_count ?? activeNodes,
+      nodes: Array.isArray(latest.nodes) && latest.nodes.length ? latest.nodes : nodes,
+      persons,
+      estimated_persons: latest.estimated_persons ?? persons.length,
+      count_evidence: {
+        ...(latest.count_evidence || {}),
+        rendered_persons: latest.count_evidence?.rendered_persons ?? persons.length,
+        stable_persons: latest.count_evidence?.stable_persons ?? persons.length,
+        raw_estimated_persons: latest.count_evidence?.raw_estimated_persons ?? persons.length,
+        active_nodes: latest.count_evidence?.active_nodes ?? activeNodes,
+        supporting_nodes: latest.count_evidence?.supporting_nodes ?? activeNodes,
+      },
+      classification,
+      vital_signs: vitalSigns,
+    };
+  }
+
+  _ingestSharedState(shared) {
+    this._lastSharedState = shared;
+    processAlertState(shared);
+
+    const env = this._environmentFromSharedState(shared);
+    if (env) {
+      this._environment = env;
+      this._syncRoomGeometry(env);
+      this._setEnvironmentNotice(false);
+    }
+
+    const frame = this._frameFromSharedState(shared);
+    const normalized = this._normalizeSensingFrame(frame);
+    if (!normalized) return;
+
+    const status = String(normalized.system_status || '').toLowerCase() === 'no_nodes' ? 'no_nodes' : 'live';
+    this._liveData = normalized;
+    this._lastLiveAt = performance.now();
+    this._setSceneStatus(status, status === 'no_nodes' ? 'Aucun noeud ESP32 connecte' : '');
+    this._hud.updateSourceBadge(status, null);
+    this._updateScenarioProps(normalized);
+    this._syncTopology(normalized);
+    this._syncRoomConfigNodes(normalized);
+  }
 
   _poseWsCandidates() {
     const host = window.location.hostname || 'localhost';

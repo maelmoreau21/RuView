@@ -18,7 +18,7 @@
       <div id="brand-logo"><span class="pi">&pi;</span> RuvSense Edge</div>
       <div id="brand-tagline">RuvSense Console / WiFi CSI Fleet</div>
       <nav id="hud-nav" aria-label="Observatory navigation">
-        <a href="/ui/console.html#fleet" class="hud-nav-link">Live 2D</a>
+        <a href="/ui/console.html#fleet" class="hud-nav-link">Retour 2D</a>
       </nav>
     </div>
 
@@ -28,6 +28,7 @@
         <span class="dot dot--offline"></span>
         <span id="data-source-label">OFFLINE</span>
       </div>
+      <div id="global-health-badge" class="global-health-badge global-health-badge--normal">NORMAL</div>
       <div id="fps-counter" style="display:none">60 FPS</div>
       <label class="hud-toggle object-detection-toggle" for="object-detection-toggle">
         <span>Objets</span>
@@ -314,7 +315,7 @@
         </label>
         <div class="setting-row readonly-row">
           <span>Live stream</span>
-          <span id="live-stream-url">/ws/pose</span>
+          <span id="live-stream-url">BroadcastChannel ruvsense</span>
         </div>
         <button id="btn-reset-camera" class="settings-btn">Reset Camera</button>
         <button id="btn-reset-settings" class="settings-btn">Reset to Defaults</button>

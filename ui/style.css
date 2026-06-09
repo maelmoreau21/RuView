@@ -177,7 +177,7 @@ h3 {
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -267,6 +267,16 @@ h3 {
 .status-master.is-degraded span {
   background: var(--amber);
   box-shadow: 0 0 0 4px rgba(227, 180, 71, 0.12);
+}
+
+.global-health-cell {
+  display: grid;
+  gap: 3px;
+  align-content: center;
+}
+
+.global-health-cell .global-health-badge {
+  width: 100%;
 }
 
 .console-shell {

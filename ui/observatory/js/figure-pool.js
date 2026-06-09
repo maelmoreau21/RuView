@@ -107,6 +107,7 @@ const OVERSHOOT = [
 ];
 
 const MAX_FIGURES = 8;
+const CRITICAL_COLOR = 0xff3040;
 
 // Reusable vectors to avoid per-frame allocation
 const _vecFrom = new THREE.Vector3();
@@ -362,6 +363,41 @@ export class FigurePool {
     return { heart, breathing, confidence };
   }
 
+  _statusText(...sources) {
+    return sources.map((source) => {
+      if (!source || typeof source !== 'object') return String(source || '');
+      return [
+        source.status,
+        source.state,
+        source.health_status,
+        source.vital_status,
+        source.alert_status,
+        source.event_type,
+        source.type,
+        source.reason,
+      ].filter(Boolean).join(' ');
+    }).join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  }
+
+  _vitalsStatus(person, data, vitals) {
+    const status = this._statusText(person, person?.vital_signs, person?.vitals, data?.vital_signs, data?.classification);
+    const critical =
+      /\b(apnea|apnee|apneic|respiratory_arrest|cardiac_arrest|heart_stop|asystole|arret_cardiaque|critical|critique)\b/.test(status)
+      || person?.apnea_detected === true
+      || person?.cardiac_arrest === true
+      || person?.heart_stopped === true
+      || (vitals.breathing != null && vitals.breathing <= 3)
+      || (vitals.heart != null && vitals.heart <= 5);
+    if (critical) return { level: 'critical', label: 'ALERTE', color: '#ff3040' };
+
+    const warning =
+      /\b(fall|fallen|falling|chute|anomaly|anomalie|warning)\b/.test(status)
+      || (vitals.breathing != null && (vitals.breathing < 8 || vitals.breathing > 28))
+      || (vitals.heart != null && (vitals.heart < 50 || vitals.heart > 130));
+    if (warning) return { level: 'warning', label: 'ALERTE', color: '#ffb020' };
+    return { level: 'normal', label: 'NORMAL', color: '#3eff8a' };
+  }
+
   _formatRate(value) {
     return value != null && value > 0 ? String(Math.round(value)) : '--';
   }
@@ -386,8 +422,8 @@ export class FigurePool {
     ctx.closePath();
   }
 
-  _drawVitalsBillboard(fig, person, vitals) {
-    const label = `P${person?.id ?? '?'} HR ${this._formatRate(vitals.heart)} BR ${this._formatRate(vitals.breathing)} C ${this._formatConfidence(vitals.confidence)}`;
+  _drawVitalsBillboard(fig, person, vitals, status) {
+    const label = `P${person?.id ?? '?'} ${status.label} HR ${this._formatRate(vitals.heart)} BR ${this._formatRate(vitals.breathing)} C ${this._formatConfidence(vitals.confidence)}`;
     if (fig._labelText === label) return;
 
     const ctx = fig.labelCtx;
@@ -401,7 +437,11 @@ export class FigurePool {
     ctx.fillStyle = 'rgba(5, 13, 19, 0.84)';
     ctx.fill();
     ctx.shadowBlur = 0;
-    ctx.strokeStyle = 'rgba(62, 255, 138, 0.72)';
+    ctx.strokeStyle = status.level === 'critical'
+      ? 'rgba(255, 48, 64, 0.82)'
+      : status.level === 'warning'
+        ? 'rgba(255, 176, 32, 0.76)'
+        : 'rgba(62, 255, 138, 0.72)';
     ctx.lineWidth = 2;
     ctx.stroke();
 
@@ -409,24 +449,53 @@ export class FigurePool {
     ctx.font = '700 24px Inter, system-ui, sans-serif';
     ctx.fillText(`P${person?.id ?? '?'}`, 30, 50);
 
+    ctx.fillStyle = status.color;
+    ctx.font = '800 18px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(status.label, w - 28, 48);
+    ctx.textAlign = 'left';
+
     ctx.font = '600 22px Inter, system-ui, sans-serif';
     ctx.fillStyle = '#ff6a82';
-    ctx.fillText(`HR ${this._formatRate(vitals.heart)}`, 88, 50);
+    ctx.fillText(`HR ${this._formatRate(vitals.heart)}`, 30, 78);
     ctx.fillStyle = '#51dcff';
-    ctx.fillText(`BR ${this._formatRate(vitals.breathing)}`, 180, 50);
+    ctx.fillText(`BR ${this._formatRate(vitals.breathing)}`, 140, 78);
 
-    ctx.font = '600 20px Inter, system-ui, sans-serif';
+    ctx.font = '600 18px Inter, system-ui, sans-serif';
     ctx.fillStyle = '#d8f7ff';
-    ctx.fillText(`Conf ${this._formatConfidence(vitals.confidence)}`, 30, 86);
+    ctx.fillText(`Conf ${this._formatConfidence(vitals.confidence)}`, 30, 106);
     ctx.restore();
 
     fig._labelText = label;
     fig.labelTexture.needsUpdate = true;
   }
 
-  _updateVitalsBillboard(fig, person, data, position) {
-    const vitals = this._personVitals(person, data);
-    this._drawVitalsBillboard(fig, person, vitals);
+  _applyFigureHealthTint(fig, status) {
+    const critical = status.level === 'critical';
+    const wireColor = new THREE.Color(critical ? CRITICAL_COLOR : this._settings.wireColor);
+    const jointColor = new THREE.Color(critical ? CRITICAL_COLOR : this._settings.jointColor);
+    for (let i = 0; i < fig.joints.length; i++) {
+      const color = i === 0 ? wireColor : jointColor;
+      fig.joints[i].material.color.copy(color);
+      fig.joints[i].material.emissive.copy(color);
+      if (fig.joints[i]._haloMat) fig.joints[i]._haloMat.color.copy(jointColor);
+      if (fig.joints[i]._glow) fig.joints[i]._glow.color.copy(jointColor);
+    }
+    for (const bone of fig.bones) {
+      bone.mesh.material.color.copy(wireColor);
+      bone.mesh.material.emissive.copy(wireColor);
+    }
+    for (const seg of fig.bodySegments) {
+      seg.mat.color.copy(wireColor);
+      seg.mat.emissive.copy(wireColor);
+    }
+    fig.auraMat.color.copy(wireColor);
+    fig.personLight.color.copy(wireColor);
+    if (critical) fig.personLight.intensity = Math.max(fig.personLight.intensity, this._settings.glow * 0.75);
+  }
+
+  _updateVitalsBillboard(fig, person, data, position, vitals, status) {
+    this._drawVitalsBillboard(fig, person, vitals, status);
     const head = fig.joints[0]?.position;
     const maxY = fig.joints.reduce((highest, joint) => Math.max(highest, joint.position.y), position[1] + 1.7);
     fig.label.position.set(
@@ -496,7 +565,10 @@ export class FigurePool {
         const kps = this._liveKeypoints(p, position)
           || this._poseSystem.generateKeypoints({ ...p, position }, elapsed, breathPulse);
         this.applyKeypoints(fig, kps, breathPulse, position, elapsed, p.pose);
-        this._updateVitalsBillboard(fig, p, data, position);
+        const vitals = this._personVitals(p, data);
+        const status = this._vitalsStatus(p, data, vitals);
+        this._updateVitalsBillboard(fig, p, data, position, vitals, status);
+        this._applyFigureHealthTint(fig, status);
         this._applyPresenceOpacity(fig, this._presenceOpacity(data, p));
         fig.visible = true;
       } else {
