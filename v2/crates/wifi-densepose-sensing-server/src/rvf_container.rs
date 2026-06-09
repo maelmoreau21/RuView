@@ -426,6 +426,155 @@ fn align_up(size: usize) -> usize {
     (size + SEGMENT_ALIGNMENT - 1) & !(SEGMENT_ALIGNMENT - 1)
 }
 
+fn looks_like_jsonl(data: &[u8]) -> bool {
+    let data = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &data[3..]
+    } else {
+        data
+    };
+
+    data.iter()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace())
+        .map(|b| matches!(b, b'{' | b'"'))
+        .unwrap_or(false)
+}
+
+fn parse_jsonl_line(line: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    match value {
+        serde_json::Value::String(inner) => {
+            serde_json::from_str(&inner).map_err(|e| e.to_string())
+        }
+        other => Ok(other),
+    }
+}
+
+fn weights_from_json_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<Vec<f32>>, String> {
+    for key in ["weights", "values"] {
+        if let Some(values) = obj.get(key).and_then(json_f32_array) {
+            return Ok(Some(values?));
+        }
+    }
+
+    for key in ["data_b64", "base64", "weights_b64", "tensor_b64"] {
+        if let Some(encoded) = obj.get(key).and_then(|v| v.as_str()) {
+            return decode_f32_base64_tensor(obj, encoded).map(Some);
+        }
+    }
+
+    if looks_like_tensor_record(obj) {
+        if let Some(values) = obj.get("data").and_then(json_f32_array) {
+            return Ok(Some(values?));
+        }
+        if let Some(encoded) = obj.get("data").and_then(|v| v.as_str()) {
+            return decode_f32_base64_tensor(obj, encoded).map(Some);
+        }
+    }
+
+    for key in ["tensor", "payload"] {
+        if let Some(nested) = obj.get(key).and_then(|v| v.as_object()) {
+            if let Some(values) = weights_from_json_object(nested)? {
+                return Ok(Some(values));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn looks_like_tensor_record(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.contains_key("dtype") || obj.contains_key("data_type") || obj.contains_key("shape") || {
+        matches!(
+            obj.get("type").and_then(|v| v.as_str()),
+            Some("tensor" | "weight" | "weights" | "model_weights" | "encoder" | "lora")
+        )
+    }
+}
+
+fn json_f32_array(value: &serde_json::Value) -> Option<Result<Vec<f32>, String>> {
+    let arr = value.as_array()?;
+    Some(
+        arr.iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                v.as_f64()
+                    .map(|n| n as f32)
+                    .ok_or_else(|| format!("weight value at index {idx} is not numeric"))
+            })
+            .collect(),
+    )
+}
+
+fn decode_f32_base64_tensor(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    encoded: &str,
+) -> Result<Vec<f32>, String> {
+    if let Some(dtype) = obj
+        .get("dtype")
+        .or_else(|| obj.get("data_type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+    {
+        if !matches!(dtype.as_str(), "f32" | "fp32" | "float32") {
+            return Err(format!("unsupported JSONL tensor dtype `{dtype}`"));
+        }
+    }
+
+    let encoded = encoded
+        .split_once("base64,")
+        .map(|(_, data)| data)
+        .unwrap_or(encoded);
+    let bytes = decode_base64(encoded)?;
+    if bytes.len() % 4 != 0 {
+        return Err(format!(
+            "f32 tensor payload has {} bytes, expected a multiple of 4",
+            bytes.len()
+        ));
+    }
+
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+
+    for byte in input.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            break;
+        }
+
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return Err(format!("invalid base64 byte 0x{byte:02X}")),
+        } as u32;
+
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xFF) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+
+    Ok(out)
+}
+
 // ── RVF Reader ──────────────────────────────────────────────────────────────
 
 /// Reads and parses an RVF container from bytes, providing access to
@@ -439,6 +588,20 @@ pub struct RvfReader {
 impl RvfReader {
     /// Parse an RVF container from a byte slice.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if looks_like_jsonl(data) {
+            return Self::from_jsonl_bytes(data).or_else(|e| {
+                tracing::warn!(
+                    "Model load failed: falling back to heuristic mode (no neural inference): {e}"
+                );
+                Ok(Self::heuristic_fallback(data.len(), e))
+            });
+        }
+
+        Self::from_binary_bytes(data)
+    }
+
+    /// Parse the original RVF binary container format.
+    fn from_binary_bytes(data: &[u8]) -> Result<Self, String> {
         let mut segments = Vec::new();
         let mut offset = 0;
 
@@ -502,6 +665,110 @@ impl RvfReader {
             segments,
             raw_size: data.len(),
         })
+    }
+
+    /// Parse HuggingFace-style line-delimited JSON model metadata/tensors.
+    fn from_jsonl_bytes(data: &[u8]) -> Result<Self, String> {
+        let text = std::str::from_utf8(data).map_err(|e| format!("JSONL is not UTF-8: {e}"))?;
+        let mut builder = RvfBuilder::new();
+        let mut metadata_lines = Vec::new();
+        let mut quant_info = None;
+        let mut manifest_added = false;
+        let mut weights = Vec::new();
+        let mut parsed_lines = 0usize;
+
+        for (idx, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let value = parse_jsonl_line(line)
+                .map_err(|e| format!("invalid JSONL at line {}: {e}", idx + 1))?;
+            let obj = value
+                .as_object()
+                .ok_or_else(|| format!("line {} is not a JSON object", idx + 1))?;
+
+            parsed_lines += 1;
+
+            if !manifest_added && obj.get("type").and_then(|v| v.as_str()) == Some("metadata") {
+                let model_id = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| obj.get("model_id").and_then(|v| v.as_str()))
+                    .unwrap_or("wifi-densepose-jsonl");
+                let version = obj
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                builder.add_manifest(model_id, version, "WiFi DensePose JSONL model");
+                manifest_added = true;
+            }
+
+            if let Some(tensor_weights) = weights_from_json_object(obj)? {
+                weights.extend(tensor_weights);
+            }
+
+            if obj.get("type").and_then(|v| v.as_str()) == Some("quantization") {
+                quant_info = Some(value.clone());
+            }
+
+            metadata_lines.push(value);
+        }
+
+        if parsed_lines == 0 {
+            return Err("JSONL model contains no JSON objects".to_string());
+        }
+
+        if !manifest_added {
+            builder.add_manifest(
+                "wifi-densepose-jsonl",
+                "unknown",
+                "WiFi DensePose JSONL model",
+            );
+        }
+
+        if !weights.is_empty() {
+            builder.add_weights(&weights);
+        }
+
+        builder.add_metadata(&serde_json::json!({
+            "format": "wifi-densepose-rvf-jsonl",
+            "source": "jsonl",
+            "line_count": parsed_lines,
+            "records": metadata_lines,
+            "neural_inference": !weights.is_empty(),
+        }));
+
+        if let Some(quant) = quant_info {
+            let payload = serde_json::to_vec(&quant).map_err(|e| e.to_string())?;
+            builder.add_raw_segment(SEG_QUANT, &payload);
+        }
+
+        Ok(Self {
+            segments: builder.segments,
+            raw_size: data.len(),
+        })
+    }
+
+    fn heuristic_fallback(raw_size: usize, reason: String) -> Self {
+        let mut builder = RvfBuilder::new();
+        builder.add_manifest(
+            "heuristic-mode",
+            "0.0.0",
+            "Model load failed: falling back to heuristic mode (no neural inference)",
+        );
+        builder.add_metadata(&serde_json::json!({
+            "format": "heuristic-fallback",
+            "neural_inference": false,
+            "presence_score": "variance_heuristic",
+            "reason": reason,
+        }));
+
+        Self {
+            segments: builder.segments,
+            raw_size,
+        }
     }
 
     /// Read an RVF container from a file.
@@ -914,6 +1181,58 @@ mod tests {
         assert!((w[0] - 42.0).abs() < f32::EPSILON);
 
         // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn jsonl_model_file_loads() {
+        let dir = std::env::temp_dir().join("rvf_jsonl_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.rvf.jsonl");
+        let jsonl = concat!(
+            "{\"type\":\"metadata\",\"name\":\"hf-test\",\"version\":\"1.2.3\"}\n",
+            "{\"type\":\"tensor\",\"name\":\"weights\",\"dtype\":\"f32\",",
+            "\"shape\":[2],\"data_b64\":\"AACAPwAAAEA=\"}\n",
+            "{\"type\":\"quantization\",\"default_bits\":4,\"variants\":[2,4,8]}\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+
+        let reader = RvfReader::from_file(&path).expect("JSONL model should load");
+        assert_eq!(reader.total_size(), jsonl.len());
+
+        let manifest = reader.manifest().expect("manifest should be present");
+        assert_eq!(manifest["model_id"], "hf-test");
+        assert_eq!(manifest["version"], "1.2.3");
+
+        let weights = reader.weights().expect("weights should be decoded");
+        assert_eq!(weights.len(), 2);
+        assert_eq!(weights[0].to_bits(), 1.0f32.to_bits());
+        assert_eq!(weights[1].to_bits(), 2.0f32.to_bits());
+
+        let quant = reader.quant_info().expect("quantization should be present");
+        assert_eq!(quant["default_bits"], 4);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn corrupted_jsonl_falls_back_to_heuristic_reader() {
+        let dir = std::env::temp_dir().join("rvf_corrupt_jsonl_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.rvf.jsonl");
+        std::fs::write(&path, "{\"type\":\"metadata\"\n").unwrap();
+
+        let reader = RvfReader::from_file(&path).expect("corrupt JSONL should fall back");
+        let manifest = reader.manifest().expect("fallback manifest should exist");
+        assert_eq!(manifest["model_id"], "heuristic-mode");
+
+        let metadata = reader.metadata().expect("fallback metadata should exist");
+        assert_eq!(metadata["neural_inference"], false);
+        assert_eq!(metadata["presence_score"], "variance_heuristic");
+        assert!(reader.weights().is_none());
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }

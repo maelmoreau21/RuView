@@ -1,0 +1,9 @@
+{
+  "apnea_threshold_seconds": 20,
+  "breathing_min_bpm": 4,
+  "breathing_max_bpm": 40,
+  "heartrate_min_bpm": 40,
+  "heartrate_max_bpm": 150,
+  "master_ip": "127.0.0.1",
+  "master_port": 3000
+}

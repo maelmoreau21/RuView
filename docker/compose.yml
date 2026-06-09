@@ -34,3 +34,26 @@ services:
       timeout: 3s
       retries: 8
       start_period: 20s
+
+  health-monitor-script:
+    image: python:3.12-slim
+    container_name: ruvsense-health-monitor
+    profiles:
+      - health-monitoring
+    restart: unless-stopped
+    depends_on:
+      ruvsense-master:
+        condition: service_healthy
+    network_mode: "service:ruvsense-master"
+    working_dir: /app
+    environment:
+      HEALTH_ALERT_CONFIG: /app/scripts/health_alert_config.json
+      HEALTH_LOG_DIR: /app/logs
+      RUVSENSE_MASTER_PORT: ${RUVSENSE_HTTP_PORT:-3000}
+      RUVIEW_API_TOKEN: ${RUVIEW_API_TOKEN:-}
+    volumes:
+      - ../scripts:/app/scripts:ro
+      - ../logs:/app/logs
+    command: >
+      sh -c "pip install --no-cache-dir requests >/dev/null
+      && python scripts/setup_health_monitoring.py"

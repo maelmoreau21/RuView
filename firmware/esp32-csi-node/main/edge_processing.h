@@ -9,7 +9,7 @@
  *   - Biquad IIR bandpass filters for breathing (0.1-0.5 Hz) and heart rate (0.8-2.0 Hz)
  *   - Phase unwrapping and Welford running statistics
  *   - Top-K subcarrier selection by variance
- *   - Presence detection with adaptive threshold calibration
+ *   - Presence detection with rolling ambient baseline calibration
  *   - Vital signs: breathing rate, heart rate (zero-crossing BPM)
  *   - Fall detection (phase acceleration exceeds threshold)
  *   - Delta compression (XOR + RLE) for bandwidth reduction
@@ -39,8 +39,12 @@
 #define EDGE_MAX_PERSONS      4     /**< Max simultaneous persons. */
 
 /* ---- Calibration ---- */
-#define EDGE_CALIB_FRAMES     1200  /**< Frames for adaptive calibration (~60s at 20 Hz). */
-#define EDGE_CALIB_SIGMA_MULT 3.0f  /**< Threshold = mean + 3*sigma of ambient. */
+#define EDGE_BASELINE_WINDOW_FRAMES 300    /**< Rolling ambient baseline window (~30s at 10 Hz). */
+#define EDGE_CALIB_FRAMES           EDGE_BASELINE_WINDOW_FRAMES
+#define EDGE_BASELINE_UPDATE_MS     30000  /**< Recompute rolling baseline threshold every 30s. */
+#define EDGE_RECALIBRATION_MS       30000  /**< Manual recalibration window length. */
+#define EDGE_BASELINE_QUIET_MOTION  0.1f   /**< Only update baseline below fast-motion energy. */
+#define EDGE_CALIB_SIGMA_MULT       3.0f   /**< Threshold = median + 3*robust sigma. */
 
 /* ---- Fall detection ---- */
 #define EDGE_FALL_COOLDOWN_MS 5000  /**< Minimum ms between fall alerts (debounce). */
@@ -220,5 +224,11 @@ void edge_get_phase_history(const float **out_buf, uint16_t *out_len,
  * @param n_subcarriers  Number of subcarriers to fill.
  */
 void edge_get_variances(float *out_variances, uint16_t n_subcarriers);
+
+/**
+ * Request a 30-second ambient recalibration in the DSP task.
+ * Also triggered when NVS namespace "csi_cfg" contains key "recalib" = 1.
+ */
+void edge_request_recalibration(void);
 
 #endif /* EDGE_PROCESSING_H */

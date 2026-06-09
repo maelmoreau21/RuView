@@ -117,6 +117,23 @@ python provision_three_c6.py --ports COM12 \
 
 For LAN access from another machine, set `SENSING_ALLOWED_HOSTS=<master-ip>,<hostname>` before starting Docker so host-header validation accepts `http://<master-ip>:3000/`.
 
+### Health Monitoring Setup
+
+The health monitoring bootstrap script loads the RuvSense health runtime modules, verifies live ESP32-C6 CSI topology, then polls `/api/v1/vital-signs` every 5 seconds. It writes JSONL records to `logs/health_YYYYMMDD.jsonl` and prints terminal-bell red alerts for apnea, unsafe heart rate, high breathing rate, or fall events reported by the API.
+
+```bash
+python -m pip install requests
+python scripts/setup_health_monitoring.py
+```
+
+Thresholds and the master address live in [`scripts/health_alert_config.json`](scripts/health_alert_config.json). The script waits on `/health/ready` for up to 120 seconds, warns if no live ESP32-C6 CSI node is present in `/api/v1/topology`, and enables modules through the runtime endpoint `PUT /api/v1/modules/:id/enabled`. Current runtime aliases are `health-monitor` -> `respiration_tracking` + `fall_detection`, `sleep-apnea` -> `sleep_apnea_screening`, `cardiac-arrhythmia` -> `cardiac_arrhythmia`, and `vital-trend` -> `respiration_tracking` + `cardiac_arrhythmia`.
+
+To run it with Docker Compose, enable the optional profile. The script container shares the `ruvsense-master` network namespace, so the default `127.0.0.1:3000` config still targets the master service.
+
+```bash
+docker compose -f docker/compose.yml --profile health-monitoring up -d --build
+```
+
 > [!NOTE]
 > **Live CSI hardware required for production.** Presence, vital signs, through-wall sensing, and advanced modules require Channel State Information (CSI) from ESP32 hardware. One ESP32-C6 node is enough to bring the Console online; 3+ nodes improve multistatic modules and confidence. RuvSense Edge never substitutes simulated data when the fleet is offline. Use `CSI_SOURCE=simulate` with `RUVSENSE_ENABLE_SIMULATION=true` only for explicit development, CI, or deterministic proof checks. Consumer WiFi laptops provide RSSI-only presence detection.
 

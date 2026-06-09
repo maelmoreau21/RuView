@@ -25,8 +25,8 @@ per ADR-022 Phase 3.
   `CsiFrame` representation.
 - **Vital sign detection** -- Pure-Rust FFT-based breathing rate (0.1--0.5 Hz) and heart rate
   (0.67--2.0 Hz) estimation from CSI amplitude time series (ADR-021).
-- **RVF container** -- Standalone binary container format for packaging model weights, metadata, and
-  configuration into a single `.rvf` file with 64-byte aligned segments.
+- **RVF container** -- Standalone container reader for binary `.rvf` files with 64-byte aligned
+  segments and HuggingFace-style `.rvf.jsonl` metadata/tensor bundles.
 - **RVF pipeline** -- Progressive model loading with streaming segment decoding.
 - **Graph Transformer** -- Cross-attention bottleneck between antenna-space CSI features and the
   COCO 17-keypoint body graph, followed by GCN message passing (ADR-023 Phase 2). Pure `std`, no ML

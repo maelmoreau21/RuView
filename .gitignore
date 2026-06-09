@@ -24,6 +24,7 @@ rust-port/wifi-densepose-rs/data/recordings/
 
 # RuvSense Edge runtime state created by docker/compose.yml
 data/ruvsense/
+logs/health_*.jsonl
 
 # NVS partition images and CSVs (contain WiFi credentials)
 nvs.bin

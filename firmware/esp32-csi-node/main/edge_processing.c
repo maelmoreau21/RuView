@@ -34,9 +34,18 @@ extern nvs_config_t g_nvs_config;
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "edge_proc";
+
+#define EDGE_HUMAN_FFT_LEN          EDGE_PHASE_HISTORY_LEN
+#define EDGE_HUMAN_FREQ_MIN_HZ      0.1f
+#define EDGE_HUMAN_FREQ_MAX_HZ      2.0f
+#define EDGE_HUMAN_BAND_RATIO_MIN   0.08f
+#define EDGE_HUMAN_PEAK_RATIO_MIN   4.0f
+#define EDGE_NVS_RECALIB_CHECK_MS   5000
+#define EDGE_DIAG_LOG_INTERVAL_US   30000000LL
 
 /* ======================================================================
  * SPSC Ring Buffer (lock-free, single-producer single-consumer)
@@ -50,6 +59,9 @@ static uint32_t s_ring_drops;  /* Frames dropped due to full ring buffer. */
  * ~6.5-7.5 KB of the 8 KB task stack.  These save ~4 KB of stack. */
 static float s_scratch_br[EDGE_PHASE_HISTORY_LEN];
 static float s_scratch_hr[EDGE_PHASE_HISTORY_LEN];
+static float s_fft_real[EDGE_HUMAN_FFT_LEN];
+static float s_fft_imag[EDGE_HUMAN_FFT_LEN];
+static float s_baseline_sort[EDGE_BASELINE_WINDOW_FRAMES];
 
 static inline bool ring_push(const uint8_t *iq, uint16_t len,
                              int8_t rssi, uint8_t channel)
@@ -263,12 +275,27 @@ static float s_prev_phase_velocity;
 static uint8_t  s_fall_consec_count;   /**< Consecutive frames above threshold. */
 static int64_t  s_fall_last_alert_us;  /**< Timestamp of last fall alert (debounce). */
 
-/** Adaptive calibration state. */
+/** Rolling ambient baseline state. */
 static bool     s_calibrated;
-static float    s_calib_sum;
-static float    s_calib_sum_sq;
-static uint32_t s_calib_count;
+static float    s_baseline_samples[EDGE_BASELINE_WINDOW_FRAMES];
+static uint16_t s_baseline_count;
+static uint16_t s_baseline_idx;
+static int64_t  s_last_baseline_update_us;
+static float    s_baseline_median;
+static float    s_baseline_mad_sigma;
 static float    s_adaptive_threshold;
+
+/** Manual recalibration state, triggered by API or NVS key "recalib"=1. */
+static volatile bool s_recalib_requested;
+static bool     s_recalib_active;
+static int64_t  s_recalib_start_us;
+static float    s_recalib_samples[EDGE_BASELINE_WINDOW_FRAMES];
+static uint16_t s_recalib_count;
+static int64_t  s_last_recalib_nvs_check_us;
+
+/** Presence RF-classification diagnostics. */
+static int64_t s_last_no_human_log_us;
+static int64_t s_last_threshold_log_us;
 
 /** Last vitals send timestamp. */
 static int64_t s_last_vitals_send_us;
@@ -332,33 +359,330 @@ static void update_top_k(uint16_t n_subcarriers)
 }
 
 /* ======================================================================
- * Adaptive Presence Calibration
+ * Rolling Ambient Baseline and RF Presence Classification
  * ====================================================================== */
 
-static void calibration_update(float motion)
+typedef struct {
+    bool  has_component;
+    float band_ratio;
+    float peak_hz;
+    float peak_ratio;
+} edge_human_freq_result_t;
+
+static void sort_float_ascending(float *values, uint16_t count)
 {
-    if (s_calibrated) return;
-
-    s_calib_sum += motion;
-    s_calib_sum_sq += motion * motion;
-    s_calib_count++;
-
-    if (s_calib_count >= EDGE_CALIB_FRAMES) {
-        float mean = s_calib_sum / (float)s_calib_count;
-        float var = (s_calib_sum_sq / (float)s_calib_count) - (mean * mean);
-        float sigma = (var > 0.0f) ? sqrtf(var) : 0.001f;
-
-        s_adaptive_threshold = mean + EDGE_CALIB_SIGMA_MULT * sigma;
-        if (s_adaptive_threshold < 0.01f) {
-            s_adaptive_threshold = 0.01f;
+    for (uint16_t i = 1; i < count; i++) {
+        float key = values[i];
+        uint16_t j = i;
+        while (j > 0 && values[j - 1] > key) {
+            values[j] = values[j - 1];
+            j--;
         }
-
-        s_calibrated = true;
-        ESP_LOGI(TAG, "Adaptive calibration complete: mean=%.4f sigma=%.4f "
-                 "threshold=%.4f (from %lu frames)",
-                 mean, sigma, s_adaptive_threshold,
-                 (unsigned long)s_calib_count);
+        values[j] = key;
     }
+}
+
+static float median_from_samples(const float *samples, uint16_t count)
+{
+    if (count == 0) return 0.0f;
+
+    for (uint16_t i = 0; i < count; i++) {
+        s_baseline_sort[i] = samples[i];
+    }
+    sort_float_ascending(s_baseline_sort, count);
+
+    uint16_t mid = count / 2;
+    if ((count & 1U) != 0) {
+        return s_baseline_sort[mid];
+    }
+    return 0.5f * (s_baseline_sort[mid - 1] + s_baseline_sort[mid]);
+}
+
+static bool baseline_apply_samples(const float *samples, uint16_t count,
+                                   const char *reason)
+{
+    if (count == 0) return false;
+
+    float median = median_from_samples(samples, count);
+    for (uint16_t i = 0; i < count; i++) {
+        s_baseline_sort[i] = fabsf(samples[i] - median);
+    }
+    sort_float_ascending(s_baseline_sort, count);
+
+    uint16_t mid = count / 2;
+    float mad;
+    if ((count & 1U) != 0) {
+        mad = s_baseline_sort[mid];
+    } else {
+        mad = 0.5f * (s_baseline_sort[mid - 1] + s_baseline_sort[mid]);
+    }
+
+    float robust_sigma = mad * 1.4826f;
+    if (robust_sigma < 0.001f) {
+        robust_sigma = 0.001f;
+    }
+
+    s_baseline_median = median;
+    s_baseline_mad_sigma = robust_sigma;
+    s_adaptive_threshold = median + EDGE_CALIB_SIGMA_MULT * robust_sigma;
+    if (s_adaptive_threshold < 0.01f) {
+        s_adaptive_threshold = 0.01f;
+    }
+    s_calibrated = true;
+
+    ESP_LOGI(TAG, "Baseline updated (%s): median=%.4f sigma=%.4f "
+             "threshold=%.4f samples=%u",
+             reason, s_baseline_median, s_baseline_mad_sigma,
+             s_adaptive_threshold, (unsigned)count);
+    return true;
+}
+
+static void baseline_add_quiet_sample(float motion)
+{
+    s_baseline_samples[s_baseline_idx] = motion;
+    s_baseline_idx = (s_baseline_idx + 1) % EDGE_BASELINE_WINDOW_FRAMES;
+    if (s_baseline_count < EDGE_BASELINE_WINDOW_FRAMES) {
+        s_baseline_count++;
+    }
+}
+
+static void rolling_baseline_update(float motion, int64_t now_us)
+{
+    if (s_cfg.presence_thresh != 0.0f || s_recalib_active) return;
+    if (motion >= EDGE_BASELINE_QUIET_MOTION) return;
+
+    baseline_add_quiet_sample(motion);
+    if (s_baseline_count < EDGE_BASELINE_WINDOW_FRAMES) return;
+
+    int64_t update_interval_us = (int64_t)EDGE_BASELINE_UPDATE_MS * 1000;
+    if (s_last_baseline_update_us == 0
+        || (now_us - s_last_baseline_update_us) >= update_interval_us)
+    {
+        if (baseline_apply_samples(s_baseline_samples, s_baseline_count,
+                                   "rolling median")) {
+            s_last_baseline_update_us = now_us;
+        }
+    }
+}
+
+static void recalibration_begin(int64_t now_us)
+{
+    s_recalib_active = true;
+    s_recalib_start_us = now_us;
+    s_recalib_count = 0;
+    ESP_LOGI(TAG, "Manual recalibration started: %ums window",
+             (unsigned)EDGE_RECALIBRATION_MS);
+}
+
+static void recalibration_update(float motion, int64_t now_us)
+{
+    if (s_recalib_requested) {
+        s_recalib_requested = false;
+        recalibration_begin(now_us);
+    }
+
+    if (!s_recalib_active) return;
+
+    if (motion < EDGE_BASELINE_QUIET_MOTION
+        && s_recalib_count < EDGE_BASELINE_WINDOW_FRAMES)
+    {
+        s_recalib_samples[s_recalib_count++] = motion;
+    }
+
+    int64_t recalib_us = (int64_t)EDGE_RECALIBRATION_MS * 1000;
+    if ((now_us - s_recalib_start_us) < recalib_us) return;
+
+    if (s_cfg.presence_thresh != 0.0f) {
+        ESP_LOGI(TAG, "Manual recalibration complete but fixed threshold %.4f "
+                 "is configured; adaptive baseline unchanged",
+                 s_cfg.presence_thresh);
+    } else if (s_recalib_count > 0) {
+        baseline_apply_samples(s_recalib_samples, s_recalib_count,
+                               "manual 30s recalibration");
+
+        uint16_t copy_count = s_recalib_count;
+        if (copy_count > EDGE_BASELINE_WINDOW_FRAMES) {
+            copy_count = EDGE_BASELINE_WINDOW_FRAMES;
+        }
+        memcpy(s_baseline_samples, s_recalib_samples,
+               copy_count * sizeof(s_baseline_samples[0]));
+        s_baseline_count = copy_count;
+        s_baseline_idx = copy_count % EDGE_BASELINE_WINDOW_FRAMES;
+        s_last_baseline_update_us = now_us;
+    } else {
+        ESP_LOGI(TAG, "Manual recalibration complete: no quiet samples, "
+                 "baseline unchanged");
+    }
+
+    s_recalib_active = false;
+}
+
+static void edge_check_nvs_recalibration(int64_t now_us)
+{
+    int64_t check_interval_us = (int64_t)EDGE_NVS_RECALIB_CHECK_MS * 1000;
+    if (s_last_recalib_nvs_check_us != 0
+        && (now_us - s_last_recalib_nvs_check_us) < check_interval_us)
+    {
+        return;
+    }
+    s_last_recalib_nvs_check_us = now_us;
+
+    nvs_handle_t handle;
+    if (nvs_open("csi_cfg", NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+
+    bool requested = false;
+    uint8_t u8_val = 0;
+    uint32_t u32_val = 0;
+    if (nvs_get_u8(handle, "recalib", &u8_val) == ESP_OK) {
+        requested = (u8_val == 1);
+    } else if (nvs_get_u32(handle, "recalib", &u32_val) == ESP_OK) {
+        requested = (u32_val == 1);
+    }
+
+    if (requested) {
+        edge_request_recalibration();
+        ESP_LOGI(TAG, "NVS recalib=1 consumed; starting background recalibration");
+        if (nvs_erase_key(handle, "recalib") == ESP_OK) {
+            nvs_commit(handle);
+        }
+    }
+
+    nvs_close(handle);
+}
+
+static void log_threshold_if_due(float threshold, int64_t now_us)
+{
+    if (s_last_threshold_log_us != 0
+        && (now_us - s_last_threshold_log_us) < EDGE_DIAG_LOG_INTERVAL_US)
+    {
+        return;
+    }
+    s_last_threshold_log_us = now_us;
+
+    ESP_LOGI(TAG, "Presence threshold current=%.4f calibrated=%s "
+             "baseline_median=%.4f baseline_sigma=%.4f",
+             threshold,
+             s_calibrated ? "yes" : "no",
+             s_baseline_median,
+             s_baseline_mad_sigma);
+}
+
+static void fft_inplace_256(float *real, float *imag)
+{
+    const uint16_t n = EDGE_HUMAN_FFT_LEN;
+
+    for (uint16_t i = 1, j = 0; i < n; i++) {
+        uint16_t bit = n >> 1;
+        for (; (j & bit) != 0; bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+
+        if (i < j) {
+            float tr = real[i];
+            float ti = imag[i];
+            real[i] = real[j];
+            imag[i] = imag[j];
+            real[j] = tr;
+            imag[j] = ti;
+        }
+    }
+
+    for (uint16_t len = 2; len <= n; len <<= 1) {
+        float ang = -2.0f * M_PI / (float)len;
+        float wlen_r = cosf(ang);
+        float wlen_i = sinf(ang);
+        uint16_t half = len >> 1;
+
+        for (uint16_t i = 0; i < n; i += len) {
+            float wr = 1.0f;
+            float wi = 0.0f;
+            for (uint16_t j = 0; j < half; j++) {
+                uint16_t even = i + j;
+                uint16_t odd = even + half;
+                float vr = real[odd] * wr - imag[odd] * wi;
+                float vi = real[odd] * wi + imag[odd] * wr;
+                float ur = real[even];
+                float ui = imag[even];
+
+                real[even] = ur + vr;
+                imag[even] = ui + vi;
+                real[odd] = ur - vr;
+                imag[odd] = ui - vi;
+
+                float next_wr = wr * wlen_r - wi * wlen_i;
+                wi = wr * wlen_i + wi * wlen_r;
+                wr = next_wr;
+            }
+        }
+    }
+}
+
+static edge_human_freq_result_t detect_human_frequency_component(float sample_rate)
+{
+    edge_human_freq_result_t result = {0};
+    if (s_history_len < EDGE_HUMAN_FFT_LEN) {
+        result.has_component = true;
+        return result;
+    }
+
+    float mean = 0.0f;
+    for (uint16_t i = 0; i < EDGE_HUMAN_FFT_LEN; i++) {
+        uint16_t ri = (s_history_idx + EDGE_PHASE_HISTORY_LEN
+                       - EDGE_HUMAN_FFT_LEN + i) % EDGE_PHASE_HISTORY_LEN;
+        mean += s_phase_history[ri];
+    }
+    mean /= (float)EDGE_HUMAN_FFT_LEN;
+
+    for (uint16_t i = 0; i < EDGE_HUMAN_FFT_LEN; i++) {
+        uint16_t ri = (s_history_idx + EDGE_PHASE_HISTORY_LEN
+                       - EDGE_HUMAN_FFT_LEN + i) % EDGE_PHASE_HISTORY_LEN;
+        float hann = 0.5f - 0.5f * cosf((2.0f * M_PI * (float)i)
+                                        / (float)(EDGE_HUMAN_FFT_LEN - 1));
+        s_fft_real[i] = (s_phase_history[ri] - mean) * hann;
+        s_fft_imag[i] = 0.0f;
+    }
+
+    fft_inplace_256(s_fft_real, s_fft_imag);
+
+    float total_power = 0.0f;
+    float band_power = 0.0f;
+    float max_band_power = 0.0f;
+    uint16_t max_band_bin = 0;
+    uint16_t bin_count = (EDGE_HUMAN_FFT_LEN / 2) - 1;
+
+    for (uint16_t bin = 1; bin < EDGE_HUMAN_FFT_LEN / 2; bin++) {
+        float power = s_fft_real[bin] * s_fft_real[bin]
+                    + s_fft_imag[bin] * s_fft_imag[bin];
+        float hz = ((float)bin * sample_rate) / (float)EDGE_HUMAN_FFT_LEN;
+        total_power += power;
+
+        if (hz >= EDGE_HUMAN_FREQ_MIN_HZ && hz <= EDGE_HUMAN_FREQ_MAX_HZ) {
+            band_power += power;
+            if (power > max_band_power) {
+                max_band_power = power;
+                max_band_bin = bin;
+            }
+        }
+    }
+
+    if (total_power <= 0.000001f) {
+        result.has_component = false;
+        return result;
+    }
+
+    float mean_power = total_power / (float)bin_count;
+    result.band_ratio = band_power / total_power;
+    result.peak_ratio = max_band_power / (mean_power + 0.000001f);
+    result.peak_hz = ((float)max_band_bin * sample_rate)
+                   / (float)EDGE_HUMAN_FFT_LEN;
+    result.has_component =
+        (result.band_ratio >= EDGE_HUMAN_BAND_RATIO_MIN)
+        || (result.peak_ratio >= EDGE_HUMAN_PEAK_RATIO_MIN);
+
+    return result;
 }
 
 /* ======================================================================
@@ -714,6 +1038,7 @@ static void process_frame(const edge_ring_slot_t *slot)
 
     s_frame_count++;
     s_latest_rssi = slot->rssi;
+    int64_t frame_now_us = esp_timer_get_time();
 
     /* CSI sample rate. MGMT-only promiscuous filter (RuView#396, csi_collector.c)
      * yields ~10 Hz from beacons; keep this value aligned with csi_collector's
@@ -803,10 +1128,9 @@ static void process_frame(const edge_ring_slot_t *slot)
     /* --- Step 9: Presence detection --- */
     s_presence_score = s_motion_energy;
 
-    /* Adaptive calibration: learn ambient noise level from first N frames. */
-    if (!s_calibrated && s_cfg.presence_thresh == 0.0f) {
-        calibration_update(s_motion_energy);
-    }
+    edge_check_nvs_recalibration(frame_now_us);
+    recalibration_update(s_motion_energy, frame_now_us);
+    rolling_baseline_update(s_motion_energy, frame_now_us);
 
     float threshold = s_cfg.presence_thresh;
     if (threshold == 0.0f && s_calibrated) {
@@ -814,7 +1138,29 @@ static void process_frame(const edge_ring_slot_t *slot)
     } else if (threshold == 0.0f) {
         threshold = 0.05f;  /* Default until calibrated. */
     }
-    s_presence_detected = (s_presence_score > threshold);
+
+    log_threshold_if_due(threshold, frame_now_us);
+
+    bool presence_candidate = (s_presence_score > threshold);
+    s_presence_detected = presence_candidate;
+    if (presence_candidate) {
+        edge_human_freq_result_t human =
+            detect_human_frequency_component(sample_rate);
+        if (!human.has_component) {
+            s_presence_detected = false;
+            if (s_last_no_human_log_us == 0
+                || (frame_now_us - s_last_no_human_log_us)
+                    >= EDGE_DIAG_LOG_INTERVAL_US)
+            {
+                s_last_no_human_log_us = frame_now_us;
+                ESP_LOGI(TAG, "Presence rejected: no human frequency component "
+                         "(motion=%.4f threshold=%.4f band_ratio=%.3f "
+                         "peak=%.2fHz peak_ratio=%.2f)",
+                         s_presence_score, threshold, human.band_ratio,
+                         human.peak_hz, human.peak_ratio);
+            }
+        }
+    }
 
     /* --- Step 10: Fall detection (phase acceleration + debounce, issue #263) --- */
     if (s_history_len >= 3) {
@@ -858,7 +1204,7 @@ static void process_frame(const edge_ring_slot_t *slot)
     }
 
     /* --- Step 13: Send vitals packet at configured interval --- */
-    int64_t now_us = esp_timer_get_time();
+    int64_t now_us = frame_now_us;
     int64_t interval_us = (int64_t)s_cfg.vital_interval_ms * 1000;
     if ((now_us - s_last_vitals_send_us) >= interval_us) {
         send_vitals_packet();
@@ -866,9 +1212,10 @@ static void process_frame(const edge_ring_slot_t *slot)
         s_last_vitals_send_us = now_us;
 
         if ((s_frame_count % 200) == 0) {
-            ESP_LOGI(TAG, "Vitals: br=%.1f hr=%.1f motion=%.4f pres=%s "
+            ESP_LOGI(TAG, "Vitals: br=%.1f hr=%.1f motion=%.4f thresh=%.4f pres=%s "
                      "fall=%s persons=%u frames=%lu drops=%lu",
                      s_breathing_bpm, s_heartrate_bpm, s_motion_energy,
+                     threshold,
                      s_presence_detected ? "YES" : "no",
                      s_fall_detected ? "YES" : "no",
                      (unsigned)s_latest_pkt.n_persons,
@@ -937,6 +1284,7 @@ static void edge_task(void *arg)
         } else {
             /* No frames available — sleep one full tick.
              * NOTE: pdMS_TO_TICKS(5) == 0 at 100 Hz, which would busy-spin. */
+            edge_check_nvs_recalibration(esp_timer_get_time());
             vTaskDelay(1);
         }
     }
@@ -986,6 +1334,11 @@ void edge_get_variances(float *out_variances, uint16_t n_subcarriers)
     }
 }
 
+void edge_request_recalibration(void)
+{
+    s_recalib_requested = true;
+}
+
 esp_err_t edge_processing_init(const edge_config_t *cfg)
 {
     if (cfg == NULL) {
@@ -1027,10 +1380,21 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
 
     /* Reset calibration state. */
     s_calibrated = false;
-    s_calib_sum = 0.0f;
-    s_calib_sum_sq = 0.0f;
-    s_calib_count = 0;
+    memset(s_baseline_samples, 0, sizeof(s_baseline_samples));
+    s_baseline_count = 0;
+    s_baseline_idx = 0;
+    s_last_baseline_update_us = 0;
+    s_baseline_median = 0.0f;
+    s_baseline_mad_sigma = 0.0f;
     s_adaptive_threshold = 0.05f;
+    s_recalib_requested = false;
+    s_recalib_active = false;
+    s_recalib_start_us = 0;
+    memset(s_recalib_samples, 0, sizeof(s_recalib_samples));
+    s_recalib_count = 0;
+    s_last_recalib_nvs_check_us = 0;
+    s_last_no_human_log_us = 0;
+    s_last_threshold_log_us = 0;
 
     /* Reset multi-person state. */
     memset(s_persons, 0, sizeof(s_persons));
