@@ -60,6 +60,17 @@ const POSE_ALIASES = new Map([
   ['falling_down', 'falling'],
   ['crouched', 'crouching'],
 ]);
+const ROOM_CONFIG_STORAGE_KEY = 'ruvsense:room-config';
+const DEFAULT_ROOM_CONFIG = {
+  room_width_meters: 5.0,
+  room_height_meters: 4.0,
+  nodes: [
+    { id: 1, x: 0.0, y: 0.0, label: 'Node 1' },
+    { id: 2, x: 5.0, y: 0.0, label: 'Node 2' },
+    { id: 3, x: 2.5, y: 4.0, label: 'Node 3' },
+  ],
+};
+const ROOM_VISUAL_HEIGHT_M = 2.6;
 
 // SCENARIO_NAMES, DEFAULTS, SETTINGS_VERSION, PRESETS imported from hud-controller.js
 
@@ -131,12 +142,20 @@ class Observatory {
     this._roomSize = { width: 12, height: 4, depth: 10 };
     this._cameraFramedToSensors = false;
     this._wsReconnectTimer = null;
+    this._wsCandidateIndex = 0;
     this._lastLiveAt = 0;
     this._lastEdgeVitals = null;
     this._currentScenario = null;
     this._obstacleSummary = null;
     this._personMotionFilters = new Map();
     this._linkRaycaster = new THREE.Raycaster();
+    this._connectionState = 'connecting';
+    this._roomConfig = null;
+    this._roomConfigSource = 'default';
+    this._roomConfigNodes = new Map();
+    this._presenceSilhouettes = new Map();
+    this._activeRoomNodeCount = 0;
+    this._sceneStatusOverlay = null;
 
     // Build scene
     this._setupLighting();
@@ -144,6 +163,8 @@ class Observatory {
     this._buildRoom();
     this._scenarioProps = new ScenarioProps(this._scene);
     this._buildTopologyDevices();
+    this._buildRoomConfigLayer();
+    this._buildPresenceLayer();
     this._poseSystem = new PoseSystem();
     this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
     this._buildDotMatrixMist();
@@ -157,6 +178,9 @@ class Observatory {
 
     // HUD controller (settings dialog, sparkline, vital displays)
     this._hud = new HudController(this);
+    this._initSceneStatusOverlay();
+    this._initRoomConfigPanel();
+    this._loadRoomConfig();
 
     // State
     this._autopilot = false;
@@ -342,6 +366,510 @@ class Observatory {
     this._scene.add(this._linkGroup);
     this._scene.add(this._impactGroup);
     this._scene.add(this._topologyGroup);
+  }
+
+  _buildRoomConfigLayer() {
+    this._roomConfigGroup = new THREE.Group();
+    this._roomConfigGroup.name = 'room-config-layer';
+    this._scene.add(this._roomConfigGroup);
+  }
+
+  _buildPresenceLayer() {
+    this._presenceGroup = new THREE.Group();
+    this._presenceGroup.name = 'presence-update-silhouettes';
+    this._scene.add(this._presenceGroup);
+  }
+
+  _initSceneStatusOverlay() {
+    this._sceneStatusOverlay = document.getElementById('scene-status-overlay');
+    this._setSceneStatus('connecting', 'En attente du serveur...');
+  }
+
+  _setSceneStatus(status, message = '') {
+    this._connectionState = status;
+    const overlay = this._sceneStatusOverlay;
+    if (!overlay) return;
+
+    overlay.classList.remove('scene-status-overlay--connecting', 'scene-status-overlay--no-nodes');
+    if (status === 'live') {
+      overlay.hidden = true;
+      return;
+    }
+
+    overlay.hidden = false;
+    if (status === 'no_nodes') {
+      overlay.classList.add('scene-status-overlay--no-nodes');
+      overlay.textContent = message || 'Aucun n\u0153ud ESP32 connect\u00e9';
+      return;
+    }
+
+    overlay.classList.add('scene-status-overlay--connecting');
+    overlay.textContent = message || 'En attente du serveur...';
+  }
+
+  _initRoomConfigPanel() {
+    this._roomConfigPanel = document.getElementById('room-config-panel');
+    this._roomConfigButton = document.getElementById('room-config-btn');
+    this._roomConfigClose = document.getElementById('room-config-close');
+    this._roomConfigApply = document.getElementById('room-config-apply');
+    this._roomConfigReset = document.getElementById('room-config-reset');
+    this._roomNodeFields = document.getElementById('room-node-fields');
+
+    this._roomConfigButton?.addEventListener('click', () => this._toggleRoomConfigPanel());
+    this._roomConfigClose?.addEventListener('click', () => this._closeRoomConfigPanel());
+    this._roomConfigApply?.addEventListener('click', () => {
+      const next = this._roomConfigFromPanel();
+      if (next) this._applyRoomConfig(next, 'local', true);
+    });
+    this._roomConfigReset?.addEventListener('click', () => {
+      try { localStorage.removeItem(ROOM_CONFIG_STORAGE_KEY); } catch {}
+      this._loadRoomConfig(true);
+    });
+  }
+
+  _toggleRoomConfigPanel() {
+    if (!this._roomConfigPanel) return;
+    this._roomConfigPanel.hidden = !this._roomConfigPanel.hidden;
+    if (!this._roomConfigPanel.hidden) this._populateRoomConfigPanel();
+  }
+
+  _closeRoomConfigPanel() {
+    if (this._roomConfigPanel) this._roomConfigPanel.hidden = true;
+  }
+
+  _readStoredRoomConfig() {
+    try {
+      const raw = localStorage.getItem(ROOM_CONFIG_STORAGE_KEY);
+      return raw ? this._normalizeRoomConfig(JSON.parse(raw)) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async _loadRoomConfig(ignoreStored = false) {
+    const stored = ignoreStored ? null : this._readStoredRoomConfig();
+    if (stored) {
+      this._applyRoomConfig(stored, 'local', false);
+      return;
+    }
+
+    try {
+      const response = await fetch('/ui/room-config.json', { cache: 'no-store' });
+      if (response.ok) {
+        const config = this._normalizeRoomConfig(await response.json());
+        if (config) {
+          this._applyRoomConfig(config, 'file', false);
+          return;
+        }
+      }
+    } catch {
+      // The file is provisioned by deployment or another agent; use visual defaults until it exists.
+    }
+
+    this._applyRoomConfig(DEFAULT_ROOM_CONFIG, 'default', false);
+  }
+
+  _normalizeRoomConfig(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const width = Number(raw.room_width_meters);
+    const depth = Number(raw.room_height_meters);
+    const nodes = Array.isArray(raw.nodes) ? raw.nodes : [];
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(depth) || depth <= 0) return null;
+
+    return {
+      room_width_meters: width,
+      room_height_meters: depth,
+      nodes: nodes.map((node, index) => {
+        const id = Number(node?.id ?? node?.node_id ?? index + 1);
+        const x = Number(node?.x);
+        const y = Number(node?.y);
+        return {
+          id: Number.isFinite(id) ? id : index + 1,
+          x: Number.isFinite(x) ? x : 0,
+          y: Number.isFinite(y) ? y : 0,
+          label: String(node?.label || node?.display_label || `Node ${index + 1}`),
+        };
+      }),
+    };
+  }
+
+  _applyRoomConfig(rawConfig, source = 'runtime', persist = false) {
+    const config = this._normalizeRoomConfig(rawConfig) || this._normalizeRoomConfig(DEFAULT_ROOM_CONFIG);
+    this._roomConfig = config;
+    this._roomConfigSource = source;
+
+    if (persist) {
+      try { localStorage.setItem(ROOM_CONFIG_STORAGE_KEY, JSON.stringify(config)); } catch {}
+    }
+
+    if (!this._environment) {
+      this._syncRoomGeometry({
+        room: { dimensions_m: [config.room_width_meters, ROOM_VISUAL_HEIGHT_M, config.room_height_meters] },
+      });
+    }
+    this._rebuildRoomConfigScene();
+    this._populateRoomConfigPanel();
+    this._syncRoomConfigNodes(this._currentData || this._liveData || null);
+  }
+
+  _populateRoomConfigPanel() {
+    if (!this._roomConfig || !this._roomConfigPanel) return;
+    const widthInput = document.getElementById('room-width-input');
+    const heightInput = document.getElementById('room-height-input');
+    if (widthInput) widthInput.value = this._roomConfig.room_width_meters.toFixed(1);
+    if (heightInput) heightInput.value = this._roomConfig.room_height_meters.toFixed(1);
+    if (!this._roomNodeFields) return;
+
+    this._roomNodeFields.replaceChildren();
+    const title = document.createElement('div');
+    title.className = 'room-node-title';
+    title.textContent = 'Noeuds ESP32';
+    this._roomNodeFields.appendChild(title);
+
+    for (const node of this._roomConfig.nodes) {
+      const row = document.createElement('label');
+      row.className = 'room-node-field';
+      row.dataset.nodeId = String(node.id);
+
+      const label = document.createElement('span');
+      label.textContent = node.label || `Node ${node.id}`;
+
+      const xInput = document.createElement('input');
+      xInput.type = 'number';
+      xInput.step = '0.1';
+      xInput.value = Number(node.x).toFixed(1);
+      xInput.dataset.axis = 'x';
+      xInput.setAttribute('aria-label', `${label.textContent} x`);
+
+      const yInput = document.createElement('input');
+      yInput.type = 'number';
+      yInput.step = '0.1';
+      yInput.value = Number(node.y).toFixed(1);
+      yInput.dataset.axis = 'y';
+      yInput.setAttribute('aria-label', `${label.textContent} y`);
+
+      row.append(label, xInput, yInput);
+      this._roomNodeFields.appendChild(row);
+    }
+  }
+
+  _roomConfigFromPanel() {
+    if (!this._roomConfig) return null;
+    const width = Number(document.getElementById('room-width-input')?.value);
+    const depth = Number(document.getElementById('room-height-input')?.value);
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(depth) || depth <= 0) return null;
+
+    const nodes = this._roomConfig.nodes.map((node) => {
+      const rows = [...(this._roomNodeFields?.querySelectorAll('.room-node-field') || [])];
+      const row = rows.find((candidate) => candidate.dataset.nodeId === String(node.id));
+      const x = Number(row?.querySelector('[data-axis="x"]')?.value);
+      const y = Number(row?.querySelector('[data-axis="y"]')?.value);
+      return {
+        ...node,
+        x: Number.isFinite(x) ? x : node.x,
+        y: Number.isFinite(y) ? y : node.y,
+      };
+    });
+
+    return {
+      room_width_meters: width,
+      room_height_meters: depth,
+      nodes,
+    };
+  }
+
+  _roomToScenePosition(x, y, elevation = 0) {
+    const width = Number(this._roomConfig?.room_width_meters || this._roomSize.width || 1);
+    const depth = Number(this._roomConfig?.room_height_meters || this._roomSize.depth || 1);
+    return [
+      Number(x || 0) - width / 2,
+      elevation,
+      Number(y || 0) - depth / 2,
+    ];
+  }
+
+  _clearObjectGroup(group) {
+    if (!group) return;
+    while (group.children.length) {
+      const child = group.children[0];
+      group.remove(child);
+      child.traverse?.((obj) => {
+        obj.geometry?.dispose?.();
+        if (Array.isArray(obj.material)) {
+          obj.material.forEach((mat) => {
+            mat.map?.dispose?.();
+            mat.dispose?.();
+          });
+        } else {
+          obj.material?.map?.dispose?.();
+          obj.material?.dispose?.();
+        }
+      });
+    }
+  }
+
+  _createTextSprite(text, options = {}) {
+    const canvas = document.createElement('canvas');
+    canvas.width = options.width || 256;
+    canvas.height = options.height || 96;
+    const texture = new THREE.CanvasTexture(canvas);
+    if ('colorSpace' in texture) texture.colorSpace = THREE.SRGBColorSpace;
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const sprite = new THREE.Sprite(material);
+    sprite.userData.labelCanvas = canvas;
+    sprite.userData.labelTexture = texture;
+    sprite.userData.labelOptions = options;
+    this._updateTextSprite(sprite, text, options.color);
+    return sprite;
+  }
+
+  _updateTextSprite(sprite, text, color = null) {
+    const canvas = sprite?.userData?.labelCanvas;
+    const texture = sprite?.userData?.labelTexture;
+    const options = sprite?.userData?.labelOptions || {};
+    if (!canvas || !texture) return;
+    const ctx = canvas.getContext('2d');
+    const lines = String(text || '').split('\n');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = options.background || 'rgba(8, 16, 28, 0.72)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = options.border || 'rgba(255, 255, 255, 0.18)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
+    ctx.fillStyle = color || options.color || '#e8ece0';
+    ctx.font = options.font || '600 22px JetBrains Mono, Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const lineHeight = options.lineHeight || 28;
+    const start = canvas.height / 2 - ((lines.length - 1) * lineHeight) / 2;
+    lines.forEach((line, index) => ctx.fillText(line, canvas.width / 2, start + index * lineHeight));
+    texture.needsUpdate = true;
+  }
+
+  _rebuildRoomConfigScene() {
+    if (!this._roomConfigGroup || !this._roomConfig) return;
+    this._clearObjectGroup(this._roomConfigGroup);
+    this._roomConfigNodes.clear();
+
+    const width = this._roomConfig.room_width_meters;
+    const depth = this._roomConfig.room_height_meters;
+    const vertices = [];
+    const xDivisions = Math.max(1, Math.ceil(width));
+    const zDivisions = Math.max(1, Math.ceil(depth));
+
+    for (let i = 0; i <= xDivisions; i++) {
+      const x = -width / 2 + (width * i) / xDivisions;
+      vertices.push(x, 0.035, -depth / 2, x, 0.035, depth / 2);
+    }
+    for (let i = 0; i <= zDivisions; i++) {
+      const z = -depth / 2 + (depth * i) / zDivisions;
+      vertices.push(-width / 2, 0.035, z, width / 2, 0.035, z);
+    }
+
+    const gridGeo = new THREE.BufferGeometry();
+    gridGeo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    const grid = new THREE.LineSegments(
+      gridGeo,
+      new THREE.LineBasicMaterial({ color: 0x9aa4ad, transparent: true, opacity: 0.24 })
+    );
+    this._roomConfigGroup.add(grid);
+
+    const borderPoints = [
+      new THREE.Vector3(-width / 2, 0.05, -depth / 2),
+      new THREE.Vector3(width / 2, 0.05, -depth / 2),
+      new THREE.Vector3(width / 2, 0.05, depth / 2),
+      new THREE.Vector3(-width / 2, 0.05, depth / 2),
+      new THREE.Vector3(-width / 2, 0.05, -depth / 2),
+    ];
+    const border = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(borderPoints),
+      new THREE.LineBasicMaterial({ color: 0xb8c0c8, transparent: true, opacity: 0.55 })
+    );
+    this._roomConfigGroup.add(border);
+
+    for (const node of this._roomConfig.nodes) {
+      const entry = this._createRoomNodeIcon(node);
+      const [x, y, z] = this._roomToScenePosition(node.x, node.y, 0.08);
+      entry.group.position.set(x, y, z);
+      this._roomConfigGroup.add(entry.group);
+      this._roomConfigNodes.set(Number(node.id), entry);
+    }
+  }
+
+  _createRoomNodeIcon(node) {
+    const group = new THREE.Group();
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: C.redAlert,
+      emissive: C.redAlert,
+      emissiveIntensity: 0.22,
+      roughness: 0.4,
+    });
+    const antennaMat = new THREE.MeshBasicMaterial({ color: 0xd8dee8, transparent: true, opacity: 0.74 });
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: C.redAlert,
+      transparent: true,
+      opacity: 0.55,
+      wireframe: true,
+    });
+
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.1, 0.18), bodyMat);
+    body.position.y = 0.08;
+    group.add(body);
+
+    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.3, 8), antennaMat);
+    antenna.position.y = 0.28;
+    group.add(antenna);
+
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.006, 6, 32), ringMat);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.08;
+    group.add(ring);
+
+    const label = this._createTextSprite(node.label || `Node ${node.id}`, {
+      width: 192,
+      height: 56,
+      font: '600 20px JetBrains Mono, Consolas, monospace',
+      color: '#dce6ef',
+      background: 'rgba(8, 16, 28, 0.64)',
+    });
+    label.scale.set(0.72, 0.22, 1);
+    label.position.y = 0.62;
+    group.add(label);
+
+    return { group, bodyMat, ringMat, label };
+  }
+
+  _syncRoomConfigNodes(data) {
+    if (!this._roomConfig || !this._roomConfigNodes.size) return;
+    const systemStatus = String(data?.system_status || '').toLowerCase();
+    const fallbackActiveNodes = Array.isArray(data?.nodes)
+      ? data.nodes.filter((node) => node.active !== false).length
+      : 0;
+    const nodeCount = Math.max(0, this._integerOrZero(
+      data?.node_count ?? data?.count_evidence?.active_nodes ?? fallbackActiveNodes
+    ));
+    const activeIds = new Set();
+    for (const node of data?.nodes || []) {
+      const status = String(node.status || node.health_status || '').toLowerCase();
+      const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(status);
+      const id = Number(node.node_id ?? node.id);
+      if (active && Number.isFinite(id)) activeIds.add(id);
+    }
+
+    this._roomConfig.nodes.forEach((node, index) => {
+      const entry = this._roomConfigNodes.get(Number(node.id));
+      if (!entry) return;
+      const hasExplicitIds = activeIds.size > 0;
+      const active = systemStatus !== 'no_nodes' && (hasExplicitIds ? activeIds.has(Number(node.id)) : index < nodeCount);
+      const color = active ? C.greenGlow : C.redAlert;
+      entry.bodyMat.color.setHex(color);
+      entry.bodyMat.emissive.setHex(color);
+      entry.bodyMat.opacity = active ? 1 : 0.72;
+      entry.ringMat.color.setHex(color);
+      entry.ringMat.opacity = active ? 0.8 : 0.36;
+      entry.group.visible = true;
+    });
+  }
+
+  _presenceColor(confidence) {
+    if (confidence < 0.4) return 0xff3040;
+    if (confidence < 0.7) return 0xffb020;
+    return 0x00d878;
+  }
+
+  _upsertPresenceSilhouette(id) {
+    let entry = this._presenceSilhouettes.get(id);
+    if (entry) return entry;
+
+    const group = new THREE.Group();
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: C.greenGlow,
+      emissive: C.greenGlow,
+      emissiveIntensity: 0.18,
+      roughness: 0.36,
+      metalness: 0.08,
+    });
+    const headMat = bodyMat.clone();
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 1.12, 20), bodyMat);
+    body.position.y = 0.7;
+    body.castShadow = true;
+    group.add(body);
+
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 24, 16), headMat);
+    head.position.y = 1.42;
+    head.castShadow = true;
+    group.add(head);
+
+    const label = this._createTextSprite('', {
+      width: 256,
+      height: 92,
+      font: '600 20px JetBrains Mono, Consolas, monospace',
+      background: 'rgba(8, 16, 28, 0.76)',
+    });
+    label.scale.set(0.95, 0.34, 1);
+    label.position.y = 1.92;
+    group.add(label);
+
+    this._presenceGroup.add(group);
+    entry = { group, bodyMat, headMat, label, lastLabel: '' };
+    this._presenceSilhouettes.set(id, entry);
+    return entry;
+  }
+
+  _removePresenceSilhouette(id, entry) {
+    this._presenceGroup.remove(entry.group);
+    entry.group.traverse((obj) => {
+      obj.geometry?.dispose?.();
+      if (Array.isArray(obj.material)) {
+        obj.material.forEach((mat) => {
+          mat.map?.dispose?.();
+          mat.dispose?.();
+        });
+      } else {
+        obj.material?.map?.dispose?.();
+        obj.material?.dispose?.();
+      }
+    });
+    this._presenceSilhouettes.delete(id);
+  }
+
+  _updatePresenceSilhouettes(data, elapsed) {
+    const persons = Array.isArray(data?.persons) ? data.persons : [];
+    const activeIds = new Set();
+    persons.forEach((person, index) => {
+      if (person.is_present === false) return;
+      const id = this._personIdentity(person, index);
+      activeIds.add(id);
+      const entry = this._upsertPresenceSilhouette(id);
+      const position = this._parseVector3(person.position) || this._fallbackPersonPosition(index, persons.length);
+      const confidence = Math.max(0, Math.min(1, Number(person.confidence) || 0));
+      const motionEnergy = Math.max(0, Math.min(1, Number(person.motion_energy ?? person.motion_score / 100) || 0));
+      const color = this._presenceColor(confidence);
+      const yOffset = Math.sin(elapsed * 3.2 + index * 0.7) * motionEnergy * 0.12;
+
+      entry.group.position.set(position[0], yOffset, position[2]);
+      entry.bodyMat.color.setHex(color);
+      entry.bodyMat.emissive.setHex(color);
+      entry.headMat.color.setHex(color);
+      entry.headMat.emissive.setHex(color);
+
+      const br = this._numberOrNull(person.breathing_bpm ?? person.vitals?.breathing_bpm ?? person.vital_signs?.breathing_rate_bpm);
+      const hr = this._numberOrNull(person.heart_rate_bpm ?? person.vitals?.heart_rate_bpm ?? person.vital_signs?.heart_rate_bpm);
+      const label = `BR ${br == null ? '--' : br.toFixed(1)} BPM\nHR ${hr == null ? '--' : Math.round(hr)} BPM`;
+      if (entry.lastLabel !== label) {
+        this._updateTextSprite(entry.label, label, confidence < 0.4 ? '#ffb3ba' : confidence < 0.7 ? '#ffe4ad' : '#b7ffd4');
+        entry.lastLabel = label;
+      }
+    });
+
+    for (const [id, entry] of [...this._presenceSilhouettes.entries()]) {
+      if (!activeIds.has(id)) this._removePresenceSilhouette(id, entry);
+    }
   }
 
   // ---- WiFi Waves ----
@@ -791,13 +1319,31 @@ class Observatory {
 
   _ingestSocketFrame(frame) {
     const type = this._sensingTypeOf(frame);
+    if (type === 'presence_update') {
+      const normalized = this._normalizePresenceFrame(frame);
+      if (!normalized) return;
+      const status = normalized.system_status === 'no_nodes' ? 'no_nodes' : 'live';
+      this._liveData = normalized;
+      this._lastLiveAt = performance.now();
+      this._setSceneStatus(status);
+      this._hud.updateSourceBadge(status, this._ws);
+      this._updateScenarioProps(normalized);
+      this._syncTopology(normalized);
+      this._syncRoomConfigNodes(normalized);
+      return;
+    }
+
     if (type === 'sensing_update') {
       const normalized = this._normalizeSensingFrame(frame);
       if (!normalized) return;
+      const status = String(normalized.system_status || '').toLowerCase() === 'no_nodes' ? 'no_nodes' : 'live';
       this._liveData = normalized;
       this._lastLiveAt = performance.now();
+      this._setSceneStatus(status);
+      this._hud.updateSourceBadge(status, this._ws);
       this._updateScenarioProps(normalized);
       this._syncTopology(normalized);
+      this._syncRoomConfigNodes(normalized);
       return;
     }
 
@@ -901,7 +1447,7 @@ class Observatory {
       ? evidence.rendered_persons
       : Math.max(evidence.rendered_persons, persons.length);
     persons = this._dedupePersons(persons, renderLimit);
-    persons = this._smoothScenePersons(persons, data);
+    persons = this._smoothScenePersons(persons, frame);
     const renderedPersons = hasCountEvidence ? evidence.rendered_persons : (persons.length || evidence.rendered_persons);
     const countEvidence = {
       ...evidence,
@@ -926,6 +1472,103 @@ class Observatory {
       estimated_persons: renderedPersons,
       count_evidence: countEvidence,
       classification,
+    };
+  }
+
+  _normalizePresenceFrame(rawFrame) {
+    if (!rawFrame || typeof rawFrame !== 'object') return null;
+    const rawPersons = Array.isArray(rawFrame.persons) ? rawFrame.persons : [];
+    const persons = rawPersons
+      .filter((person) => person?.is_present !== false)
+      .slice(0, MAX_SCENE_PERSONS)
+      .map((person, index) => {
+        const x = this._numberOrNull(person?.x) ?? 0;
+        const y = this._numberOrNull(person?.y) ?? 0;
+        const confidence = Math.max(0, Math.min(1, this._numberOrNull(person?.confidence) ?? 0));
+        const motionEnergy = Math.max(0, Math.min(1, this._numberOrNull(person?.motion_energy) ?? 0));
+        const br = this._numberOrNull(person?.breathing_bpm);
+        const hr = this._numberOrNull(person?.heart_rate_bpm);
+        const position = this._roomToScenePosition(x, y, 0);
+
+        return {
+          id: this._personIdentity(person, index),
+          x,
+          y,
+          confidence,
+          breathing_bpm: br,
+          heart_rate_bpm: hr,
+          is_present: true,
+          motion_energy: motionEnergy,
+          motion_score: motionEnergy * 100,
+          position,
+          position_m: position.slice(),
+          position_source: 'observatory_layout',
+          pose_source: 'ws_pose',
+          pose: 'standing',
+          vitals: {
+            ...(br != null ? { breathing_bpm: br } : {}),
+            ...(hr != null ? { heart_rate_bpm: hr } : {}),
+          },
+          vital_signs: {
+            ...(br != null ? { breathing_rate_bpm: br } : {}),
+            ...(hr != null ? { heart_rate_bpm: hr } : {}),
+          },
+        };
+      });
+
+    const nodeCount = this._integerOrZero(rawFrame.node_count);
+    const nodes = (this._roomConfig?.nodes || DEFAULT_ROOM_CONFIG.nodes).map((node, index) => {
+      const active = String(rawFrame.system_status || '').toLowerCase() !== 'no_nodes' && index < nodeCount;
+      const position = this._roomToScenePosition(node.x, node.y, 0.08);
+      return {
+        id: node.id,
+        node_id: node.id,
+        label: node.label || `Node ${node.id}`,
+        active,
+        status: active ? 'online' : 'offline',
+        position,
+        position_m: position.slice(),
+      };
+    });
+
+    const maxConfidence = persons.reduce((best, person) => Math.max(best, person.confidence || 0), 0);
+    const avgMotion = persons.length
+      ? persons.reduce((sum, person) => sum + (person.motion_energy || 0), 0) / persons.length
+      : 0;
+    const primaryVitals = persons.find((person) => person.breathing_bpm != null || person.heart_rate_bpm != null);
+    const systemStatus = String(rawFrame.system_status || (nodeCount > 0 ? 'live' : 'no_nodes')).toLowerCase();
+
+    return {
+      type: 'sensing_update',
+      msg_type: 'sensing_update',
+      source: 'ws_pose',
+      system_status: systemStatus,
+      timestamp_ms: this._numberOrNull(rawFrame.timestamp_ms) ?? Date.now(),
+      node_count: nodeCount,
+      nodes,
+      persons,
+      estimated_persons: persons.length,
+      count_evidence: {
+        stable_persons: persons.length,
+        raw_estimated_persons: persons.length,
+        rendered_persons: persons.length,
+        active_nodes: nodeCount,
+        supporting_nodes: nodeCount,
+        ambiguous: false,
+        reason: 'presence_update',
+      },
+      features: {
+        mean_rssi: 0,
+        variance: 0,
+        motion_band_power: avgMotion,
+      },
+      classification: {
+        presence: persons.length > 0,
+        motion_level: avgMotion > 0.15 ? 'active' : (persons.length ? 'present' : 'absent'),
+        confidence: maxConfidence,
+      },
+      signal_field: null,
+      vital_signs: primaryVitals?.vital_signs || null,
     };
   }
 
@@ -1486,12 +2129,23 @@ class Observatory {
 
   // ---- WebSocket live data ----
 
-  _autoDetectLive() {
+  _poseWsCandidates() {
+    const host = window.location.hostname || 'localhost';
+    const candidates = [];
+    if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      candidates.push(`${proto}//${window.location.host}/ws/pose`);
+    }
+    candidates.push(`ws://${host}:3000/ws/pose`);
+    return [...new Set(candidates)];
+  }
+
+  _autoDetectLegacyLive() {
     // Probe sensing server health on same origin, then common ports
     const host = window.location.hostname || 'localhost';
     const candidates = [
       window.location.origin,                   // same origin (e.g. :3000)
-      `http://${host}:8765`,                     // default WS port
+      `http://${host}:3000`,                     // Rust server port
       `http://${host}:3000`,                     // default HTTP port
     ];
     // Deduplicate
@@ -1511,7 +2165,7 @@ class Observatory {
           if (data && data.status === 'ok') {
             const wsProto = base.startsWith('https') ? 'wss:' : 'ws:';
             const urlObj = new URL(base);
-            const wsUrl = `${wsProto}//${urlObj.host}/ws/sensing`;
+            const wsUrl = `${wsProto}//${urlObj.host}/ws/pose`;
             console.log('[Observatory] Sensing server detected at', base, '→', wsUrl);
             this.settings.dataSource = 'ws';
             this.settings.wsUrl = wsUrl;
@@ -1525,13 +2179,25 @@ class Observatory {
     tryNext(0);
   }
 
+  _autoDetectLive() {
+    const candidates = this._poseWsCandidates();
+    const url = candidates[this._wsCandidateIndex % candidates.length];
+    this._wsCandidateIndex += 1;
+    this.settings.dataSource = 'ws';
+    this.settings.wsUrl = url;
+    this._setSceneStatus('connecting', 'En attente du serveur...');
+    this._hud.updateSourceBadge('connecting', null);
+    this._connectWS(url);
+  }
+
   _connectWS(url) {
     this._disconnectWS();
     try {
       this._ws = new WebSocket(url);
       this._ws.onopen = () => {
-        console.log('[Observatory] WebSocket connected');
-        this._hud.updateSourceBadge('live', this._ws);
+        console.log('[Observatory] WebSocket connected:', url);
+        this._setSceneStatus('connecting', 'En attente du serveur...');
+        this._hud.updateSourceBadge('connecting', this._ws);
       };
       this._ws.onmessage = (evt) => {
         try {
@@ -1539,13 +2205,18 @@ class Observatory {
         } catch {}
       };
       this._ws.onclose = () => {
-        console.log('[Observatory] WebSocket closed; stream offline');
+        console.log('[Observatory] WebSocket closed; retrying pose stream');
         this._ws = null;
-        this._hud.updateSourceBadge('offline', null);
+        this._setSceneStatus('connecting', 'En attente du serveur...');
+        this._hud.updateSourceBadge('connecting', null);
         this._scheduleReconnect();
       };
       this._ws.onerror = () => {};
-    } catch {}
+    } catch {
+      this._setSceneStatus('connecting', 'En attente du serveur...');
+      this._hud.updateSourceBadge('connecting', null);
+      this._scheduleReconnect();
+    }
   }
 
   _scheduleReconnect() {
@@ -1557,15 +2228,23 @@ class Observatory {
   }
 
   _disconnectWS() {
-    if (this._ws) { this._ws.close(); this._ws = null; }
+    if (this._ws) {
+      this._ws.onclose = null;
+      this._ws.close();
+      this._ws = null;
+    }
     this._liveData = null;
     this._personMotionFilters.clear();
+    this._syncRoomConfigNodes(null);
+    this._updatePresenceSilhouettes(null, 0);
   }
 
   _emptyLiveFrame() {
     return {
       msg_type: 'sensing_update',
-      source: 'offline',
+      source: this._connectionState || 'connecting',
+      system_status: this._connectionState || 'connecting',
+      node_count: 0,
       nodes: this._mergeNodes(null),
       persons: [],
       estimated_persons: 0,
@@ -1605,6 +2284,8 @@ class Observatory {
     this._updateDotMatrixMist(data, elapsed);
     this._updateParticleTrail(data, dt, elapsed);
     this._syncTopology(data);
+    this._syncRoomConfigNodes(data);
+    this._updatePresenceSilhouettes(data, elapsed);
     this._updateWifiWaves(elapsed);
     this._updateSignalField(data);
     this._hud.updateHUD(data);

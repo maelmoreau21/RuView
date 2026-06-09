@@ -337,8 +337,13 @@ export class HudController {
   updateSourceBadge(status, ws) {
     const dot = document.querySelector('#data-source-badge .dot');
     const label = document.getElementById('data-source-label');
+    if (!dot || !label) return;
     if (status === 'live') {
       dot.className = 'dot dot--live'; label.textContent = 'LIVE';
+    } else if (status === 'connecting') {
+      dot.className = 'dot dot--degraded'; label.textContent = 'CONNECTING';
+    } else if (status === 'no_nodes') {
+      dot.className = 'dot dot--offline'; label.textContent = 'NO NODES';
     } else if (status === 'degraded') {
       dot.className = 'dot dot--degraded'; label.textContent = 'DEGRADED';
     } else {

@@ -1599,7 +1599,7 @@ fn position_json(position: [f64; 3], source: &str, confidence: f64) -> serde_jso
         "y": position[1],
         "z": position[2],
         "source": source,
-        "confidence": confidence.clamp(0.0, 1.0),
+        "confidence": clamp_unit(confidence),
     })
 }
 
@@ -4698,6 +4698,336 @@ async fn handle_ws_client(mut socket: WebSocket, state: SharedState) {
     }
 
     info!("WebSocket client disconnected (sensing)");
+}
+
+async fn ws_presence_pose_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_presence_pose_client(socket, state))
+}
+
+async fn handle_presence_pose_client(mut socket: WebSocket, state: SharedState) {
+    info!("WebSocket client connected (presence pose)");
+
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let payload = {
+                    let s = state.read().await;
+                    presence_update_payload(&s, std::time::Instant::now())
+                };
+                if socket.send(Message::Text(payload.to_string())).await.is_err() {
+                    break;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    info!("WebSocket client disconnected (presence pose)");
+}
+
+async fn ws_vitals_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_vitals_client(socket, state))
+}
+
+async fn handle_vitals_client(mut socket: WebSocket, state: SharedState) {
+    info!("WebSocket client connected (vitals)");
+
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let payload = {
+                    let s = state.read().await;
+                    vitals_update_payload(&s, std::time::Instant::now())
+                };
+                if socket.send(Message::Text(payload.to_string())).await.is_err() {
+                    break;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    info!("WebSocket client disconnected (vitals)");
+}
+
+fn presence_update_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::Value {
+    let node_count = active_node_count(s, now);
+    let system_status = if node_count == 0 { "no_nodes" } else { "live" };
+    let persons = if node_count == 0 {
+        Vec::new()
+    } else {
+        presence_persons(s, now)
+    };
+
+    serde_json::json!({
+        "type": "presence_update",
+        "timestamp_ms": unix_timestamp_ms(),
+        "persons": persons,
+        "node_count": node_count,
+        "system_status": system_status,
+    })
+}
+
+fn presence_persons(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_json::Value> {
+    let Some(update) = s.latest_update.as_ref() else {
+        return Vec::new();
+    };
+    if !update.classification.presence {
+        return Vec::new();
+    }
+
+    let breathing_bpm = update
+        .vital_signs
+        .as_ref()
+        .and_then(|vitals| vitals.breathing_rate_bpm)
+        .or(s.latest_vitals.breathing_rate_bpm)
+        .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.breathing_rate_bpm))
+        .unwrap_or(0.0);
+    let heart_rate_bpm = update
+        .vital_signs
+        .as_ref()
+        .and_then(|vitals| vitals.heart_rate_bpm)
+        .or(s.latest_vitals.heart_rate_bpm)
+        .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.heartrate_bpm))
+        .unwrap_or(0.0);
+    let motion_energy = current_motion_energy(s, update, now);
+
+    if let Some(tracking) = update.state.as_ref() {
+        return tracking
+            .persons
+            .iter()
+            .map(|person| {
+                presence_person_json(
+                    person.id,
+                    person.position_m[0],
+                    person.position_m[2],
+                    person.confidence,
+                    breathing_bpm,
+                    heart_rate_bpm,
+                    true,
+                    motion_energy,
+                )
+            })
+            .collect();
+    }
+
+    if let Some(persons) = update.persons.as_ref() {
+        let converted: Vec<_> = persons
+            .iter()
+            .filter_map(|person| {
+                let position = person.position_m.or(person.position)?;
+                Some(presence_person_json(
+                    person.id,
+                    position[0],
+                    position[2],
+                    person.confidence,
+                    breathing_bpm,
+                    heart_rate_bpm,
+                    true,
+                    motion_energy,
+                ))
+            })
+            .collect();
+        if !converted.is_empty() {
+            return converted;
+        }
+    }
+
+    let timestamp_ms = unix_timestamp_ms();
+    localization_snapshot(s, now, timestamp_ms)
+        .0
+        .map(|location| {
+            vec![presence_person_json(
+                1,
+                location.x as f64,
+                location.y as f64,
+                location.confidence as f64,
+                breathing_bpm,
+                heart_rate_bpm,
+                true,
+                motion_energy,
+            )]
+        })
+        .unwrap_or_default()
+}
+
+fn presence_person_json(
+    id: u32,
+    x: f64,
+    y: f64,
+    confidence: f64,
+    breathing_bpm: f64,
+    heart_rate_bpm: f64,
+    is_present: bool,
+    motion_energy: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "x": finite_or_zero(x),
+        "y": finite_or_zero(y),
+        "confidence": clamp_unit(confidence),
+        "breathing_bpm": finite_or_zero(breathing_bpm),
+        "heart_rate_bpm": finite_or_zero(heart_rate_bpm),
+        "is_present": is_present,
+        "motion_energy": clamp_unit(motion_energy),
+    })
+}
+
+fn current_motion_energy(
+    s: &AppStateInner,
+    update: &SensingUpdate,
+    now: std::time::Instant,
+) -> f64 {
+    let edge_energy = s
+        .node_states
+        .values()
+        .filter(|node| is_node_active(node, now))
+        .filter_map(|node| node.edge_vitals.as_ref().map(|vitals| vitals.motion_energy as f64))
+        .filter(|energy| energy.is_finite())
+        .fold(0.0_f64, f64::max);
+    if edge_energy > 0.0 {
+        return edge_energy.clamp(0.0, 1.0);
+    }
+
+    let smoothed = s
+        .node_states
+        .values()
+        .filter(|node| is_node_active(node, now))
+        .map(|node| node.smoothed_motion)
+        .filter(|energy| energy.is_finite())
+        .fold(s.smoothed_motion, f64::max);
+    if smoothed > 0.0 {
+        return smoothed.clamp(0.0, 1.0);
+    }
+
+    normalize_motion_energy(update.features.motion_band_power)
+}
+
+fn vitals_update_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::Value {
+    let node_count = active_node_count(s, now);
+    let system_status = if node_count == 0 { "no_nodes" } else { "live" };
+    let mut nodes: Vec<serde_json::Value> = s
+        .node_states
+        .iter()
+        .map(|(&node_id, node)| node_vitals_json(node_id, node, now))
+        .collect();
+    nodes.sort_by_key(|node| node.get("node_id").and_then(|id| id.as_u64()).unwrap_or(0));
+
+    serde_json::json!({
+        "type": "vitals_update",
+        "timestamp_ms": unix_timestamp_ms(),
+        "node_count": node_count,
+        "system_status": system_status,
+        "nodes": nodes,
+    })
+}
+
+fn node_vitals_json(node_id: u8, node: &NodeState, now: std::time::Instant) -> serde_json::Value {
+    let active = is_node_active(node, now);
+    let last_seen_ms = node
+        .last_frame_time
+        .map(|last| now.saturating_duration_since(last).as_millis() as u64);
+    let edge = node.edge_vitals.as_ref();
+    let breathing_rate_bpm = edge
+        .map(|vitals| vitals.breathing_rate_bpm)
+        .or(node.latest_vitals.breathing_rate_bpm)
+        .unwrap_or(0.0);
+    let heart_rate_bpm = edge
+        .map(|vitals| vitals.heartrate_bpm)
+        .or(node.latest_vitals.heart_rate_bpm)
+        .unwrap_or(0.0);
+    let motion_energy = edge
+        .map(|vitals| vitals.motion_energy as f64)
+        .unwrap_or_else(|| node.smoothed_motion);
+    let presence_score = edge
+        .map(|vitals| vitals.presence_score as f64)
+        .unwrap_or_else(|| node_presence_confidence(node));
+    let is_present = edge
+        .map(|vitals| vitals.presence)
+        .unwrap_or_else(|| node_supports_presence(node, now));
+
+    serde_json::json!({
+        "node_id": node_id,
+        "active": active,
+        "is_present": is_present,
+        "presence": is_present,
+        "presence_score": clamp_unit(presence_score),
+        "fall_detected": edge.map(|vitals| vitals.fall_detected).unwrap_or(false),
+        "motion": edge.map(|vitals| vitals.motion).unwrap_or_else(|| node.smoothed_motion > 0.03),
+        "motion_energy": normalize_motion_energy(motion_energy),
+        "breathing_rate_bpm": finite_or_zero(breathing_rate_bpm),
+        "breathing_bpm": finite_or_zero(breathing_rate_bpm),
+        "heart_rate_bpm": finite_or_zero(heart_rate_bpm),
+        "heartrate_bpm": finite_or_zero(heart_rate_bpm),
+        "breathing_confidence": clamp_unit(node.latest_vitals.breathing_confidence),
+        "heartbeat_confidence": clamp_unit(node.latest_vitals.heartbeat_confidence),
+        "signal_quality": clamp_unit(node.latest_vitals.signal_quality),
+        "rssi_dbm": node.rssi_history.back().copied(),
+        "n_persons": edge.map(|vitals| vitals.n_persons).unwrap_or(node.prev_person_count as u8),
+        "frame_rate_hz": node.csi_fps_ema,
+        "last_seen_ms": last_seen_ms,
+        "last_csi_ms": age_ms(now, node.last_csi_time),
+        "last_vitals_ms": age_ms(now, node.last_vitals_time),
+        "source": if edge.is_some() { "edge_vitals" } else { "csi" },
+        "esp32_timestamp_ms": edge.map(|vitals| vitals.timestamp_ms),
+    })
+}
+
+fn normalize_motion_energy(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    if value <= 1.0 {
+        value.max(0.0)
+    } else {
+        (value / 100.0).clamp(0.0, 1.0)
+    }
+}
+
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn clamp_unit(value: f64) -> f64 {
+    finite_or_zero(value).clamp(0.0, 1.0)
 }
 
 // ── ADR-099: real-time CSI introspection — WS topic + REST snapshot ──────────
@@ -12111,6 +12441,8 @@ async fn main() {
     let ws_state = state.clone();
     let ws_app = Router::new()
         .route("/ws/sensing", get(ws_sensing_handler))
+        .route("/ws/pose", get(ws_presence_pose_handler))
+        .route("/ws/vitals", get(ws_vitals_handler))
         .route("/health", get(health))
         .layer(axum::middleware::from_fn_with_state(
             host_allowlist.clone(),
@@ -12197,6 +12529,8 @@ async fn main() {
         .route("/api/v1/stream/pose", get(ws_pose_handler))
         // Sensing WebSocket on the HTTP port so the UI can reach it without a second port
         .route("/ws/sensing", get(ws_sensing_handler))
+        .route("/ws/pose", get(ws_presence_pose_handler))
+        .route("/ws/vitals", get(ws_vitals_handler))
         // ADR-099: real-time introspection — per-frame attractor + DTW snapshot.
         .route("/ws/introspection", get(ws_introspection_handler))
         .route(

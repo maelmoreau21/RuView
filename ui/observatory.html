@@ -8,6 +8,7 @@
 </head>
 <body>
   <canvas id="observatory-canvas"></canvas>
+  <div id="scene-status-overlay" class="scene-status-overlay scene-status-overlay--connecting">En attente du serveur...</div>
 
   <!-- ======= HUD Overlay ======= -->
   <div id="hud">
@@ -33,6 +34,7 @@
         <input id="object-detection-toggle" type="checkbox" role="switch">
         <i aria-hidden="true"></i>
       </label>
+      <button id="room-config-btn" class="topbar-btn" type="button">Config pièce</button>
       <button id="settings-btn" title="Settings">&#9881;</button>
     </div>
 
@@ -312,12 +314,34 @@
         </label>
         <div class="setting-row readonly-row">
           <span>Live stream</span>
-          <span id="live-stream-url">/ws/sensing</span>
+          <span id="live-stream-url">/ws/pose</span>
         </div>
         <button id="btn-reset-camera" class="settings-btn">Reset Camera</button>
         <button id="btn-reset-settings" class="settings-btn">Reset to Defaults</button>
         <button id="btn-export-settings" class="settings-btn">Export Settings</button>
       </div>
+    </div>
+  </div>
+
+  <div id="room-config-panel" class="room-config-panel" hidden>
+    <div class="room-config-header">
+      <span>Config pièce</span>
+      <button id="room-config-close" type="button" aria-label="Fermer">&times;</button>
+    </div>
+    <div class="room-config-body">
+      <label class="room-config-field">
+        <span>Largeur (m)</span>
+        <input id="room-width-input" type="number" min="1" max="30" step="0.1">
+      </label>
+      <label class="room-config-field">
+        <span>Hauteur plan (m)</span>
+        <input id="room-height-input" type="number" min="1" max="30" step="0.1">
+      </label>
+      <div id="room-node-fields" class="room-node-fields"></div>
+    </div>
+    <div class="room-config-actions">
+      <button id="room-config-apply" type="button">Appliquer</button>
+      <button id="room-config-reset" type="button">Réinitialiser</button>
     </div>
   </div>
 

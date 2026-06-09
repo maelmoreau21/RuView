@@ -54,6 +54,36 @@ body {
   width: 100vw; height: 100vh;
 }
 
+.scene-status-overlay {
+  position: fixed;
+  left: 50%;
+  top: 82px;
+  z-index: 25;
+  transform: translateX(-50%);
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 12px 18px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 176, 32, 0.45);
+  background: rgba(8, 16, 28, 0.92);
+  color: #ffe4ad;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  pointer-events: none;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.34);
+}
+
+.scene-status-overlay[hidden] {
+  display: none;
+}
+
+.scene-status-overlay--no-nodes {
+  border-color: rgba(255, 48, 64, 0.58);
+  background: rgba(64, 8, 14, 0.9);
+  color: #ffb3ba;
+}
+
 /* ---- HUD Overlay ---- */
 #hud {
   position: fixed;
@@ -714,24 +744,152 @@ body.hud-right-collapsed .panel-collapse--right {
   border: 1px solid rgba(255,255,255,0.05);
 }
 
-/* ---- Settings button ---- */
+/* ---- Top bar buttons ---- */
+.topbar-btn,
 #settings-btn {
   pointer-events: auto;
   background: rgba(255,255,255,0.06);
   border: 1px solid rgba(255,255,255,0.1);
   color: var(--text-secondary);
-  font-size: 18px;
-  width: 34px; height: 34px;
-  border-radius: 50%;
   cursor: pointer;
   transition: all 0.2s;
   display: flex; align-items: center; justify-content: center;
   padding: 0;
 }
+
+.topbar-btn {
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+#settings-btn {
+  font-size: 18px;
+  width: 34px; height: 34px;
+  border-radius: 50%;
+}
+
+.topbar-btn:hover,
 #settings-btn:hover {
   background: rgba(0, 216, 120, 0.15);
   border-color: var(--green-glow);
   color: var(--green-glow);
+}
+
+.room-config-panel {
+  position: fixed;
+  top: 76px;
+  right: 28px;
+  z-index: 110;
+  width: min(360px, calc(100vw - 32px));
+  max-height: calc(100vh - 104px);
+  overflow-y: auto;
+  border: 1px solid rgba(0, 216, 120, 0.24);
+  border-radius: 8px;
+  background: rgba(10, 16, 28, 0.97);
+  color: var(--text-primary);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.55), 0 0 32px rgba(0,216,120,0.06);
+  pointer-events: auto;
+}
+
+.room-config-panel[hidden] {
+  display: none;
+}
+
+.room-config-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.room-config-header button {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 22px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.room-config-header button:hover {
+  color: var(--red-alert);
+}
+
+.room-config-body {
+  padding: 14px 16px 8px;
+}
+
+.room-config-field,
+.room-node-field {
+  display: grid;
+  grid-template-columns: 1fr minmax(84px, 112px);
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.room-node-field {
+  grid-template-columns: 1fr 72px 72px;
+}
+
+.room-config-field input,
+.room-node-field input {
+  min-width: 0;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  background: #0c1420;
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+  padding: 6px 8px;
+}
+
+.room-node-fields {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255,255,255,0.07);
+}
+
+.room-node-title {
+  margin-bottom: 8px;
+  color: var(--text-label);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.room-config-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 0 16px 16px;
+}
+
+.room-config-actions button {
+  min-height: 34px;
+  border: 1px solid rgba(0, 216, 120, 0.24);
+  border-radius: 6px;
+  background: rgba(0, 216, 120, 0.08);
+  color: var(--green-glow);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.room-config-actions button:hover {
+  border-color: var(--green-glow);
+  background: rgba(0, 216, 120, 0.15);
 }
 
 /* ---- Settings Dialog ---- */
