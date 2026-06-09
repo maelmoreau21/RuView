@@ -24,6 +24,7 @@ mod vital_signs;
 
 // Training pipeline modules (exposed via lib.rs)
 use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, trainer};
+use wifi_densepose_sensing_server::localization::{self, NodePosition, PersonLocation};
 
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1052,6 +1053,83 @@ fn active_node_count(s: &AppStateInner, now: std::time::Instant) -> usize {
         .values()
         .filter(|ns| is_node_active(ns, now))
         .count()
+}
+
+const LOCATION_RECENT_WINDOW: Duration = Duration::from_secs(2);
+
+fn unix_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn localization_node_positions(env: &EnvironmentConfig) -> Vec<NodePosition> {
+    let mut positions: Vec<NodePosition> = env
+        .nodes
+        .iter()
+        .map(|node| NodePosition {
+            node_id: node.node_id,
+            x: node.position_m[0] as f32,
+            y: node.position_m[2] as f32,
+        })
+        .collect();
+    if positions.is_empty() {
+        positions = localization::node_positions_from_env();
+    }
+    positions.sort_by_key(|position| position.node_id);
+    positions
+}
+
+fn recent_location_rssi(s: &AppStateInner, now: std::time::Instant) -> Vec<(u8, f32)> {
+    let mut readings: Vec<(u8, f32)> = s
+        .node_states
+        .iter()
+        .filter_map(|(&node_id, ns)| {
+            let last_csi = ns.last_csi_time?;
+            if now.saturating_duration_since(last_csi) > LOCATION_RECENT_WINDOW {
+                return None;
+            }
+            let rssi = *ns.rssi_history.back()? as f32;
+            rssi.is_finite().then_some((node_id, rssi))
+        })
+        .collect();
+    readings.sort_by_key(|(node_id, _)| *node_id);
+    readings
+}
+
+fn localization_snapshot(
+    s: &AppStateInner,
+    now: std::time::Instant,
+    timestamp_ms: u64,
+) -> (Option<PersonLocation>, usize, Vec<NodePosition>) {
+    let positions = localization_node_positions(&s.environment);
+    let readings = recent_location_rssi(s, now);
+    let node_count = localization::locatable_node_count(&readings, &positions);
+    let location =
+        localization::estimate_person_location_with_positions(&readings, &positions, timestamp_ms);
+    (location, node_count, positions)
+}
+
+fn location_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::Value {
+    let timestamp_ms = unix_timestamp_ms();
+    let (location, node_count, node_positions) = localization_snapshot(s, now, timestamp_ms);
+    let persons: Vec<serde_json::Value> = location
+        .map(|loc| {
+            vec![serde_json::json!({
+                "x": loc.x,
+                "y": loc.y,
+                "confidence": loc.confidence,
+            })]
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "persons": persons,
+        "node_count": node_count,
+        "timestamp_ms": timestamp_ms,
+        "nodes": node_positions,
+    })
 }
 
 fn record_pose_latency(s: &mut AppStateInner, started: std::time::Instant) {
@@ -6517,6 +6595,7 @@ async fn api_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
             "pose_estimation": true,
             "signal_processing": true,
             "ruvector": true,
+            "localization": true,
             "streaming": true,
         }
     }))
@@ -7460,10 +7539,17 @@ fn chrono_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+async fn location_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    Json(location_payload(&s, std::time::Instant::now()))
+}
+
 async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let vs = &s.latest_vitals;
     let (br_len, br_cap, hb_len, hb_cap) = s.vital_detector.buffer_status();
+    let timestamp_ms = unix_timestamp_ms();
+    let (location, _, _) = localization_snapshot(&s, std::time::Instant::now(), timestamp_ms);
     Json(serde_json::json!({
         "vital_signs": {
             "breathing_rate_bpm": vs.breathing_rate_bpm,
@@ -7478,6 +7564,7 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
             "heartbeat_samples": hb_len,
             "heartbeat_capacity": hb_cap,
         },
+        "location": location,
         "source": s.effective_source(),
         "tick": s.tick,
     }))
@@ -10408,6 +10495,29 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         let count_evidence =
             apply_room_presence_continuity(&mut s, &mut classification, est_persons, now);
         let rendered_persons = count_evidence.rendered_persons;
+        {
+            let ns = s
+                .node_states
+                .entry(frame.node_id)
+                .or_insert_with(|| NodeState::new_for_node(frame.node_id));
+            ns.observe_csi_frame_arrival(now);
+            ns.update_novelty(&frame.amplitudes);
+            ns.frame_history.push_back(frame.amplitudes.clone());
+            if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
+                ns.frame_history.pop_front();
+            }
+            ns.rssi_history.push_back(features.mean_rssi);
+            if ns.rssi_history.len() > 60 {
+                ns.rssi_history.pop_front();
+            }
+            ns.latest_vitals = vitals.clone();
+            ns.last_vitals_time = Some(now);
+            ns.latest_features = Some(features.clone());
+            ns.current_motion_level = classification.motion_level.clone();
+            ns.prev_person_count = rendered_persons;
+            ns.update_tensor_compression(&frame.amplitudes, &frame.phases);
+        }
+        let node_features = build_node_features(&s.node_states, now);
 
         let mut update = SensingUpdate {
             msg_type: "sensing_update".to_string(),
@@ -10415,7 +10525,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             source: "simulated".to_string(),
             tick,
             nodes: vec![NodeInfo {
-                node_id: 1,
+                node_id: frame.node_id,
                 rssi_dbm: features.mean_rssi,
                 position: [2.0, 0.0, 1.5],
                 amplitude: frame_amplitudes,
@@ -10457,7 +10567,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 None
             },
             count_evidence: Some(count_evidence),
-            node_features: None,
+            node_features,
         };
 
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
@@ -11816,6 +11926,7 @@ async fn main() {
         .route("/api/v1/mesh", get(mesh_endpoint))
         .route("/api/v1/mesh/metrics", get(mesh_metrics_endpoint))
         // Vital sign endpoints
+        .route("/api/v1/location", get(location_endpoint))
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
         // ADR-102: Edge Module Registry — surfaces the canonical Cognitum cog

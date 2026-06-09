@@ -78,6 +78,14 @@
         <span id="auto-placement-status">auto placement --</span>
       </div>
 
+      <div class="location-plan-panel" aria-label="Localisation RSSI 2D">
+        <div class="location-plan-head">
+          <strong>Localisation RSSI</strong>
+          <span id="location-plan-summary">position --</span>
+        </div>
+        <svg id="location-plan" class="location-plan-svg" role="img" aria-label="Plan 2D de la piece avec noeuds et personne"></svg>
+      </div>
+
       <div class="placement-toolbar" aria-label="Placement manuel des nœuds">
         <div class="placement-detail">
           <strong id="placement-selected">Aucun nœud sélectionné</strong>
@@ -169,6 +177,7 @@
           <div><dt>Personnes</dt><dd id="person-count">0</dd></div>
           <div><dt>Posture</dt><dd id="posture-state">masquee</dd></div>
           <div><dt>Mouvement</dt><dd id="motion-level">unknown</dd></div>
+          <div><dt>Localisation</dt><dd id="location-vitals">--</dd></div>
           <div><dt>Respiration</dt><dd id="breathing-rate">--</dd></div>
           <div><dt>Cœur</dt><dd id="heart-rate">--</dd></div>
           <div><dt>Qualité signal</dt><dd id="signal-quality">--</dd></div>
@@ -223,6 +232,7 @@
           <a href="/ui/pose-fusion.html">Pose Fusion</a>
           <a href="/metrics">Métriques</a>
           <a href="/health/ready">Santé ready</a>
+          <a href="/api/v1/location">Localisation JSON</a>
           <a href="/api/v1/nodes">Nœuds JSON</a>
           <a href="/api/v1/topology">Topologie JSON</a>
           <a href="/api/v1/modules">Modules JSON</a>

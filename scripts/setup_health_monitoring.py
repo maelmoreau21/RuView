@@ -32,6 +32,12 @@ DEFAULT_CONFIG = {
 
 MODULE_LOAD_PLAN = [
     {
+        # Filter first so noisy occupied-room multipath is gated before downstream health modules.
+        "requested_id": "coherence-gate",
+        "priority": 0,
+        "runtime_ids": ["coherence_gate", "coherence-gate"],
+    },
+    {
         "requested_id": "health-monitor",
         "priority": 1,
         "runtime_ids": ["health_monitor", "respiration_tracking", "fall_detection"],

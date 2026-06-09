@@ -16,6 +16,7 @@ pub mod embedding;
 pub mod graph_transformer;
 pub mod host_validation;
 pub mod introspection;
+pub mod localization;
 pub mod matter;
 pub mod mqtt;
 pub mod path_safety;

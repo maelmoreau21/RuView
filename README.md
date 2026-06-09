@@ -134,6 +134,22 @@ To run it with Docker Compose, enable the optional profile. The script container
 docker compose -f docker/compose.yml --profile health-monitoring up -d --build
 ```
 
+### Réduire les faux positifs
+
+Dans une pièce non vide, activez d'abord le filtre de cohérence avec le monitoring, puis calibrez la zone ciblée depuis le master RuvSense.
+
+```bash
+python -m pip install requests
+python scripts/setup_health_monitoring.py
+python scripts/calibrate_room.py
+```
+
+Si la zone est vide, `calibrate_room.py` lance une recalibration de 30 secondes. Si la pièce reste occupée, il applique le mode pièce occupée et augmente le seuil de présence de 40% via `/api/v1/config/presence-threshold`. Pour ajuster le seuil global au démarrage sans recompiler, définissez `PRESENCE_THRESHOLD_MULTIPLIER` puis redémarrez le master.
+
+```bash
+PRESENCE_THRESHOLD_MULTIPLIER=1.4 docker compose -f docker/compose.yml up -d --build --force-recreate ruvsense-master
+```
+
 > [!NOTE]
 > **Live CSI hardware required for production.** Presence, vital signs, through-wall sensing, and advanced modules require Channel State Information (CSI) from ESP32 hardware. One ESP32-C6 node is enough to bring the Console online; 3+ nodes improve multistatic modules and confidence. RuvSense Edge never substitutes simulated data when the fleet is offline. Use `CSI_SOURCE=simulate` with `RUVSENSE_ENABLE_SIMULATION=true` only for explicit development, CI, or deterministic proof checks. Consumer WiFi laptops provide RSSI-only presence detection.
 

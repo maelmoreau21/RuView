@@ -451,6 +451,79 @@ h3 {
   white-space: nowrap;
 }
 
+.location-plan-panel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--bg-1);
+  padding: 8px;
+}
+
+.location-plan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.location-plan-head strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.location-plan-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.location-plan-svg {
+  width: 100%;
+  min-height: 180px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background:
+    linear-gradient(90deg, rgba(92, 200, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(0deg, rgba(92, 200, 255, 0.05) 1px, transparent 1px),
+    #08120f;
+  background-size: 36px 36px;
+}
+
+.location-room {
+  fill: rgba(57, 209, 143, 0.035);
+  stroke: rgba(57, 209, 143, 0.42);
+  stroke-width: 2;
+}
+
+.location-node {
+  fill: var(--green);
+  stroke: rgba(255, 255, 255, 0.75);
+  stroke-width: 2;
+}
+
+.location-node-label,
+.location-person-label {
+  fill: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.location-person-cross {
+  stroke: var(--magenta);
+  stroke-width: 4;
+  stroke-linecap: round;
+}
+
+.location-person-ring {
+  fill: rgba(215, 131, 255, 0.14);
+  stroke: rgba(215, 131, 255, 0.46);
+  stroke-width: 2;
+}
+
 .topology-stage::after {
   content: "X horizontal / Z profondeur";
   position: absolute;

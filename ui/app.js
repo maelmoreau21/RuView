@@ -2,6 +2,7 @@ const state = {
   topology: null,
   modules: [],
   vitals: null,
+  location: null,
   edgeVitals: null,
   calibration: null,
   pose: null,
@@ -597,12 +598,178 @@ function vectorPosition(value) {
   return null;
 }
 
+function locationPerson() {
+  const persons = Array.isArray(state.location?.persons) ? state.location.persons : [];
+  const source = persons.length ? persons[0] : state.vitals?.location;
+  if (!source || typeof source !== 'object') return null;
+  const x = Number(source.x);
+  const y = Number(source.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return {
+    x,
+    y,
+    confidence: Number(source.confidence ?? 0),
+    timestamp_ms: Number(source.timestamp_ms ?? state.location?.timestamp_ms ?? 0),
+  };
+}
+
+function locationNodePositions() {
+  const locationNodes = Array.isArray(state.location?.nodes) ? state.location.nodes : [];
+  if (locationNodes.length) {
+    return locationNodes
+      .map((node) => ({
+        node_id: Number(node.node_id),
+        x: Number(node.x),
+        y: Number(node.y),
+      }))
+      .filter((node) => Number.isFinite(node.node_id) && Number.isFinite(node.x) && Number.isFinite(node.y));
+  }
+
+  const topologyNodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  return topologyNodes
+    .map((node) => {
+      const pos = currentNodePosition(node);
+      return {
+        node_id: nodeIdOf(node),
+        x: Number(pos.x),
+        y: Number(pos.z),
+      };
+    })
+    .filter((node) => Number.isFinite(node.node_id) && Number.isFinite(node.x) && Number.isFinite(node.y));
+}
+
+function locationBounds(points) {
+  const [width, , depth] = roomDims();
+  const hasNegative = points.some((point) => point.x < -0.001 || point.y < -0.001);
+  return hasNegative
+    ? { minX: -width / 2, maxX: width / 2, minY: -depth / 2, maxY: depth / 2 }
+    : { minX: 0, maxX: width, minY: 0, maxY: depth };
+}
+
+function projectLocationPoint(point, bounds, rect) {
+  const spanX = Math.max(0.001, bounds.maxX - bounds.minX);
+  const spanY = Math.max(0.001, bounds.maxY - bounds.minY);
+  return {
+    x: rect.x + clamp((point.x - bounds.minX) / spanX, 0, 1) * rect.width,
+    y: rect.y + rect.height - clamp((point.y - bounds.minY) / spanY, 0, 1) * rect.height,
+  };
+}
+
+function svgEl(tag, attrs = {}) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value !== undefined && value !== null) el.setAttribute(key, String(value));
+  }
+  return el;
+}
+
+function renderLocationPlan() {
+  const svg = $('#location-plan');
+  if (!svg) return;
+  svg.replaceChildren();
+  svg.setAttribute('viewBox', '0 0 360 220');
+  const rect = { x: 22, y: 20, width: 316, height: 170 };
+  const nodes = locationNodePositions();
+  const person = locationPerson();
+  const points = [...nodes, ...(person ? [person] : [])];
+
+  svg.append(svgEl('rect', {
+    class: 'location-room',
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    rx: 6,
+  }));
+
+  if (!points.length) {
+    const empty = svgEl('text', {
+      x: rect.x + rect.width / 2,
+      y: rect.y + rect.height / 2,
+      fill: 'currentColor',
+      'text-anchor': 'middle',
+      class: 'location-node-label',
+    });
+    empty.textContent = 'Aucune position RSSI';
+    svg.append(empty);
+    setText('location-plan-summary', 'position --');
+    return;
+  }
+
+  const bounds = locationBounds(points);
+  for (const node of nodes) {
+    const point = projectLocationPoint(node, bounds, rect);
+    const label = svgEl('text', {
+      class: 'location-node-label',
+      x: point.x + 10,
+      y: point.y - 8,
+    });
+    label.textContent = `N${node.node_id}`;
+    svg.append(
+      svgEl('circle', {
+        class: 'location-node',
+        cx: point.x,
+        cy: point.y,
+        r: 6,
+      }),
+      label,
+    );
+  }
+
+  if (person) {
+    const point = projectLocationPoint(person, bounds, rect);
+    const radius = clamp((1 - clamp(person.confidence, 0, 1)) * 34 + 14, 14, 48);
+    const label = svgEl('text', {
+      class: 'location-person-label',
+      x: point.x + 12,
+      y: point.y + 18,
+    });
+    label.textContent = `P ${fmtPct(person.confidence)}`;
+    svg.append(
+      svgEl('circle', {
+        class: 'location-person-ring',
+        cx: point.x,
+        cy: point.y,
+        r: radius,
+      }),
+      svgEl('line', {
+        class: 'location-person-cross',
+        x1: point.x - 8,
+        y1: point.y - 8,
+        x2: point.x + 8,
+        y2: point.y + 8,
+      }),
+      svgEl('line', {
+        class: 'location-person-cross',
+        x1: point.x + 8,
+        y1: point.y - 8,
+        x2: point.x - 8,
+        y2: point.y + 8,
+      }),
+      label,
+    );
+    setText('location-plan-summary', `x ${person.x.toFixed(2)} / y ${person.y.toFixed(2)} / ${fmtPct(person.confidence)}`);
+  } else {
+    setText('location-plan-summary', `${nodes.length} noeud(s), position --`);
+  }
+}
+
 function primaryPerson() {
   const persons = Array.isArray(state.latest?.persons) ? state.latest.persons : [];
   if (persons.length) return persons[0];
   const posePersons = Array.isArray(state.pose?.persons) ? state.pose.persons : [];
   if (posePersons.length) return posePersons[0];
   if (state.pose?.person) return state.pose.person;
+  const loc = locationPerson();
+  if (loc) {
+    return {
+      id: 'rssi-location',
+      confidence: loc.confidence,
+      position_m: [loc.x, 0, loc.y],
+      position_source: 'rssi_localization',
+      pose: 'person',
+    };
+  }
   const count = Number(state.latest?.count_evidence?.rendered_persons ?? state.latest?.estimated_persons ?? 0);
   if (count > 0) {
     return {
@@ -871,6 +1038,7 @@ function renderVitals() {
   const presence = firstDefined(state.latest?.classification?.presence, edge.presence, false);
   const motion = firstDefined(state.latest?.classification?.motion_level, edge.motion ? 'motion' : undefined, 'unknown');
   const persons = firstDefined(state.latest?.count_evidence?.rendered_persons, state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
+  const loc = locationPerson();
   const person = primaryPerson();
   const posture = normalizePoseName(firstDefined(person?.pose, person?.posture, state.latest?.posture, state.pose?.posture));
   const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, edgeVitals.breathing_rate_bpm, vitals.breathing_rate_bpm);
@@ -880,6 +1048,7 @@ function renderVitals() {
   setText('presence-state', presence ? 'présence' : 'absent');
   setText('person-count', String(persons || 0));
   setText('motion-level', text(motion, 'unknown'));
+  setText('location-vitals', loc ? `x ${loc.x.toFixed(2)} / y ${loc.y.toFixed(2)} / ${fmtPct(loc.confidence)}` : '--');
   setText('posture-state', state.vitalsOptIn ? text(posture, '--') : 'masquee');
   setText('breathing-rate', state.vitalsOptIn && breathing ? `${Number(breathing).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
   setText('heart-rate', state.vitalsOptIn && heart ? `${Number(heart).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
@@ -977,6 +1146,7 @@ function renderCalibration() {
 function renderAll() {
   renderStatus();
   renderTopology();
+  renderLocationPlan();
   renderPlacementControls();
   renderFleet();
   renderModules();
@@ -1000,10 +1170,11 @@ function activatePanel(panel, updateHash = false) {
 }
 
 async function refreshRest() {
-  const [topologyResult, modulesResult, vitalsResult, edgeVitalsResult, calibrationResult, poseResult] = await Promise.allSettled([
+  const [topologyResult, modulesResult, vitalsResult, locationResult, edgeVitalsResult, calibrationResult, poseResult] = await Promise.allSettled([
     fetchJson('/api/v1/topology'),
     fetchJson('/api/v1/modules'),
     fetchJson('/api/v1/vital-signs').catch(() => null),
+    fetchJson('/api/v1/location').catch(() => null),
     fetchJson('/api/v1/edge-vitals').catch(() => null),
     fetchJson('/api/v1/calibration').catch(() => null),
     fetchJson('/api/v1/pose/current').catch(() => null),
@@ -1020,6 +1191,7 @@ async function refreshRest() {
     state.modulePresets = modulesResult.value.presets || [];
   }
   if (vitalsResult.status === 'fulfilled') state.vitals = vitalsResult.value;
+  if (locationResult.status === 'fulfilled') state.location = locationResult.value;
   if (edgeVitalsResult.status === 'fulfilled') state.edgeVitals = edgeVitalsResult.value;
   if (calibrationResult.status === 'fulfilled') state.calibration = calibrationResult.value;
   if (poseResult.status === 'fulfilled') state.pose = poseResult.value;
@@ -1041,6 +1213,7 @@ function connectWs() {
     try {
       state.latest = JSON.parse(event.data);
       renderTopology();
+      renderLocationPlan();
       renderVitals();
     } catch (error) {
       logEvent(`Frame sensing invalide: ${error.message}`, 'warn');
@@ -1458,7 +1631,10 @@ function bindActions() {
   window.addEventListener('pointerup', endPlacementPan);
   window.addEventListener('pointercancel', endNodeDrag);
   window.addEventListener('pointercancel', endPlacementPan);
-  window.addEventListener('resize', renderTopology);
+  window.addEventListener('resize', () => {
+    renderTopology();
+    renderLocationPlan();
+  });
   $('#placement-zoom-in')?.addEventListener('click', () => zoomPlacementBy(1.2));
   $('#placement-zoom-out')?.addEventListener('click', () => zoomPlacementBy(1 / 1.2));
   $('#placement-zoom-fit')?.addEventListener('click', fitPlacementViewToNodes);
@@ -1545,6 +1721,12 @@ window.__ruvsenseRenderFixture = (count = 3) => {
     posture: 'standing',
     persons: [{ id: 'fixture-person', pose: count > 1 ? 'standing' : 'sitting', position_m: [0.3, 0.0, 0.4], confidence: 0.72, position_source: 'multistatic' }],
     vital_signs: { breathing_rate_bpm: 13.8, heart_rate_bpm: 72.4, signal_quality: 0.74 },
+  } : null;
+  state.location = count > 0 ? {
+    persons: [{ x: 0.3, y: 0.4, confidence: count >= 3 ? 1.0 : count === 2 ? 0.5 : 0.0 }],
+    node_count: count,
+    timestamp_ms: Date.now(),
+    nodes: nodes.map((node) => ({ node_id: node.node_id, x: node.position.x, y: node.position.z })),
   } : null;
   state.pose = count > 0 ? {
     posture: 'standing',
