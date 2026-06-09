@@ -322,7 +322,7 @@ h3 {
 
 .topology-pane {
   display: grid;
-  grid-template-rows: auto minmax(320px, 1fr) auto auto;
+  grid-template-rows: auto minmax(320px, 1fr) auto auto auto;
   gap: 10px;
   padding: 12px;
   overflow: hidden;
@@ -430,6 +430,27 @@ h3 {
   z-index: 1;
 }
 
+.map-status-band {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.map-status-band span,
+.quality-chip {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--bg-1);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  padding: 6px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .topology-stage::after {
   content: "X horizontal / Z profondeur";
   position: absolute;
@@ -474,6 +495,43 @@ h3 {
 .rf-link.estimated {
   background: rgba(227, 180, 71, 0.55);
   border-top: 1px dashed rgba(227, 180, 71, 0.62);
+}
+
+.rf-link.coverage-weak,
+.rf-link.coverage-offline {
+  background: rgba(255, 107, 100, 0.55);
+  border-top: 1px dashed rgba(255, 107, 100, 0.62);
+}
+
+.coverage-zone {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(92, 200, 255, 0.2);
+  border-radius: 50%;
+  background: rgba(92, 200, 255, 0.045);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.coverage-zone.coverage-strong {
+  border-color: rgba(57, 209, 143, 0.26);
+  background: rgba(57, 209, 143, 0.055);
+}
+
+.coverage-zone.coverage-usable {
+  border-color: rgba(92, 200, 255, 0.25);
+  background: rgba(92, 200, 255, 0.05);
+}
+
+.coverage-zone.coverage-weak {
+  border-color: rgba(227, 180, 71, 0.32);
+  background: rgba(227, 180, 71, 0.055);
+}
+
+.coverage-zone.coverage-offline {
+  border-style: dashed;
+  border-color: rgba(255, 107, 100, 0.22);
+  background: rgba(255, 107, 100, 0.035);
 }
 
 .node-distance-line {
@@ -555,6 +613,46 @@ h3 {
 .topology-marker.is-selected {
   border-color: var(--green);
   box-shadow: 0 0 0 3px rgba(57, 209, 143, 0.16);
+}
+
+.person-uncertainty {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(215, 131, 255, 0.32);
+  border-radius: 50%;
+  background: rgba(215, 131, 255, 0.10);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.person-estimate {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(215, 131, 255, 0.55);
+  border-radius: 999px;
+  background: rgba(18, 12, 24, 0.94);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 900;
+  padding: 5px 8px;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 5;
+}
+
+.person-estimate i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--magenta);
+}
+
+.person-estimate.is-uncertain {
+  border-style: dashed;
+  color: var(--muted);
 }
 
 .topology-marker.estimated {
@@ -704,6 +802,22 @@ h3 {
 
 .side-panel {
   overflow: hidden;
+}
+
+.quality-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.quality-chip.strong {
+  border-color: rgba(57, 209, 143, 0.35);
+  color: var(--green);
+}
+
+.quality-chip.weak {
+  border-color: rgba(227, 180, 71, 0.4);
+  color: var(--amber);
 }
 
 .panel-view {
@@ -917,6 +1031,24 @@ select {
   font-weight: 800;
 }
 
+.privacy-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--bg-1);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  padding: 8px;
+}
+
+.privacy-toggle input {
+  width: 16px;
+  height: 16px;
+}
+
 .action-row,
 .advanced-links {
   display: flex;
@@ -938,6 +1070,22 @@ select {
   gap: 5px;
   color: var(--muted);
   font-size: 11px;
+}
+
+.calibration-guard {
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--bg-1);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  padding: 7px 9px;
+}
+
+#auto-calibration.is-active {
+  border-color: var(--green);
+  background: rgba(57, 209, 143, 0.13);
+  color: var(--text);
 }
 
 .calibration-progress-track {
@@ -1301,12 +1449,16 @@ select {
   }
 
   .topology-pane {
-    grid-template-rows: auto 420px auto auto;
+    grid-template-rows: auto 420px auto auto auto;
   }
 
   .section-head,
   .filter-row {
     grid-template-columns: 1fr;
+  }
+
+  .map-status-band {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .section-head {
@@ -1339,7 +1491,7 @@ select {
   }
 
   .topology-pane {
-    grid-template-rows: auto 360px auto auto;
+    grid-template-rows: auto 360px auto auto auto;
   }
 
   .topology-view-controls {
@@ -1370,6 +1522,10 @@ select {
   }
 
   .placement-inputs {
+    grid-template-columns: 1fr;
+  }
+
+  .map-status-band {
     grid-template-columns: 1fr;
   }
 }

@@ -135,6 +135,7 @@ class Observatory {
     this._lastEdgeVitals = null;
     this._currentScenario = null;
     this._obstacleSummary = null;
+    this._personMotionFilters = new Map();
     this._linkRaycaster = new THREE.Raycaster();
 
     // Build scene
@@ -647,6 +648,115 @@ class Observatory {
     return limit > 0 ? merged.slice(0, limit) : [];
   }
 
+  _sceneTimestampMs(data) {
+    const explicit = this._numberOrNull(data?.timestamp_ms);
+    if (explicit != null) return explicit;
+    const seconds = this._numberOrNull(data?.timestamp);
+    if (seconds != null) return seconds * 1000;
+    return performance.now();
+  }
+
+  _translateKeypoints(keypoints, delta) {
+    if (!Array.isArray(keypoints)) return keypoints;
+    return keypoints.map((point) => {
+      if (Array.isArray(point) && point.length >= 3) {
+        const next = point.slice();
+        next[0] += delta[0];
+        next[1] += delta[1];
+        next[2] += delta[2];
+        return next;
+      }
+      if (point && typeof point === 'object') {
+        return {
+          ...point,
+          x: Number(point.x || 0) + delta[0],
+          y: Number(point.y || 0) + delta[1],
+          z: Number(point.z || 0) + delta[2],
+        };
+      }
+      return point;
+    });
+  }
+
+  _smoothPersonPosition(person, rawPosition, nowMs) {
+    const key = String(person.id);
+    const source = String(person?.position_source || person?.pose_source || '').toLowerCase();
+    if (['observatory_layout', 'count_evidence', 'presence_hold'].includes(source)) {
+      const previous = this._personMotionFilters.get(key);
+      if (previous && nowMs - previous.at <= 1800) {
+        previous.at = nowMs;
+        return previous.position.slice();
+      }
+      this._personMotionFilters.delete(key);
+      return rawPosition;
+    }
+    const confidence = this._personConfidence(person);
+    const previous = this._personMotionFilters.get(key);
+    if (!previous) {
+      this._personMotionFilters.set(key, { position: rawPosition.slice(), at: nowMs });
+      return rawPosition;
+    }
+    const dt = Math.min(0.25, Math.max(1 / 60, (nowMs - previous.at) / 1000 || 1 / 30));
+    const delta = [
+      rawPosition[0] - previous.position[0],
+      rawPosition[1] - previous.position[1],
+      rawPosition[2] - previous.position[2],
+    ];
+    const distance = Math.hypot(delta[0], delta[1], delta[2]);
+    const maxSpeedMps = confidence < 0.55 ? 1.1 : 2.4;
+    const maxStep = Math.max(0.12, maxSpeedMps * dt);
+    let gated = rawPosition;
+    if (distance > maxStep && distance > 0) {
+      const scale = maxStep / distance;
+      gated = [
+        previous.position[0] + delta[0] * scale,
+        previous.position[1] + delta[1] * scale,
+        previous.position[2] + delta[2] * scale,
+      ];
+    }
+    const speed = distance / Math.max(dt, 1 / 60);
+    const alpha = Math.min(0.58, Math.max(0.16, 0.18 + speed * 0.045));
+    const smoothed = [
+      previous.position[0] + (gated[0] - previous.position[0]) * alpha,
+      previous.position[1] + (gated[1] - previous.position[1]) * alpha,
+      previous.position[2] + (gated[2] - previous.position[2]) * alpha,
+    ];
+    this._personMotionFilters.set(key, { position: smoothed.slice(), at: nowMs });
+    return smoothed;
+  }
+
+  _smoothScenePersons(persons, data) {
+    const nowMs = this._sceneTimestampMs(data);
+    const seen = new Set();
+    const smoothed = persons.map((person, index) => {
+      const id = this._personIdentity(person, index);
+      seen.add(id);
+      const rawPosition = this._parseVector3(person.position);
+      if (!rawPosition) return person;
+      const nextPosition = this._smoothPersonPosition({ ...person, id }, rawPosition, nowMs);
+      const delta = [
+        nextPosition[0] - rawPosition[0],
+        nextPosition[1] - rawPosition[1],
+        nextPosition[2] - rawPosition[2],
+      ];
+      return {
+        ...person,
+        id,
+        position: nextPosition,
+        ...(person.position_m ? { position_m: nextPosition } : {}),
+        ...(person.keypoints_m ? { keypoints_m: this._translateKeypoints(person.keypoints_m, delta) } : {}),
+      };
+    });
+    this._prunePersonFilters(seen, nowMs);
+    return smoothed;
+  }
+
+  _prunePersonFilters(seen, nowMs) {
+    for (const [key, filter] of this._personMotionFilters) {
+      if (!seen.has(key) || nowMs - filter.at > 2500) this._personMotionFilters.delete(key);
+    }
+  }
+
   _edgeVitalsFromFrame(frame) {
     if (!frame || typeof frame !== 'object') return null;
     const br = this._numberOrNull(frame.breathing_rate_bpm ?? frame.breathing_bpm);
@@ -791,6 +901,7 @@ class Observatory {
       ? evidence.rendered_persons
       : Math.max(evidence.rendered_persons, persons.length);
     persons = this._dedupePersons(persons, renderLimit);
+    persons = this._smoothScenePersons(persons, data);
     const renderedPersons = hasCountEvidence ? evidence.rendered_persons : (persons.length || evidence.rendered_persons);
     const countEvidence = {
       ...evidence,
@@ -1059,19 +1170,41 @@ class Observatory {
     return '2.4GHz';
   }
 
-  _coverageRadiusForBand(band) {
+  _coverageRadiusForBand(band, rangeHintM = null) {
     const normalized = String(band || '').toLowerCase();
-    const roomSpan = Math.max(this._roomSize.width, this._roomSize.depth, 2);
-    let radius = 4.5;
-    if (normalized.includes('6')) radius = 2.8;
-    else if (normalized.includes('5')) radius = 3.4;
-    else if (normalized.includes('2.4') || normalized.includes('2g')) radius = 4.8;
-    return Math.min(radius, Math.max(1.2, roomSpan * 0.55));
+    const roomSpan = Math.max(
+      this._roomSize.width,
+      this._roomSize.depth,
+      this._sensorBounds.width,
+      this._sensorBounds.depth,
+      2,
+    );
+    let bandScale = 0.86;
+    if (normalized.includes('6')) bandScale = 0.72;
+    else if (normalized.includes('5')) bandScale = 0.90;
+    else if (normalized.includes('2.4') || normalized.includes('2g')) bandScale = 1.08;
+    const hinted = Number(rangeHintM);
+    const hintRadius = Number.isFinite(hinted) && hinted > 0 ? hinted * 1.15 : 0;
+    const radius = Math.max(roomSpan * bandScale, hintRadius, roomSpan * 0.65);
+    return Math.min(Math.max(radius, 1.2), Math.max(roomSpan * 1.35, hintRadius));
   }
 
-  _upsertCoverage(key, position, active, visible, band) {
+  _coverageRangeHint(entity, position, apById, env) {
+    const direct = Number(entity?.coverage?.radius_m ?? entity?.coverage_radius_m ?? entity?.range_m ?? entity?.max_range_m);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+    const linkedAp = entity?.linked_ap || env?.links?.find(link => Number(link.node_id) === Number(entity?.node_id))?.ap_id;
+    const ap = linkedAp ? apById.get(linkedAp) : null;
+    const apPosition = this._positionOf(ap);
+    if (position && apPosition) {
+      const distance = Math.hypot(position[0] - apPosition[0], position[1] - apPosition[1], position[2] - apPosition[2]);
+      if (Number.isFinite(distance) && distance > 0) return distance;
+    }
+    return Math.max(this._roomSize.width, this._roomSize.depth, this._sensorBounds.width, this._sensorBounds.depth, 2) * 0.85;
+  }
+
+  _upsertCoverage(key, position, active, visible, band, rangeHintM = null) {
     let entry = this._coverageMeshes.get(key);
-    const radius = this._coverageRadiusForBand(band);
+    const radius = this._coverageRadiusForBand(band, rangeHintM);
     const heightScale = Math.min(0.45, Math.max(0.22, this._roomSize.height / Math.max(radius * 5, 1)));
     if (!entry) {
       const domeGeo = new THREE.SphereGeometry(1, 40, 16, 0, Math.PI * 2, 0, Math.PI * 0.54);
@@ -1138,6 +1271,8 @@ class Observatory {
       const key = `ap:${ap.ap_id}`;
       visibleDevices.add(key);
       this._upsertDevice(key, 'ap', ap.label || ap.ap_id, position, ap.active !== false);
+      visibleCoverage.add(key);
+      this._upsertCoverage(key, position, ap.active !== false, ap.active !== false, ap.band, this._coverageRangeHint(ap, position, apById, env));
       this._ensureWaveSource(key, position, ap.active !== false, 1.15);
     }
 
@@ -1152,7 +1287,7 @@ class Observatory {
       visibleCoverage.add(key);
       const band = this._coverageBand(node, apById, env);
       const coverageVisible = active || ['stale', 'sync_only'].includes(status);
-      this._upsertCoverage(key, position, active, coverageVisible, band);
+      this._upsertCoverage(key, position, active, coverageVisible, band, this._coverageRangeHint(node, position, apById, env));
       this._ensureWaveSource(key, position, active, 0.55);
     }
 
@@ -1424,6 +1559,7 @@ class Observatory {
   _disconnectWS() {
     if (this._ws) { this._ws.close(); this._ws = null; }
     this._liveData = null;
+    this._personMotionFilters.clear();
   }
 
   _emptyLiveFrame() {
@@ -1669,4 +1805,22 @@ window.__ruvsenseObservatoryTestApi = {
   ingestFrame: (frame) => observatory._ingestSocketFrame(frame),
   normalizeFrame: (frame) => observatory._normalizeSensingFrame(frame),
   sceneFrameData: (frame) => observatory._sceneFrameData(observatory._normalizeSensingFrame(frame)),
+  resetSmoothing: () => observatory._personMotionFilters.clear(),
+  setEnvironment: (env) => {
+    observatory._environment = env;
+    observatory._syncRoomGeometry(env);
+    observatory._syncTopology(observatory._currentData);
+    return env;
+  },
+  coverageSnapshot: () => Array.from(observatory._coverageMeshes.entries()).map(([key, entry]) => ({
+    key,
+    visible: entry.group.visible,
+    radius_x: entry.group.scale.x,
+    radius_z: entry.group.scale.z,
+  })),
+  motionSnapshot: () => Array.from(observatory._personMotionFilters.entries()).map(([id, filter]) => ({
+    id,
+    position: filter.position.slice(),
+    at: filter.at,
+  })),
 };

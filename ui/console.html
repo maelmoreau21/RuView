@@ -27,6 +27,7 @@
       <div class="status-cell"><strong id="fusion-mode">offline</strong><small>fusion</small></div>
       <div class="status-cell"><strong id="source-mode">offline</strong><small>source</small></div>
       <div class="status-cell"><strong id="scan-interface">wlan0</strong><small>scan</small></div>
+      <div class="status-cell"><strong id="vitals-optin-status">off</strong><small>vitals</small></div>
     </div>
     <nav class="global-nav" aria-label="Navigation globale">
       <a href="/ui/index.html">Accueil</a>
@@ -70,6 +71,13 @@
         <div id="topology-stage" class="topology-stage" aria-label="Topologie des AP et nœuds ESP32-C6 détectés"></div>
       </div>
 
+      <div class="map-status-band" aria-label="Etat de la carte live">
+        <span id="coverage-summary">coverage --</span>
+        <span id="dead-zone-summary">dead zones --</span>
+        <span id="person-position-summary">position --</span>
+        <span id="auto-placement-status">auto placement --</span>
+      </div>
+
       <div class="placement-toolbar" aria-label="Placement manuel des nœuds">
         <div class="placement-detail">
           <strong id="placement-selected">Aucun nœud sélectionné</strong>
@@ -83,6 +91,7 @@
         </div>
         <div class="placement-actions">
           <span id="placement-state" class="badge">enregistré</span>
+          <button id="auto-place-now" type="button">Auto placer</button>
           <button id="reset-placement" type="button">Réinitialiser</button>
           <button id="save-placement" class="primary" type="button" disabled>Enregistrer</button>
         </div>
@@ -105,6 +114,7 @@
           </div>
           <span id="fleet-summary" class="badge">0 live</span>
         </div>
+        <div id="node-quality-summary" class="quality-strip" aria-live="polite"></div>
         <div class="split-list">
           <section>
             <h3>Nœuds ESP32-C6</h3>
@@ -150,9 +160,14 @@
           </div>
           <span id="vitals-status" class="badge">attente</span>
         </div>
+        <label class="privacy-toggle">
+          <input id="vitals-optin" type="checkbox">
+          <span>Afficher vitals et posture</span>
+        </label>
         <dl class="metric-list">
           <div><dt>Présence</dt><dd id="presence-state">unknown</dd></div>
           <div><dt>Personnes</dt><dd id="person-count">0</dd></div>
+          <div><dt>Posture</dt><dd id="posture-state">masquee</dd></div>
           <div><dt>Mouvement</dt><dd id="motion-level">unknown</dd></div>
           <div><dt>Respiration</dt><dd id="breathing-rate">--</dd></div>
           <div><dt>Cœur</dt><dd id="heart-rate">--</dd></div>
@@ -171,7 +186,10 @@
         <div class="action-row">
           <button id="start-calibration" class="primary" type="button">Démarrer</button>
           <button id="stop-calibration" type="button">Arrêter</button>
+          <button id="auto-calibration" type="button">Auto safe</button>
+          <button id="abort-calibration" type="button">Abort</button>
         </div>
+        <p id="calibration-guard" class="calibration-guard">auto safe inactif</p>
         <div class="calibration-progress" aria-label="Progression calibration">
           <div class="calibration-progress-track">
             <span id="calibration-progress-fill"></span>

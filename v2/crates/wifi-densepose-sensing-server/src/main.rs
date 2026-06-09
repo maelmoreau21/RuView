@@ -1173,6 +1173,7 @@ fn node_summary_json(
         "person_count": ns.prev_person_count,
         "position": position_m,
         "position_m": position_m,
+        "coverage": coverage_json(env, Some(ns), now),
         "tdm_slot": cfg.map(|n| n.tdm_slot),
         "tdm_total": cfg.map(|n| n.tdm_total),
         "linked_ap": node_linked_ap(env, id),
@@ -1214,6 +1215,7 @@ fn configured_offline_node_json(
         "person_count": 0,
         "position": cfg.position_m,
         "position_m": cfg.position_m,
+        "coverage": coverage_json(env, None, std::time::Instant::now()),
         "tdm_slot": cfg.tdm_slot,
         "tdm_total": cfg.tdm_total,
         "linked_ap": node_linked_ap(env, cfg.node_id).unwrap_or_else(|| cfg.linked_ap.clone()),
@@ -1269,6 +1271,91 @@ fn position_json(position: [f64; 3], source: &str, confidence: f64) -> serde_jso
         "z": position[2],
         "source": source,
         "confidence": confidence.clamp(0.0, 1.0),
+    })
+}
+
+fn room_floor_diagonal_m(room: &RoomConfig) -> f64 {
+    let width = room.dimensions_m[0].max(1.0);
+    let depth = room.dimensions_m[2].max(1.0);
+    (width.powi(2) + depth.powi(2)).sqrt().max(1.0)
+}
+
+fn distance_m(a: [f64; 3], b: [f64; 3]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn coverage_quality(score: f64) -> &'static str {
+    if score >= 0.72 {
+        "strong"
+    } else if score >= 0.46 {
+        "usable"
+    } else if score >= 0.24 {
+        "weak"
+    } else {
+        "offline"
+    }
+}
+
+fn node_coverage_score(ns: Option<&NodeState>, now: std::time::Instant) -> (f64, Vec<&'static str>) {
+    let Some(ns) = ns else {
+        return (0.0, vec!["offline"]);
+    };
+    let mut reasons = Vec::new();
+    let active = is_node_active(ns, now);
+    let rssi = ns.rssi_history.back().copied().unwrap_or(-95.0);
+    let rssi_score = ((rssi + 95.0) / 45.0).clamp(0.0, 1.0);
+    if rssi < -82.0 {
+        reasons.push("low_rssi");
+    }
+    let fps_score = (ns.csi_fps_ema / 10.0).clamp(0.0, 1.0);
+    if ns.csi_fps_ema < 2.0 {
+        reasons.push("low_frame_rate");
+    }
+    let coherence_score = ns.coherence_score.clamp(0.0, 1.0);
+    if coherence_score < 0.35 {
+        reasons.push("low_coherence");
+    }
+    let sync_score = ns
+        .sync_snapshot()
+        .map(|sync| if sync.is_valid { 1.0 } else { 0.55 })
+        .unwrap_or(0.42);
+    if sync_score < 0.6 {
+        reasons.push("sync_missing_or_stale");
+    }
+    let freshness_score = if active {
+        1.0
+    } else if ns
+        .last_frame_time
+        .is_some_and(|t| now.saturating_duration_since(t) <= Duration::from_secs(60))
+    {
+        reasons.push("stale_csi");
+        0.32
+    } else {
+        reasons.push("offline");
+        0.0
+    };
+    let score = (0.36 * rssi_score
+        + 0.20 * fps_score
+        + 0.20 * coherence_score
+        + 0.12 * sync_score
+        + 0.12 * freshness_score)
+        .clamp(0.0, 1.0);
+    (score, reasons)
+}
+
+fn coverage_json(
+    env: &EnvironmentConfig,
+    ns: Option<&NodeState>,
+    now: std::time::Instant,
+) -> serde_json::Value {
+    let (score, reasons) = node_coverage_score(ns, now);
+    let diagonal = room_floor_diagonal_m(&env.room);
+    let radius_m = (diagonal * (0.30 + score * 0.85)).clamp(1.0, diagonal * 1.15);
+    serde_json::json!({
+        "score": score,
+        "quality": coverage_quality(score),
+        "radius_m": radius_m,
+        "reasons": reasons,
     })
 }
 
@@ -1446,6 +1533,7 @@ fn topology_nodes_json(
                     "position_m": position,
                     "position_confidence": position_confidence,
                     "position_source": position_source,
+                    "coverage": coverage_json(env, Some(ns), now),
                     "tdm_slot": cfg.map(|n| n.tdm_slot),
                     "tdm_total": cfg.map(|n| n.tdm_total),
                     "linked_ap": node_linked_ap(env, id),
@@ -1479,6 +1567,7 @@ fn topology_nodes_json(
                     "position_m": position,
                     "position_confidence": position_confidence,
                     "position_source": position_source,
+                    "coverage": coverage_json(env, None, now),
                     "tdm_slot": cfg.map(|n| n.tdm_slot),
                     "tdm_total": cfg.map(|n| n.tdm_total),
                     "linked_ap": node_linked_ap(env, id),
@@ -1524,12 +1613,33 @@ fn topology_links_json(
             } else {
                 return None;
             };
+            let node_state = node_states.get(&node_id);
+            let (node_score, mut reasons) = node_coverage_score(node_state, now);
+            let ap_rssi_score = ((ap.rssi_dbm + 95.0) / 45.0).clamp(0.0, 1.0);
+            if ap.rssi_dbm < -82.0 {
+                reasons.push("weak_ap_rssi");
+            }
+            let ap_position = configured_ap.map(|cfg| cfg.position_m);
+            let node_position = configured_node_position(env, node_id);
+            let link_distance_m = ap_position.map(|pos| distance_m(pos, node_position));
+            if link_distance_m.is_some_and(|distance| distance > room_floor_diagonal_m(&env.room)) {
+                reasons.push("long_link");
+            }
+            let link_score = node_score.min(ap_rssi_score).clamp(0.0, 1.0);
             Some(serde_json::json!({
                 "link_id": format!("{}:node-{}", ap.bssid, node_id),
                 "ap_bssid": ap.bssid.as_str(),
                 "node_id": node_id,
                 "source": source,
                 "confidence": confidence,
+                "rssi_dbm": ap.rssi_dbm,
+                "distance_m": link_distance_m,
+                "coverage": {
+                    "score": link_score,
+                    "quality": coverage_quality(link_score),
+                    "radius_m": room_floor_diagonal_m(&env.room) * (0.30 + link_score * 0.85),
+                    "reasons": reasons,
+                },
             }))
         })
         .collect()
@@ -1746,6 +1856,21 @@ pub(crate) struct EnvironmentLinkConfig {
     pub node_id: u8,
 }
 
+/// Provisional or operator-confirmed environment obstacle shown by the live console.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentObstacleConfig {
+    pub obstacle_id: String,
+    pub kind: String,
+    pub label: String,
+    pub center_m: [f64; 3],
+    pub size_m: [f64; 3],
+    #[serde(default)]
+    pub yaw_rad: f64,
+    pub source: String,
+    pub confidence: f64,
+}
+
 /// Persisted topology for the production console.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1754,6 +1879,8 @@ pub(crate) struct EnvironmentConfig {
     pub access_points: Vec<AccessPointConfig>,
     pub nodes: Vec<EnvironmentNodeConfig>,
     pub links: Vec<EnvironmentLinkConfig>,
+    #[serde(default)]
+    pub obstacles: Vec<EnvironmentObstacleConfig>,
 }
 
 /// AP observed by the Raspberry Pi master during a real WiFi scan.
@@ -1778,6 +1905,7 @@ impl Default for EnvironmentConfig {
             access_points: Vec::new(),
             nodes: Vec::new(),
             links: Vec::new(),
+            obstacles: Vec::new(),
         }
     }
 }
@@ -2411,6 +2539,14 @@ struct AppStateInner {
     multistatic_fuser: MultistaticFuser,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
+    /// Runtime opt-in for safe empty-room auto-calibration.
+    auto_calibration_enabled: bool,
+    /// Auto-calibration policy label exposed to the live console.
+    auto_calibration_policy: String,
+    /// First instant of the current quiet-room guard window.
+    auto_calibration_quiet_since: Option<std::time::Instant>,
+    /// Last automatic calibration action for UI/audit visibility.
+    auto_calibration_last_action: Option<String>,
     // ── ADR-044 §5.2: adaptive rolling-p95 normalization ─────────────────────
     /// Rolling P95 of `FeatureInfo.variance` over the last ~30 s (600 frames @ 20 Hz).
     pub(crate) p95_variance: RollingP95,
@@ -2446,6 +2582,8 @@ struct AppStateInner {
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
 const ESP32_OFFLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const AUTO_CALIBRATION_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+const AUTO_CALIBRATION_MIN_QUALITY: f64 = 0.30;
 
 impl AppStateInner {
     /// Return the effective data source, accounting for ESP32 frame timeout.
@@ -6968,6 +7106,241 @@ async fn adaptive_unload(State(state): State<SharedState>) -> Json<serde_json::V
 
 // ── Field model calibration endpoints (eigenvalue person counting) ──────────
 
+#[derive(Debug, Deserialize)]
+struct AutoCalibrationUpdate {
+    enabled: bool,
+    policy: Option<String>,
+}
+
+#[derive(Debug)]
+struct AutoCalibrationGuard {
+    source_live: bool,
+    quorum_ready: bool,
+    presence_blocked: bool,
+    motion_blocked: bool,
+    quality_blocked: bool,
+    active_nodes: usize,
+    signal_quality: Option<f64>,
+    quiet_elapsed_secs: u64,
+    can_collect: bool,
+    blockers: Vec<&'static str>,
+}
+
+fn motion_level_blocks_empty_room(level: &str) -> bool {
+    let normalized = level.trim().to_ascii_lowercase();
+    !matches!(
+        normalized.as_str(),
+        "" | "absent" | "idle" | "none" | "unknown"
+    )
+}
+
+fn room_quality_score(s: &AppStateInner, now: std::time::Instant) -> Option<f64> {
+    let mut scores = Vec::new();
+    for node in s.node_states.values().filter(|node| is_node_active(node, now)) {
+        scores.push(node_coverage_score(Some(node), now).0);
+    }
+    if !scores.is_empty() {
+        return Some(scores.iter().sum::<f64>() / scores.len() as f64);
+    }
+    s.latest_update
+        .as_ref()
+        .and_then(|update| update.signal_quality_score)
+        .or_else(|| {
+            s.latest_update
+                .as_ref()
+                .and_then(|update| update.vital_signs.as_ref().map(|vitals| vitals.signal_quality))
+        })
+}
+
+fn auto_calibration_guard(s: &AppStateInner, now: std::time::Instant) -> AutoCalibrationGuard {
+    let effective_source = s.effective_source();
+    let source_live = !effective_source.contains("offline")
+        && !effective_source.contains("simulate")
+        && !effective_source.contains("simulated");
+    let active_nodes = active_node_count(s, now);
+    let quorum_ready = active_nodes >= s.min_nodes.max(1);
+    let presence_blocked = s
+        .latest_update
+        .as_ref()
+        .is_some_and(|update| update.classification.presence)
+        || room_presence_supporting_nodes(s, now) > 0
+        || s.last_present_at
+            .is_some_and(|seen| now.saturating_duration_since(seen) <= AUTO_CALIBRATION_QUIET_WINDOW);
+    let motion_blocked = s
+        .latest_update
+        .as_ref()
+        .is_some_and(|update| motion_level_blocks_empty_room(&update.classification.motion_level))
+        || s.node_states
+            .values()
+            .filter(|node| is_node_active(node, now))
+            .any(|node| motion_level_blocks_empty_room(&node.current_motion_level));
+    let signal_quality = room_quality_score(s, now);
+    let quality_blocked = signal_quality.is_some_and(|score| score < AUTO_CALIBRATION_MIN_QUALITY);
+    let quiet_elapsed_secs = s
+        .auto_calibration_quiet_since
+        .map(|seen| now.saturating_duration_since(seen).as_secs())
+        .unwrap_or(0);
+    let mut blockers = Vec::new();
+    if !source_live {
+        blockers.push("source_not_live");
+    }
+    if !quorum_ready {
+        blockers.push("node_quorum");
+    }
+    if presence_blocked {
+        blockers.push("presence_detected");
+    }
+    if motion_blocked {
+        blockers.push("motion_detected");
+    }
+    if quality_blocked {
+        blockers.push("low_signal_quality");
+    }
+    let can_collect =
+        source_live && quorum_ready && !presence_blocked && !motion_blocked && !quality_blocked;
+    AutoCalibrationGuard {
+        source_live,
+        quorum_ready,
+        presence_blocked,
+        motion_blocked,
+        quality_blocked,
+        active_nodes,
+        signal_quality,
+        quiet_elapsed_secs,
+        can_collect,
+        blockers,
+    }
+}
+
+fn calibration_status_label(s: &AppStateInner) -> String {
+    s.field_model
+        .as_ref()
+        .map(|fm| format!("{:?}", fm.status()))
+        .unwrap_or_else(|| "not_started".to_string())
+}
+
+fn calibration_frame_count(s: &AppStateInner) -> u64 {
+    s.field_model
+        .as_ref()
+        .map(|fm| fm.calibration_frame_count())
+        .unwrap_or(0)
+}
+
+fn calibration_snapshot_json(s: &AppStateInner, now: std::time::Instant) -> serde_json::Value {
+    let guard = auto_calibration_guard(s, now);
+    let status = calibration_status_label(s);
+    let recommended_action = if !s.auto_calibration_enabled {
+        "enable_auto_or_start_manual"
+    } else if !guard.can_collect {
+        "wait_for_safe_empty_room"
+    } else if guard.quiet_elapsed_secs < AUTO_CALIBRATION_QUIET_WINDOW.as_secs() {
+        "waiting_for_quiet_window"
+    } else if matches!(status.as_str(), "Collecting") {
+        "collecting"
+    } else if matches!(status.as_str(), "Fresh") {
+        "calibrated"
+    } else {
+        "ready_to_collect"
+    };
+    serde_json::json!({
+        "status": status,
+        "active": s.field_model.is_some(),
+        "enabled": s.field_model.is_some(),
+        "frame_count": calibration_frame_count(s),
+        "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
+        "active_nodes": guard.active_nodes,
+        "min_nodes": s.min_nodes,
+        "dedup_factor": s.dedup_factor,
+        "adaptive": adaptive_calibration_nodes_json(&s.node_states),
+        "auto_mode": {
+            "enabled": s.auto_calibration_enabled,
+            "policy": s.auto_calibration_policy.as_str(),
+            "quiet_window_sec": AUTO_CALIBRATION_QUIET_WINDOW.as_secs(),
+            "quiet_elapsed_sec": guard.quiet_elapsed_secs,
+            "source_live": guard.source_live,
+            "quorum_ready": guard.quorum_ready,
+            "presence_blocked": guard.presence_blocked,
+            "motion_blocked": guard.motion_blocked,
+            "quality_blocked": guard.quality_blocked,
+            "signal_quality": guard.signal_quality,
+            "guard_state": if guard.can_collect { "clear" } else { "blocked" },
+            "blockers": guard.blockers,
+            "recommended_action": recommended_action,
+            "last_action": s.auto_calibration_last_action.as_deref(),
+        },
+        "actions": {
+            "start": "/api/v1/calibration/start",
+            "stop": "/api/v1/calibration/stop",
+            "abort": "/api/v1/calibration/abort",
+            "auto": "/api/v1/calibration/auto",
+            "status": "/api/v1/calibration/status"
+        }
+    })
+}
+
+fn start_field_model_calibration(s: &mut AppStateInner) -> Result<(), String> {
+    let fm = FieldModel::new(field_bridge::single_link_config()).map_err(|e| format!("{e}"))?;
+    s.field_model = Some(fm);
+    Ok(())
+}
+
+fn maybe_drive_auto_calibration(s: &mut AppStateInner, now: std::time::Instant) {
+    if !s.auto_calibration_enabled {
+        return;
+    }
+    let guard = auto_calibration_guard(s, now);
+    if !guard.can_collect {
+        s.auto_calibration_quiet_since = None;
+        if s.field_model
+            .as_ref()
+            .is_some_and(|fm| fm.status() == CalibrationStatus::Collecting)
+        {
+            s.field_model = None;
+            s.auto_calibration_last_action = Some(format!(
+                "aborted: {}",
+                guard.blockers.join(",")
+            ));
+        }
+        return;
+    }
+
+    let quiet_since = s.auto_calibration_quiet_since.get_or_insert(now);
+    let quiet_elapsed = now.saturating_duration_since(*quiet_since);
+    if quiet_elapsed < AUTO_CALIBRATION_QUIET_WINDOW {
+        return;
+    }
+
+    match s.field_model.as_ref().map(|fm| fm.status()) {
+        Some(CalibrationStatus::Collecting) => {
+            let frame_count = calibration_frame_count(s);
+            if frame_count >= field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES as u64 {
+                if let Some(ref mut fm) = s.field_model {
+                    let ts = chrono::Utc::now().timestamp_micros() as u64;
+                    match fm.finalize_calibration(ts, 0) {
+                        Ok(_) => {
+                            s.auto_calibration_last_action =
+                                Some(format!("finalized:{frame_count}_frames"));
+                        }
+                        Err(err) => {
+                            s.auto_calibration_last_action =
+                                Some(format!("finalize_failed:{err}"));
+                        }
+                    }
+                }
+            }
+        }
+        Some(CalibrationStatus::Fresh) => {}
+        _ => match start_field_model_calibration(s) {
+            Ok(()) => {
+                s.auto_calibration_last_action = Some("started".to_string());
+            }
+            Err(err) => {
+                s.auto_calibration_last_action = Some(format!("start_failed:{err}"));
+            }
+        },
+    }
+}
+
 async fn calibration_start(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let mut s = state.write().await;
     // Guard: don't discard an in-progress or fresh calibration
@@ -6992,9 +7365,8 @@ async fn calibration_start(State(state): State<SharedState>) -> Json<serde_json:
             _ => {} // Stale/Expired/Uncalibrated — ok to recalibrate
         }
     }
-    match FieldModel::new(field_bridge::single_link_config()) {
-        Ok(fm) => {
-            s.field_model = Some(fm);
+    match start_field_model_calibration(&mut s) {
+        Ok(()) => {
             Json(serde_json::json!({
                 "success": true,
                 "frame_count": 0,
@@ -7040,21 +7412,44 @@ async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::
 }
 
 async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let s = state.read().await;
-    match s.field_model.as_ref() {
-        Some(fm) => Json(serde_json::json!({
-            "active": true,
-            "status": format!("{:?}", fm.status()),
-            "frame_count": fm.calibration_frame_count(),
-            "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
-        })),
-        None => Json(serde_json::json!({
-            "active": false,
-            "status": "none",
-            "frame_count": 0,
-            "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
-        })),
+    let mut s = state.write().await;
+    let now = std::time::Instant::now();
+    maybe_drive_auto_calibration(&mut s, now);
+    Json(calibration_snapshot_json(&s, now))
+}
+
+async fn calibration_abort(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    s.field_model = None;
+    s.auto_calibration_enabled = false;
+    s.auto_calibration_quiet_since = None;
+    s.auto_calibration_last_action = Some("aborted_by_operator".to_string());
+    for node in s.node_states.values_mut() {
+        node.adaptive_calibration = None;
     }
+    Json(serde_json::json!({
+        "success": true,
+        "message": "Calibration aborted.",
+        "calibration": calibration_snapshot_json(&s, std::time::Instant::now()),
+    }))
+}
+
+async fn calibration_auto_update(
+    State(state): State<SharedState>,
+    Json(body): Json<AutoCalibrationUpdate>,
+) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    s.auto_calibration_enabled = body.enabled;
+    s.auto_calibration_policy = body.policy.unwrap_or_else(|| "safe".to_string());
+    if !s.auto_calibration_enabled {
+        s.auto_calibration_quiet_since = None;
+        s.auto_calibration_last_action = Some("auto_disabled".to_string());
+    } else {
+        s.auto_calibration_last_action = Some("auto_enabled".to_string());
+    }
+    let now = std::time::Instant::now();
+    maybe_drive_auto_calibration(&mut s, now);
+    Json(calibration_snapshot_json(&s, now))
 }
 
 /// Generate a simple timestamp string (epoch seconds) for recording IDs.
@@ -7610,6 +8005,37 @@ fn validate_environment(env: &EnvironmentConfig) -> Result<(), String> {
             return Err(format!(
                 "link '{}' references unknown node {}",
                 link.link_id, link.node_id
+            ));
+        }
+    }
+    let mut obstacle_ids = std::collections::HashSet::new();
+    for obstacle in &env.obstacles {
+        if obstacle.obstacle_id.trim().is_empty() {
+            return Err("obstacle id cannot be empty".to_string());
+        }
+        if !obstacle_ids.insert(obstacle.obstacle_id.as_str()) {
+            return Err(format!("duplicate obstacle id '{}'", obstacle.obstacle_id));
+        }
+        if obstacle.center_m.iter().any(|v| !v.is_finite()) {
+            return Err(format!(
+                "obstacle '{}' has invalid center",
+                obstacle.obstacle_id
+            ));
+        }
+        if obstacle
+            .size_m
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0)
+        {
+            return Err(format!(
+                "obstacle '{}' has invalid size",
+                obstacle.obstacle_id
+            ));
+        }
+        if !obstacle.yaw_rad.is_finite() || !(0.0..=1.0).contains(&obstacle.confidence) {
+            return Err(format!(
+                "obstacle '{}' has invalid confidence or yaw",
+                obstacle.obstacle_id
             ));
         }
     }
@@ -8303,32 +8729,10 @@ fn adaptive_calibration_nodes_json(
 async fn calibration_overview_endpoint(
     State(state): State<SharedState>,
 ) -> Json<serde_json::Value> {
-    let s = state.read().await;
-    let status = s
-        .field_model
-        .as_ref()
-        .map(|fm| format!("{:?}", fm.status()))
-        .unwrap_or_else(|| "not_started".to_string());
-    let frame_count = s
-        .field_model
-        .as_ref()
-        .map(|fm| fm.calibration_frame_count())
-        .unwrap_or(0);
-    Json(serde_json::json!({
-        "status": status,
-        "enabled": s.field_model.is_some(),
-        "frame_count": frame_count,
-        "min_frames": field_bridge::FIELD_MODEL_MIN_CALIBRATION_FRAMES,
-        "active_nodes": active_node_count(&s, std::time::Instant::now()),
-        "min_nodes": s.min_nodes,
-        "dedup_factor": s.dedup_factor,
-        "adaptive": adaptive_calibration_nodes_json(&s.node_states),
-        "actions": {
-            "start": "/api/v1/calibration/start",
-            "stop": "/api/v1/calibration/stop",
-            "status": "/api/v1/calibration/status"
-        }
-    }))
+    let mut s = state.write().await;
+    let now = std::time::Instant::now();
+    maybe_drive_auto_calibration(&mut s, now);
+    Json(calibration_snapshot_json(&s, now))
 }
 
 fn append_udp_jitter_prometheus_metrics(
@@ -8995,6 +9399,7 @@ async fn udp_receiver_task(
                         0
                     };
 
+                    maybe_drive_auto_calibration(&mut s, now);
                     // Feed field model calibration if active (use per-node history for ESP32).
                     if let Some(frame_history) = s
                         .node_states
@@ -9005,6 +9410,7 @@ async fn udp_receiver_task(
                             field_bridge::maybe_feed_calibration(fm, &frame_history);
                         }
                     }
+                    maybe_drive_auto_calibration(&mut s, now);
 
                     // Build nodes array with all active nodes.
                     let environment = s.environment.clone();
@@ -9503,6 +9909,7 @@ async fn udp_receiver_task(
                     );
                     let rendered_persons = count_evidence.rendered_persons;
 
+                    maybe_drive_auto_calibration(&mut s, now);
                     // Feed field model calibration only from live CSI. Interpolated
                     // frames stabilize runtime DSP but never alter baselines.
                     if is_live_frame {
@@ -9516,6 +9923,7 @@ async fn udp_receiver_task(
                             }
                         }
                     }
+                    maybe_drive_auto_calibration(&mut s, now);
 
                     // Build nodes array with all active nodes.
                     let environment = s.environment.clone();
@@ -9818,6 +10226,7 @@ async fn handle_delivered_esp32_frame(
     );
     let rendered_persons = count_evidence.rendered_persons;
 
+    maybe_drive_auto_calibration(&mut s, now);
     if is_live_frame {
         if let Some(frame_history) = s
             .node_states
@@ -9829,6 +10238,7 @@ async fn handle_delivered_esp32_frame(
             }
         }
     }
+    maybe_drive_auto_calibration(&mut s, now);
 
     let environment = s.environment.clone();
     let active_nodes: Vec<NodeInfo> = s
@@ -11238,6 +11648,10 @@ async fn main() {
         } else {
             None
         },
+        auto_calibration_enabled: false,
+        auto_calibration_policy: "safe".to_string(),
+        auto_calibration_quiet_since: None,
+        auto_calibration_last_action: None,
         // ADR-044 §5.2: rolling-P95 over ~30 s at 20 Hz; warm-up after 60 samples.
         p95_variance: RollingP95::new(600, 60),
         p95_motion_band_power: RollingP95::new(600, 60),
@@ -11456,6 +11870,8 @@ async fn main() {
         // Field model calibration (eigenvalue-based person counting)
         .route("/api/v1/calibration/start", post(calibration_start))
         .route("/api/v1/calibration/stop", post(calibration_stop))
+        .route("/api/v1/calibration/abort", post(calibration_abort))
+        .route("/api/v1/calibration/auto", put(calibration_auto_update))
         .route("/api/v1/calibration/status", get(calibration_status))
         .route("/api/v1/calibration", get(calibration_overview_endpoint))
         // ADR-044 §5.3: runtime-configurable dedup factor
@@ -11558,6 +11974,7 @@ mod topology_console_tests {
         schema_for_config_kind, topology_nodes_json, topology_readiness_json,
         upsert_environment_node_positions, validate_config_file, validate_runtime_config,
         AccessPointConfig, ConfigSchemaKind, EnvironmentConfig, EnvironmentLinkConfig,
+        EnvironmentObstacleConfig,
         EnvironmentNodeConfig, LogFormat, NodePositionUpdate, NodeState, RoomConfig, RuntimeConfig,
         ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION, MODULE_PRESETS,
     };
@@ -11598,6 +12015,7 @@ mod topology_console_tests {
                 ap_id: "ap1".to_string(),
                 node_id: 1,
             }],
+            obstacles: Vec::new(),
         }
     }
 
@@ -11631,9 +12049,47 @@ mod topology_console_tests {
         assert_eq!(nodes[0]["node_id"], serde_json::json!(1));
         assert_eq!(nodes[0]["status"], serde_json::json!("live"));
         assert_eq!(nodes[0]["display_label"], serde_json::json!("ESP32-C6 #1"));
+        assert_eq!(nodes[0]["coverage"]["quality"], serde_json::json!("strong"));
         assert_eq!(nodes[1]["node_id"], serde_json::json!(2));
         assert_eq!(nodes[1]["status"], serde_json::json!("stale"));
         assert_eq!(nodes[1]["display_label"], serde_json::json!("ESP32-C6 #2"));
+        assert!(nodes[1]["coverage"]["score"].as_f64().unwrap_or(1.0) < 0.5);
+    }
+
+    #[test]
+    fn configured_node_positions_remain_primary_for_topology() {
+        let now = Instant::now();
+        let mut node = NodeState::new();
+        node.last_frame_time = Some(now);
+        node.rssi_history.push_back(-55.0);
+
+        let mut node_states = HashMap::new();
+        node_states.insert(1, node);
+
+        let nodes = topology_nodes_json(&configured_test_environment(), &node_states, now);
+
+        assert_eq!(nodes[0]["position_source"], serde_json::json!("configured"));
+        assert_eq!(nodes[0]["position_m"], serde_json::json!([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn environment_obstacles_are_optional_and_validated() {
+        let mut env = configured_test_environment();
+        env.obstacles.push(EnvironmentObstacleConfig {
+            obstacle_id: "wall-east".to_string(),
+            kind: "wall".to_string(),
+            label: "East wall".to_string(),
+            center_m: [1.8, 1.4, 0.0],
+            size_m: [0.1, 2.8, 3.0],
+            yaw_rad: 0.0,
+            source: "operator_confirmed".to_string(),
+            confidence: 0.95,
+        });
+
+        assert!(super::validate_environment(&env).is_ok());
+
+        env.obstacles[0].confidence = 1.2;
+        assert!(super::validate_environment(&env).is_err());
     }
 
     #[test]

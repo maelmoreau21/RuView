@@ -4,6 +4,7 @@ const state = {
   vitals: null,
   edgeVitals: null,
   calibration: null,
+  pose: null,
   latest: null,
   ws: null,
   reconnectTimer: null,
@@ -24,6 +25,10 @@ const state = {
   placementPanDrag: null,
   calibrationLastStatus: null,
   calibrationEvents: [],
+  vitalsOptIn: localStorage.getItem('ruvsense:vitals-opt-in') === 'true',
+  autoPlacementLastKey: '',
+  autoPlacementStableCount: 0,
+  autoPlacementSaving: false,
 };
 
 const VALID_PANELS = new Set(['fleet', 'modules', 'vitals', 'calibration', 'diagnostics']);
@@ -31,6 +36,7 @@ const PLACEMENT_MIN_ZOOM = 0.25;
 const PLACEMENT_MAX_ZOOM = 8;
 const PLACEMENT_FIT_PADDING = 1.25;
 const CALIBRATION_MIN_FRAMES_FALLBACK = 12000;
+const AUTO_PLACEMENT_STABLE_REFRESHES = 2;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
@@ -62,6 +68,11 @@ function fmtPct(value) {
   return Number.isFinite(n) ? `${Math.round(n * 100)}%` : '--';
 }
 
+function fmtMeters(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(n >= 10 ? 1 : 2)} m` : '--';
+}
+
 function setText(id, value) {
   const node = document.getElementById(id);
   if (node) node.textContent = value;
@@ -84,6 +95,21 @@ function emptyRow(label) {
 
 function statusClass(value) {
   return String(value || 'offline').toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+}
+
+function coverageOf(item) {
+  const coverage = item?.coverage || {};
+  const score = Number(coverage.score);
+  return {
+    score: Number.isFinite(score) ? clamp(score, 0, 1) : 0,
+    quality: text(coverage.quality, score > 0 ? 'usable' : 'offline'),
+    radiusM: Number(coverage.radius_m ?? coverage.radiusM ?? coverage.range_m ?? coverage.max_range_m),
+    reasons: Array.isArray(coverage.reasons) ? coverage.reasons : [],
+  };
+}
+
+function coverageColorClass(coverage) {
+  return `coverage-${statusClass(coverage.quality)}`;
 }
 
 function logEvent(message, level = 'info') {
@@ -431,6 +457,9 @@ function renderStatus() {
   setText('readiness-label', ready ? 'prêt' : activeNodes > 0 ? 'limité' : 'pas prêt');
   setText('frame-rate', fmtHz(frameRate));
   setText('fleet-summary', `${activeNodes} live`);
+  setText('vitals-optin-status', state.vitalsOptIn ? 'on' : 'off');
+  const vitalsToggle = $('#vitals-optin');
+  if (vitalsToggle instanceof HTMLInputElement) vitalsToggle.checked = state.vitalsOptIn;
 }
 
 function marker(kind, item, compact) {
@@ -458,16 +487,17 @@ function renderLink(stage, link, apsByBssid, nodesById) {
   const ap = apsByBssid.get(String(link.ap_bssid || link.ap_id || '').toLowerCase());
   const node = nodesById.get(Number(link.node_id));
   if (!ap || !node) return;
+  const coverage = coverageOf(link);
   const a = pointToStage(positionOf(ap));
   const b = pointToStage(currentNodePosition(node));
   const dx = b.left - a.left;
   const dy = b.top - a.top;
-  const line = create('div', `rf-link ${statusClass(link.source)}`);
+  const line = create('div', `rf-link ${statusClass(link.source)} ${coverageColorClass(coverage)}`);
   line.style.left = `${a.left}%`;
   line.style.top = `${a.top}%`;
   line.style.width = `${Math.hypot(dx, dy)}%`;
   line.style.transform = `rotate(${Math.atan2(dy, dx)}rad)`;
-  line.title = `confidence ${fmtPct(link.confidence)}`;
+  line.title = `confidence ${fmtPct(link.confidence)} / link ${coverage.quality} ${fmtPct(coverage.score)} / ${fmtMeters(link.distance_m)}`;
   stage.append(line);
 }
 
@@ -512,6 +542,104 @@ function renderNodeDistances(stage, nodes) {
   }
 }
 
+function radiusToStageSize(radiusM) {
+  const [width, , depth] = roomDims();
+  const zoom = state.placementZoom || 1;
+  const r = Number(radiusM);
+  if (!Number.isFinite(r) || r <= 0) return { width: 18, height: 18 };
+  return {
+    width: clamp((r / Math.max(width, 0.1)) * 100 * 2 * zoom, 6, 260),
+    height: clamp((r / Math.max(depth, 0.1)) * 100 * 2 * zoom, 6, 260),
+  };
+}
+
+function renderCoverageLayers(stage, nodes) {
+  let usable = 0;
+  let weak = 0;
+  for (const node of nodes) {
+    const coverage = coverageOf(node);
+    if (coverage.score >= 0.46) usable += 1;
+    if (coverage.score > 0 && coverage.score < 0.46) weak += 1;
+    const pos = currentNodePosition(node);
+    const p = pointToStage(pos);
+    const size = radiusToStageSize(coverage.radiusM || Math.max(roomDims()[0], roomDims()[2]) * (0.25 + coverage.score));
+    const zone = create('div', `coverage-zone ${coverageColorClass(coverage)}`);
+    zone.style.left = `${p.left}%`;
+    zone.style.top = `${p.top}%`;
+    zone.style.width = `${size.width}%`;
+    zone.style.height = `${size.height}%`;
+    zone.title = `${text(node.display_label || node.label, `node ${node.node_id}`)} coverage ${fmtPct(coverage.score)} ${coverage.reasons.join(', ')}`;
+    stage.append(zone);
+  }
+  setText('coverage-summary', nodes.length ? `${usable}/${nodes.length} coverage usable` : 'coverage --');
+  setText('dead-zone-summary', weak ? `${weak} weak link(s)` : nodes.length ? 'dead zones none obvious' : 'dead zones --');
+}
+
+function normalizePoseName(value) {
+  const raw = String(value || '').toLowerCase();
+  if (!raw) return '';
+  if (raw.includes('lying') || raw.includes('supine') || raw.includes('prone')) return 'lying';
+  if (raw.includes('sit')) return 'sitting';
+  if (raw.includes('fall') || raw.includes('fallen')) return 'fallen';
+  if (raw.includes('walk') || raw.includes('motion')) return 'walking';
+  if (raw.includes('crouch')) return 'crouching';
+  if (raw.includes('stand')) return 'standing';
+  return raw;
+}
+
+function vectorPosition(value) {
+  if (Array.isArray(value) && value.length >= 3) {
+    return { x: Number(value[0]) || 0, y: Number(value[1]) || 0, z: Number(value[2]) || 0 };
+  }
+  if (value && typeof value === 'object') {
+    return { x: Number(value.x) || 0, y: Number(value.y) || 0, z: Number(value.z) || 0 };
+  }
+  return null;
+}
+
+function primaryPerson() {
+  const persons = Array.isArray(state.latest?.persons) ? state.latest.persons : [];
+  if (persons.length) return persons[0];
+  const posePersons = Array.isArray(state.pose?.persons) ? state.pose.persons : [];
+  if (posePersons.length) return posePersons[0];
+  if (state.pose?.person) return state.pose.person;
+  const count = Number(state.latest?.count_evidence?.rendered_persons ?? state.latest?.estimated_persons ?? 0);
+  if (count > 0) {
+    return {
+      id: 'inferred',
+      confidence: state.latest?.classification?.confidence ?? 0.35,
+      position_source: 'count_evidence',
+      pose: state.latest?.posture || 'standing',
+    };
+  }
+  return null;
+}
+
+function renderPersonEstimate(stage) {
+  const person = primaryPerson();
+  if (!person) {
+    setText('person-position-summary', 'position none');
+    return;
+  }
+  const rawPos = vectorPosition(person.position_m) || vectorPosition(person.position) || { x: 0, y: 0, z: 0 };
+  const p = pointToStage(rawPos);
+  const confidence = Number(person.confidence ?? state.latest?.classification?.confidence ?? 0.35);
+  const source = text(person.position_source || person.pose_source, 'estimated');
+  const marker = create('div', `person-estimate ${source === 'count_evidence' || source === 'observatory_layout' ? 'is-uncertain' : ''}`);
+  marker.style.left = `${p.left}%`;
+  marker.style.top = `${p.top}%`;
+  marker.title = `person ${source} confidence ${fmtPct(confidence)}`;
+  marker.append(create('i'), create('span', '', normalizePoseName(person.pose || person.posture || state.latest?.posture) || 'person'));
+  const uncertainty = create('div', 'person-uncertainty');
+  const radius = clamp((1 - (Number.isFinite(confidence) ? confidence : 0.35)) * 36 + 16, 18, 56);
+  uncertainty.style.left = `${p.left}%`;
+  uncertainty.style.top = `${p.top}%`;
+  uncertainty.style.width = `${radius}px`;
+  uncertainty.style.height = `${radius}px`;
+  stage.append(uncertainty, marker);
+  setText('person-position-summary', `${source} ${fmtPct(confidence)}`);
+}
+
 function renderTopology() {
   const stage = $('#topology-stage');
   if (!stage) return;
@@ -537,6 +665,8 @@ function renderTopology() {
     }
   }
   const nodesById = new Map(nodes.map((node) => [nodeIdOf(node), node]));
+  renderCoverageLayers(stage, nodes);
+  renderPersonEstimate(stage);
   for (const link of links) renderLink(stage, link, apsByBssid, nodesById);
   renderNodeDistances(stage, nodes);
   for (const ap of aps) stage.append(marker('ap', ap, compact && (aps.length > 12 || window.innerWidth < 520)));
@@ -590,8 +720,21 @@ function renderFleet() {
   const aps = Array.isArray(state.topology?.access_points) ? state.topology.access_points : [];
   const nodeList = $('#node-list');
   const apList = $('#ap-list');
+  const qualitySummary = $('#node-quality-summary');
   clear(nodeList);
   clear(apList);
+  clear(qualitySummary);
+
+  const usableNodes = nodes.filter((node) => coverageOf(node).score >= 0.46).length;
+  const weakNodes = nodes.filter((node) => {
+    const score = coverageOf(node).score;
+    return score > 0 && score < 0.46;
+  }).length;
+  qualitySummary?.append(
+    create('span', 'quality-chip strong', `${usableNodes} usable`),
+    create('span', weakNodes ? 'quality-chip weak' : 'quality-chip', `${weakNodes} weak`),
+    create('span', 'quality-chip', `${nodes.length} total`)
+  );
 
   if (!nodes.length) {
     nodeList?.append(emptyRow('Aucun ESP32-C6 vu par le master'));
@@ -599,10 +742,11 @@ function renderFleet() {
     for (const node of nodes) {
       const pos = currentNodePosition(node);
       const status = text(node.health_status || node.status, node.active ? 'live' : 'offline');
+      const coverage = coverageOf(node);
       nodeList?.append(denseRow(
         text(node.display_label || node.label, `ESP32-C6 #${node.node_id}`),
         `node_id ${node.node_id} / ${text(node.remote_addr, 'no addr')} / X ${pos.x.toFixed(2)} Y ${pos.y.toFixed(2)} Z ${pos.z.toFixed(2)}`,
-        [fmtHz(node.frame_rate_hz), `CSI ${fmtAge(node.last_csi_ms ?? node.last_seen_ms)}`, fmtPct(pos.confidence)],
+        [coverage.quality, fmtPct(coverage.score), fmtHz(node.frame_rate_hz), `CSI ${fmtAge(node.last_csi_ms ?? node.last_seen_ms)}`, fmtPct(pos.confidence)],
         status
       ));
     }
@@ -727,6 +871,8 @@ function renderVitals() {
   const presence = firstDefined(state.latest?.classification?.presence, edge.presence, false);
   const motion = firstDefined(state.latest?.classification?.motion_level, edge.motion ? 'motion' : undefined, 'unknown');
   const persons = firstDefined(state.latest?.count_evidence?.rendered_persons, state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
+  const person = primaryPerson();
+  const posture = normalizePoseName(firstDefined(person?.pose, person?.posture, state.latest?.posture, state.pose?.posture));
   const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, edgeVitals.breathing_rate_bpm, vitals.breathing_rate_bpm);
   const heart = firstDefined(latestVitals.heart_rate_bpm, edge.heartrate_bpm, edgeVitals.heartrate_bpm, vitals.heart_rate_bpm);
   const quality = firstDefined(latestVitals.signal_quality, edge.presence_score, edgeVitals.presence_score, vitals.signal_quality);
@@ -734,10 +880,11 @@ function renderVitals() {
   setText('presence-state', presence ? 'présence' : 'absent');
   setText('person-count', String(persons || 0));
   setText('motion-level', text(motion, 'unknown'));
-  setText('breathing-rate', breathing ? `${Number(breathing).toFixed(1)} bpm` : '--');
-  setText('heart-rate', heart ? `${Number(heart).toFixed(1)} bpm` : '--');
+  setText('posture-state', state.vitalsOptIn ? text(posture, '--') : 'masquee');
+  setText('breathing-rate', state.vitalsOptIn && breathing ? `${Number(breathing).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
+  setText('heart-rate', state.vitalsOptIn && heart ? `${Number(heart).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
   setText('signal-quality', fmtPct(quality));
-  setText('vitals-status', breathing || heart || presence ? 'live' : 'attente');
+  setText('vitals-status', state.vitalsOptIn ? breathing || heart || presence ? 'live' : 'attente' : 'opt-in off');
 }
 
 function recordCalibrationEvent(message, level = 'info') {
@@ -774,6 +921,7 @@ function noteCalibrationStatus(status, data) {
 function renderCalibration() {
   const data = state.calibration || {};
   const status = text(data.status, 'unknown');
+  const auto = data.auto_mode || {};
   const frameCount = Math.max(0, Number(data.frame_count || 0));
   const minFrames = Math.max(1, Number(data.min_frames || CALIBRATION_MIN_FRAMES_FALLBACK));
   const progress = status === 'Fresh'
@@ -795,6 +943,8 @@ function renderCalibration() {
     ['active_nodes', data.active_nodes],
     ['min_nodes', data.min_nodes],
     ['dedup_factor', data.dedup_factor],
+    ['auto', auto.enabled ? `${auto.guard_state || 'unknown'} / ${auto.recommended_action || '--'}` : 'off'],
+    ['blockers', Array.isArray(auto.blockers) && auto.blockers.length ? auto.blockers.join(', ') : 'none'],
   ];
   for (const [key, value] of rows) {
     const row = create('tr');
@@ -810,6 +960,17 @@ function renderCalibration() {
   }
   const stop = $('#stop-calibration');
   if (stop) stop.disabled = !data.enabled;
+  const autoButton = $('#auto-calibration');
+  if (autoButton) {
+    autoButton.classList.toggle('is-active', Boolean(auto.enabled));
+    autoButton.textContent = auto.enabled ? 'Auto on' : 'Auto safe';
+    autoButton.title = auto.enabled ? 'Desactiver auto-calibration safe' : 'Activer auto-calibration safe';
+  }
+  const abort = $('#abort-calibration');
+  if (abort) abort.disabled = !data.enabled && !auto.enabled;
+  setText('calibration-guard', auto.enabled
+    ? `${text(auto.guard_state, 'unknown')} / quiet ${Number(auto.quiet_elapsed_sec || 0)}s/${Number(auto.quiet_window_sec || 30)}s / ${text(auto.recommended_action)}`
+    : 'auto safe inactif');
   renderCalibrationLog();
 }
 
@@ -839,12 +1000,13 @@ function activatePanel(panel, updateHash = false) {
 }
 
 async function refreshRest() {
-  const [topologyResult, modulesResult, vitalsResult, edgeVitalsResult, calibrationResult] = await Promise.allSettled([
+  const [topologyResult, modulesResult, vitalsResult, edgeVitalsResult, calibrationResult, poseResult] = await Promise.allSettled([
     fetchJson('/api/v1/topology'),
     fetchJson('/api/v1/modules'),
     fetchJson('/api/v1/vital-signs').catch(() => null),
     fetchJson('/api/v1/edge-vitals').catch(() => null),
     fetchJson('/api/v1/calibration').catch(() => null),
+    fetchJson('/api/v1/pose/current').catch(() => null),
   ]);
 
   if (topologyResult.status === 'fulfilled') {
@@ -860,7 +1022,9 @@ async function refreshRest() {
   if (vitalsResult.status === 'fulfilled') state.vitals = vitalsResult.value;
   if (edgeVitalsResult.status === 'fulfilled') state.edgeVitals = edgeVitalsResult.value;
   if (calibrationResult.status === 'fulfilled') state.calibration = calibrationResult.value;
+  if (poseResult.status === 'fulfilled') state.pose = poseResult.value;
   renderAll();
+  await maybeAutoPersistPlacement();
 }
 
 function connectWs() {
@@ -876,6 +1040,7 @@ function connectWs() {
   ws.onmessage = (event) => {
     try {
       state.latest = JSON.parse(event.data);
+      renderTopology();
       renderVitals();
     } catch (error) {
       logEvent(`Frame sensing invalide: ${error.message}`, 'warn');
@@ -1073,6 +1238,89 @@ async function persistPlacement() {
   }
 }
 
+function nodeNeedsAutoPlacement(node) {
+  const pos = positionOf(node);
+  const source = statusClass(pos.source);
+  return !['configured', 'manual'].includes(source) && Number(pos.confidence || 0) < 0.75;
+}
+
+function autoPositionFor(index, total) {
+  const [width, height, depth] = roomDims();
+  const n = Math.max(1, total);
+  const angle = -0.35 + (index / n) * Math.PI * 2;
+  return {
+    x: Math.cos(angle) * width * 0.36,
+    y: clamp(height * 0.42, 0.8, Math.max(0.8, height - 0.2)),
+    z: Math.sin(angle) * depth * 0.36,
+    source: 'auto',
+    confidence: 0.58,
+  };
+}
+
+function autoPlacementPayload() {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  const candidates = nodes.filter(nodeNeedsAutoPlacement);
+  return candidates.map((node, index) => {
+    const pos = autoPositionFor(index, candidates.length);
+    return {
+      node_id: nodeIdOf(node),
+      position_m: [pos.x, pos.y, pos.z],
+      pos,
+    };
+  }).filter((item) => item.node_id > 0 && !validatePosition(item.pos));
+}
+
+async function autoPlaceUnknownNodes({ persist = false } = {}) {
+  const payload = autoPlacementPayload();
+  if (!payload.length) {
+    setText('auto-placement-status', 'auto placement ok');
+    return false;
+  }
+  for (const item of payload) state.placementDraft.set(item.node_id, item.pos);
+  refreshPlacementDirty();
+  renderTopology();
+  renderPlacementControls();
+  setText('auto-placement-status', `${payload.length} auto position(s)`);
+  if (!persist) return true;
+  try {
+    await saveNodePositions(payload.map(({ node_id, position_m }) => ({ node_id, position_m })));
+    state.placementDirty = false;
+    state.placementDraft.clear();
+    state.placementOriginal.clear();
+    logEvent(`${payload.length} position(s) auto enregistree(s)`);
+    setText('auto-placement-status', `${payload.length} auto saved`);
+    return true;
+  } catch (error) {
+    state.placementServerError = error.message;
+    logEvent(`Auto placement: ${error.message}`, 'warn');
+    setText('auto-placement-status', 'auto placement blocked');
+    return false;
+  }
+}
+
+async function maybeAutoPersistPlacement() {
+  if (state.autoPlacementSaving || state.placementDirty) return;
+  const payload = autoPlacementPayload();
+  if (!payload.length) {
+    state.autoPlacementLastKey = '';
+    state.autoPlacementStableCount = 0;
+    setText('auto-placement-status', 'auto placement ok');
+    return;
+  }
+  const [w, h, d] = roomDims();
+  const key = `${w.toFixed(2)}:${h.toFixed(2)}:${d.toFixed(2)}:${payload.map((item) => item.node_id).join(',')}`;
+  state.autoPlacementStableCount = key === state.autoPlacementLastKey ? state.autoPlacementStableCount + 1 : 1;
+  state.autoPlacementLastKey = key;
+  setText('auto-placement-status', `${payload.length} pending / stable ${state.autoPlacementStableCount}`);
+  if (state.autoPlacementStableCount < AUTO_PLACEMENT_STABLE_REFRESHES) return;
+  state.autoPlacementSaving = true;
+  try {
+    await autoPlaceUnknownNodes({ persist: true });
+  } finally {
+    state.autoPlacementSaving = false;
+  }
+}
+
 function bindActions() {
   for (const button of $$('[data-panel]')) {
     button.addEventListener('click', () => activatePanel(button.dataset.panel, true));
@@ -1163,6 +1411,42 @@ function bindActions() {
       renderCalibration();
     }
   });
+  $('#auto-calibration')?.addEventListener('click', async () => {
+    const enabled = !Boolean(state.calibration?.auto_mode?.enabled);
+    try {
+      state.calibration = await fetchJson('/api/v1/calibration/auto', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled, policy: 'safe' }),
+      });
+      recordCalibrationEvent(enabled ? 'Auto safe active' : 'Auto safe desactive');
+      renderCalibration();
+      await refreshRest();
+    } catch (error) {
+      recordCalibrationEvent(error.message, 'warn');
+      logEvent(error.message, 'warn');
+    }
+  });
+  $('#abort-calibration')?.addEventListener('click', async () => {
+    try {
+      const result = await fetchJson('/api/v1/calibration/abort', { method: 'POST' });
+      if (result.success === false) throw new Error(result.error || 'Calibration abort rejected');
+      state.calibration = result.calibration || state.calibration;
+      recordCalibrationEvent('Calibration abort');
+      logEvent('Calibration abort');
+      renderCalibration();
+      await refreshRest();
+    } catch (error) {
+      recordCalibrationEvent(error.message, 'warn');
+      logEvent(error.message, 'warn');
+    }
+  });
+  $('#vitals-optin')?.addEventListener('change', (event) => {
+    state.vitalsOptIn = Boolean(event.target.checked);
+    localStorage.setItem('ruvsense:vitals-opt-in', state.vitalsOptIn ? 'true' : 'false');
+    renderStatus();
+    renderVitals();
+  });
   const topologyStage = $('#topology-stage');
   topologyStage?.addEventListener('pointerdown', beginNodeDrag);
   topologyStage?.addEventListener('pointerdown', beginPlacementPan);
@@ -1178,6 +1462,9 @@ function bindActions() {
   $('#placement-zoom-in')?.addEventListener('click', () => zoomPlacementBy(1.2));
   $('#placement-zoom-out')?.addEventListener('click', () => zoomPlacementBy(1 / 1.2));
   $('#placement-zoom-fit')?.addEventListener('click', fitPlacementViewToNodes);
+  $('#auto-place-now')?.addEventListener('click', async () => {
+    await autoPlaceUnknownNodes({ persist: true });
+  });
   $('#reset-placement')?.addEventListener('click', resetPlacement);
   $('#save-placement')?.addEventListener('click', persistPlacement);
   for (const id of ['placement-x', 'placement-y', 'placement-z']) {
@@ -1197,6 +1484,12 @@ function fixtureTopology(count = 3) {
       frame_rate_hz: 9 + (index % 5),
       last_seen_ms: 40 + index,
       sync_status: index % 3 === 0 ? 'valid' : 'no_sync',
+      coverage: {
+        score: index % 4 === 3 ? 0.32 : 0.78 - (index % 3) * 0.13,
+        quality: index % 4 === 3 ? 'weak' : 'usable',
+        radius_m: 8 + index,
+        reasons: index % 4 === 3 ? ['low_rssi'] : [],
+      },
       position: {
         x: Math.cos(angle) * 2.0,
         y: 1.1,
@@ -1230,12 +1523,43 @@ function fixtureTopology(count = 3) {
       node_id: node.node_id,
       source: index % 5 === 0 ? 'configured' : 'estimated',
       confidence: index % 5 === 0 ? 0.86 : 0.35,
+      distance_m: 8 + index,
+      coverage: {
+        score: node.coverage.score,
+        quality: node.coverage.quality,
+        radius_m: node.coverage.radius_m,
+        reasons: node.coverage.reasons,
+      },
     }] : []),
   };
 }
 
 window.__ruvsenseRenderFixture = (count = 3) => {
   state.topology = fixtureTopology(Number(count) || 0);
+  state.latest = count > 0 ? {
+    type: 'sensing_update',
+    source: 'esp32',
+    classification: { presence: true, motion_level: count > 1 ? 'walking' : 'present_still', confidence: 0.78 },
+    estimated_persons: 1,
+    count_evidence: { rendered_persons: 1, stable_persons: 1 },
+    posture: 'standing',
+    persons: [{ id: 'fixture-person', pose: count > 1 ? 'standing' : 'sitting', position_m: [0.3, 0.0, 0.4], confidence: 0.72, position_source: 'multistatic' }],
+    vital_signs: { breathing_rate_bpm: 13.8, heart_rate_bpm: 72.4, signal_quality: 0.74 },
+  } : null;
+  state.pose = count > 0 ? {
+    posture: 'standing',
+    persons: [{ id: 'fixture-person', pose: count > 1 ? 'standing' : 'sitting', position_m: [0.3, 0.0, 0.4], confidence: 0.72, position_source: 'multistatic' }],
+  } : null;
+  state.calibration = {
+    status: 'not_started',
+    enabled: false,
+    frame_count: 0,
+    min_frames: CALIBRATION_MIN_FRAMES_FALLBACK,
+    active_nodes: count,
+    min_nodes: 1,
+    dedup_factor: 3,
+    auto_mode: { enabled: false, guard_state: 'blocked', recommended_action: 'enable_auto_or_start_manual', blockers: [] },
+  };
   renderAll();
   return state.topology;
 };
@@ -1247,6 +1571,8 @@ window.__ruvsenseConsoleTestApi = {
   updatePositionFromInputs,
   fitPlacementViewToNodes,
   resetPlacementView,
+  autoPlacementPayload,
+  autoPlaceUnknownNodes,
   placementView: () => ({ zoom: state.placementZoom, pan: { ...state.placementPan } }),
 };
 
