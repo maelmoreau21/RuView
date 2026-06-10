@@ -1,5 +1,10 @@
 # RuvSense Edge
 
+> [!IMPORTANT]
+> Ce projet est un outil de recherche et d'expérimentation. Il ne doit pas être utilisé à des fins médicales.
+>
+> **Medical/research disclaimer.** RuvSense Edge is a research and monitoring platform, not a medical device, diagnostic system, emergency response service, or substitute for professional care. Vital-sign, fall, cardiac, arrhythmia, DensePose, and 3D outputs are estimates that can be wrong, especially with motion, multipath, poor calibration, or too few live CSI nodes.
+
 <p align="center">
   <a href="https://cognitum.one/seed">
     <img src="assets/ruview-seed.png" alt="RuView - WiFi DensePose" width="100%">
@@ -51,28 +56,26 @@ RuView turns ordinary WiFi into a contactless sensor. A $9 ESP32 board reads the
 [![crates.io](https://img.shields.io/crates/v/wifi-densepose-ruvector.svg)](https://crates.io/crates/wifi-densepose-ruvector)
 [![Downloads](https://img.shields.io/badge/downloads-10M%2B-brightgreen.svg)](#-edge-module-catalog)
 
- 
-> | What | How | Speed / scale |
-> |------|-----|---------------|
-> | 🫁 **Breathing rate** | Bandpass 0.1–0.5 Hz on wrapped phase, circular variance, zero-crossing BPM ([#593](https://github.com/ruvnet/RuView/issues/593)) | 6–30 BPM, real-time |
-> | 💓 **Heart rate** | Bandpass 0.8–2.0 Hz, zero-crossing BPM | 40–120 BPM, real-time |
-> | 👤 **Presence detection** | Trained head on Hugging Face ([`ruvnet/wifi-densepose-pretrained`](https://huggingface.co/ruvnet/wifi-densepose-pretrained); v2 encoder = 82.3% held-out temporal-triplet acc, honestly re-benchmarked) + a phase-variance fallback that needs no model | < 1 ms, ~30 s ambient calibration |
-> | 🧬 **CSI embeddings** | 128-dim contrastive encoder shipped on Hugging Face, 4-bit quantised variant fits in 8 KB | **164,183 emb/s** on M4 Pro |
-> | 🦴 **17-keypoint pose estimation** | `cog-pose-estimation` Cog v0.0.1 — signed aarch64 + x86_64 binaries on GCS, loads `pose_v1.safetensors` via Candle. Train your own from paired data in 2.1 s on an RTX 5080 ([ADR-101](docs/adr/ADR-101-pose-estimation-cog.md), [benchmarks](docs/benchmarks/pose-estimation-cog.md)). **SOTA on MM-Fi:** [`ruvnet/wifi-densepose-mmfi-pose`](https://huggingface.co/ruvnet/wifi-densepose-mmfi-pose) hits **82.69% torso-PCK@20** (ensemble 83.59%), beating MultiFormer (72.25%) and CSI2Pose (68.41%) on the matched MM-Fi `random_split` protocol — self-corrected and auditable on [AetherArena](https://huggingface.co/spaces/ruvnet/aether-arena) | 8.4 ms cold-start on a Pi 5 |
-> | 🚶 **Motion / activity** | Motion-band power + phase acceleration | Real-time |
-> | 🤸 **Fall detection** | Phase-acceleration threshold + 3-frame debounce + 5 s cooldown ([#263](https://github.com/ruvnet/RuView/issues/263)) | < 200 ms |
-> | 🧮 **Multi-person count** | Adaptive P95 normalisation + runtime-tunable dedup factor (`/api/v1/config/dedup-factor`, [#491](https://github.com/ruvnet/RuView/pull/491)). Six specialised learned counters available as Cogs: `occupancy-zones`, `elevator-count`, `queue-length`, `customer-flow`, `clean-room`, `person-matching` | Real-time, self-calibrating |
-> | 🌍 **World model prediction** | OccWorld TransVQVAE — 15-frame future occupancy prediction, 209 ms inference, 3.4 GB VRAM on RTX 5080; fine-tune on your space with `occworld_retrain.py` ([ADR-147](docs/adr/ADR-147-nvidia-cosmos-world-foundation-model-integration.md)) | 15 frames × 200×200×16 vox |
-> | 🧱 **Through-wall sensing** | Fresnel-zone geometry + multipath modeling | Up to ~5 m, signal-dependent |
-> | 🧠 **Edge intelligence** | **105-cog catalog** ([ADR-102](docs/adr/ADR-102-edge-module-registry.md)) live from `app-registry.json` — health, security, building, retail, industrial, research, AI, swarm, signal, network, and developer modules. Optional Cognitum Seed adds persistent vector store + kNN + witness chain | $140 total BOM |
-> | 🎯 **Camera-free pre-training** | Self-supervised contrastive encoder, 12.2M training steps on 60K frames, shipped on Hugging Face | 84 s/epoch retrain on M4 Pro |
-> | 📷 **Camera-supervised fine-tune** | MediaPipe + ESP32 CSI paired training, end-to-end Candle pipeline on RTX 5080 ([ADR-079](docs/adr/ADR-079-camera-supervised-pose-finetune.md)) | 2.1 s for 400 epochs (~5 ms/epoch) |
-> | 📡 **Multi-frequency mesh** | Channel hopping across 6 bands, TDM slot scheduling ([ADR-029](docs/adr/ADR-029-multifrequency-mesh.md)) | 3× sensing bandwidth |
-> | 🌐 **3D point cloud fusion** | Camera depth (MiDaS) + WiFi CSI + mmWave radar → unified spatial model | 22 ms pipeline · 19K+ points/frame |
->
-> Browse the full 105-module catalog (with practical descriptions, sizes, and difficulty) below in [🧩 Edge Module Catalog](#-edge-module-catalog), or visit [seed.cognitum.one/store](https://seed.cognitum.one/store).
->
-> 🤗 **Pretrained weights**: download from [`ruvnet/wifi-densepose-pretrained`](https://huggingface.co/ruvnet/wifi-densepose-pretrained) — see [Loading the pretrained model](#loading-the-pretrained-model) below for one-command setup.
+### Features
+
+| Feature | Statut | Fiabilité honnête |
+|---------|--------|-------------------|
+| Présence humaine | Stable | Bon signal de présence/occupation avec CSI live et calibration ambiante; ne fournit pas une identité et reste sensible au placement des nœuds. |
+| Mouvement | Stable | Fiable pour mouvement grossier et changements d'activité; les gestes fins dépendent fortement de l'environnement et des données locales. |
+| Fréquence respiratoire au repos | Stable | Estimation utile au repos ou pendant le sommeil; dégradée par mouvement, posture et multipath; pas un moniteur médical. |
+| Zone approximative avec 3+ nœuds | Stable | Localisation par zone quand la géométrie multistatique est suffisante; précision métrique non garantie, limitée avec 1-2 nœuds. |
+| Non-mouvement prolongé / chute possible | Stable | Alerte de screening à confirmer par un humain; les faux positifs restent possibles avec meubles, animaux, multipath ou nœuds mal placés. |
+| Streaming CSI UDP ESP32-C6 | Stable | Chemin de production officiel; échoue fermé si le quorum de nœuds live est absent; simulation uniquement en dev/test explicite. |
+| Skeleton 17 keypoints / pose | Beta/expérimental, désactivé par défaut | Recherche pose CSI; peut être utile sur jeux de données/espaces calibrés, pas fiable comme suivi humain général sans données appairées locales. |
+| Arrêt cardiaque | Beta/expérimental, désactivé par défaut | Non validé cliniquement; ne doit pas être utilisé comme détecteur d'urgence ou dispositif de sécurité vitale. |
+| Fréquence cardiaque précise | Beta/expérimental, désactivé par défaut | Tendance/screening seulement; très sensible au mouvement, à la respiration et au multipath; ne pas présenter comme battement-par-battement. |
+| Comptage multi-personnes précis | Beta/expérimental, désactivé par défaut | Occupation approximative possible; comptage précis et ré-identification nécessitent géométrie contrôlée, calibration et validation locale. |
+| DensePose / reconstruction 3D | Beta/expérimental, désactivé par défaut | Démo/recherche, utile pour exploration et benchmarks; pas une reconstruction 3D production-grade. |
+| WASM cardiac-arrhythmia | Beta/expérimental, désactivé par défaut | Prototype de screening; pas un diagnostic d'arythmie, conservé dans les workflows beta/recherche. |
+
+Browse the full 105-module catalog (with practical descriptions, sizes, and difficulty) below in [Edge Module Catalog](#-edge-module-catalog), or visit [seed.cognitum.one/store](https://seed.cognitum.one/store).
+
+**Pretrained weights**: download from [`ruvnet/wifi-densepose-pretrained`](https://huggingface.co/ruvnet/wifi-densepose-pretrained) — see [Loading the pretrained model](#loading-the-pretrained-model) below for one-command setup.
 
 ```bash
 # RuvSense Edge: Raspberry Pi 4/5 or Docker Desktop master + ESP32-C6 nodes
@@ -119,14 +122,14 @@ For LAN access from another machine, set `SENSING_ALLOWED_HOSTS=<master-ip>,<hos
 
 ### Health Monitoring Setup
 
-The health monitoring bootstrap script loads the RuvSense health runtime modules, verifies live ESP32-C6 CSI topology, then polls `/api/v1/vital-signs` every 5 seconds. It writes JSONL records to `logs/health_YYYYMMDD.jsonl` and prints terminal-bell red alerts for apnea, unsafe heart rate, high breathing rate, or fall events reported by the API.
+The stable health monitoring bootstrap script loads only the non-cardiac RuvSense runtime modules for coherence gating, resting respiration, and possible fall/non-movement alerts. It verifies live ESP32-C6 CSI topology, then polls `/api/v1/vital-signs` every 5 seconds. It writes JSONL records to `logs/health_YYYYMMDD.jsonl` and prints terminal-bell red alerts for low/paused breathing, high breathing rate, or fall events reported by the API.
 
 ```bash
 python -m pip install requests
 python scripts/setup_health_monitoring.py
 ```
 
-Thresholds and the master address live in [`scripts/health_alert_config.json`](scripts/health_alert_config.json). The script waits on `/health/ready` for up to 120 seconds, warns if no live ESP32-C6 CSI node is present in `/api/v1/topology`, and enables modules through the runtime endpoint `PUT /api/v1/modules/:id/enabled`. Current runtime aliases are `health-monitor` -> `respiration_tracking` + `fall_detection`, `sleep-apnea` -> `sleep_apnea_screening`, `cardiac-arrhythmia` -> `cardiac_arrhythmia`, and `vital-trend` -> `respiration_tracking` + `cardiac_arrhythmia`.
+Thresholds and the master address live in [`scripts/health_alert_config.json`](scripts/health_alert_config.json). The script waits on `/health/ready` for up to 120 seconds, warns if no live ESP32-C6 CSI node is present in `/api/v1/topology`, and enables modules through the runtime endpoint `PUT /api/v1/modules/:id/enabled`. Current stable runtime aliases are `health-monitor` -> `respiration_tracking` + `fall_detection` and `sleep-apnea` -> `sleep_apnea_screening` when available. Cardiac and arrhythmia workflows are beta/research-only and live under [`beta/`](beta/README.md).
 
 To run it with Docker Compose, enable the optional profile. The script container shares the `ruvsense-master` network namespace, so the default `127.0.0.1:3000` config still targets the master service.
 

@@ -131,10 +131,33 @@
           <span id="fleet-summary" class="badge">0 live</span>
         </div>
         <div id="node-quality-summary" class="quality-strip" aria-live="polite"></div>
-        <div class="split-list">
-          <section>
-            <h3>Nœuds ESP32-C6</h3>
-            <div id="node-list" class="dense-list"></div>
+        <div class="left-column-stack">
+          <section class="left-column-section" aria-labelledby="nodes-section-title">
+            <h3 id="nodes-section-title" class="left-section-title">N&OElig;UDS</h3>
+            <div id="node-list" class="node-card-list"></div>
+          </section>
+          <section class="left-column-section" aria-labelledby="system-section-title">
+            <h3 id="system-section-title" class="left-section-title">SYST&Egrave;ME</h3>
+            <div class="system-grid">
+              <div><span>Version</span><strong id="system-version">--</strong></div>
+              <div><span>Uptime</span><strong id="system-uptime">--</strong></div>
+              <div><span>Frame count</span><strong id="system-frame-count">--</strong></div>
+              <div><span>Mode</span><strong id="system-mode-badge" class="system-mode-badge is-live">MODE LIVE</strong></div>
+            </div>
+          </section>
+          <section class="left-column-section" aria-labelledby="actions-section-title">
+            <h3 id="actions-section-title" class="left-section-title">ACTIONS</h3>
+            <div class="left-action-row">
+              <button id="left-recalibrate" class="console-action-button" type="button">
+                <span class="button-spinner" aria-hidden="true"></span>
+                <span>Recalibrer</span>
+              </button>
+              <button id="left-reload-modules" class="console-action-button" type="button">
+                <span class="button-spinner" aria-hidden="true"></span>
+                <span>Recharger modules</span>
+              </button>
+            </div>
+            <p id="left-action-status" class="left-action-status" role="status" aria-live="polite">Pr&ecirc;t</p>
           </section>
         </div>
       </section>
@@ -180,7 +203,15 @@
           <input id="vitals-optin" type="checkbox">
           <span>Afficher vitals et posture</span>
         </label>
-        <dl class="metric-list">
+        <div class="right-tabs" role="tablist" aria-label="Vitaux alertes tendances">
+          <button class="right-tab is-active" type="button" role="tab" aria-selected="true" data-vitals-tab="vitals">VITAUX</button>
+          <button class="right-tab" type="button" role="tab" aria-selected="false" data-vitals-tab="alerts">ALERTES <span id="alerts-count">0</span></button>
+          <button class="right-tab" type="button" role="tab" aria-selected="false" data-vitals-tab="trends">TENDANCES</button>
+        </div>
+
+        <div class="right-tab-panel is-active" data-vitals-panel="vitals">
+        <div id="vitals-person-cards" class="vitals-person-cards"></div>
+        <dl class="metric-list compact-metrics">
           <div><dt>Présence</dt><dd id="presence-state">unknown</dd></div>
           <div><dt>Personnes</dt><dd id="person-count">0</dd></div>
           <div><dt>Posture</dt><dd id="posture-state">masquee</dd></div>
@@ -190,6 +221,32 @@
           <div><dt>Cœur</dt><dd id="heart-rate">--</dd></div>
           <div><dt>Qualité signal</dt><dd id="signal-quality">--</dd></div>
         </dl>
+        </div>
+
+        <div class="right-tab-panel" data-vitals-panel="alerts">
+          <section class="alerts-panel" aria-live="polite">
+            <div class="alerts-panel-head">
+              <h3>ALERTES <span id="alerts-title-count">0</span></h3>
+              <button id="clear-alerts" type="button">Tout effacer</button>
+            </div>
+            <ol id="right-alert-list" class="right-alert-list"></ol>
+          </section>
+        </div>
+
+        <div class="right-tab-panel" data-vitals-panel="trends">
+          <section class="trends-panel" aria-label="Tendances respiration">
+            <div class="trends-panel-head">
+              <h3>Respiration 10 min</h3>
+              <span id="trend-person-label">--</span>
+            </div>
+            <canvas id="breathing-trend-canvas" width="240" height="80"></canvas>
+            <div class="trend-axis-labels">
+              <span>-10min</span>
+              <span>0-30 rpm</span>
+              <span>maintenant</span>
+            </div>
+          </section>
+        </div>
       </section>
 
       <section class="panel-view" data-view="calibration">

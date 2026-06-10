@@ -1,4 +1,4 @@
-import { initAlerts, processAlertState } from './alerts.js';
+import { clearAlerts, getAlerts, initAlerts, processAlertState } from './alerts.js';
 
 const state = {
   topology: null,
@@ -8,6 +8,8 @@ const state = {
   edgeVitals: null,
   calibration: null,
   pose: null,
+  fleet: null,
+  version: null,
   latest: null,
   ws: null,
   reconnectTimer: null,
@@ -33,6 +35,18 @@ const state = {
   autoPlacementStableCount: 0,
   autoPlacementSaving: false,
   placementAutoMode: localStorage.getItem('ruvsense:placement-mode') !== 'manual',
+  leftActions: {
+    recalibrate: { status: 'idle', message: 'Prêt' },
+    reloadModules: { status: 'idle', message: 'Prêt' },
+  },
+  leftActionCurrent: 'recalibrate',
+  roomConfig: null,
+  roomConfigSource: 'pending',
+  topologyAnimationId: null,
+  personTrails: new Map(),
+  vitalsTab: 'vitals',
+  breathingHistory: new Map(),
+  apneaZeroSince: new Map(),
 };
 
 const VALID_PANELS = new Set(['fleet', 'modules', 'vitals', 'calibration', 'diagnostics']);
@@ -41,8 +55,24 @@ const PLACEMENT_MAX_ZOOM = 8;
 const PLACEMENT_FIT_PADDING = 1.25;
 const CALIBRATION_MIN_FRAMES_FALLBACK = 12000;
 const AUTO_PLACEMENT_STABLE_REFRESHES = 2;
+const ACTION_SPINNER_MS = 3000;
 const SHARED_CHANNEL_NAME = 'ruvsense';
 const SHARED_STATE_STORAGE_KEY = 'ruvsense:shared-state';
+const ROOM_CONFIG_PATH = '/ui/room-config.json';
+const DEFAULT_CANVAS_ROOM_WIDTH_M = 5.0;
+const DEFAULT_CANVAS_ROOM_DEPTH_M = 4.0;
+const DEFAULT_ROOM_CONFIG = {
+  room_width_meters: DEFAULT_CANVAS_ROOM_WIDTH_M,
+  room_height_meters: DEFAULT_CANVAS_ROOM_DEPTH_M,
+  nodes: [
+    { id: 1, x: 0, y: 0 },
+    { id: 2, x: DEFAULT_CANVAS_ROOM_WIDTH_M, y: 0 },
+    { id: 3, x: DEFAULT_CANVAS_ROOM_WIDTH_M, y: DEFAULT_CANVAS_ROOM_DEPTH_M },
+    { id: 4, x: 0, y: DEFAULT_CANVAS_ROOM_DEPTH_M },
+  ],
+};
+const BREATHING_TREND_MS = 10 * 60 * 1000;
+const APNEA_ZERO_MS = 15 * 1000;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const sharedStateChannel = typeof BroadcastChannel !== 'undefined'
@@ -72,6 +102,58 @@ function fmtAge(ms) {
   if (n < 1000) return `${Math.round(n)} ms`;
   if (n < 60000) return `${(n / 1000).toFixed(1)} s`;
   return `${Math.round(n / 60000)} min`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nodeFrameAgeMs(node) {
+  const value = Number(firstDefined(node?.last_csi_ms, node?.last_seen_ms));
+  if (!Number.isFinite(value) || value > 30 * 24 * 60 * 60 * 1000) return null;
+  return value;
+}
+
+function fmtFrameAge(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return '--';
+  if (n < 1000) return `${Math.round(n)}ms`;
+  if (n < 10000) return `${(n / 1000).toFixed(1)}s`;
+  return `${Math.round(n / 1000)}s`;
+}
+
+function frameAgeTone(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return 'stale';
+  if (n < 5000) return 'fresh';
+  if (n <= 30000) return 'aging';
+  return 'stale';
+}
+
+function rssiSegments(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  if (n >= -50) return 5;
+  if (n >= -60) return 4;
+  if (n >= -70) return 3;
+  if (n >= -80) return 2;
+  return 1;
+}
+
+function fmtUptime(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || n < 0) return '--';
+  const days = Math.floor(n / 86400);
+  const hours = Math.floor((n % 86400) / 3600);
+  const minutes = Math.floor((n % 3600) / 60);
+  if (days > 0) return `${days}j ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function fmtInteger(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n).toLocaleString('fr-FR') : '--';
 }
 
 function fmtPct(value) {
@@ -141,6 +223,52 @@ async function fetchJson(path, options) {
   const response = await fetch(path, { cache: 'no-store', ...options });
   if (!response.ok) throw new Error(`${path} HTTP ${response.status}`);
   return response.json();
+}
+
+function positiveNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function normalizeRoomConfig(raw, source) {
+  const width = positiveNumber(
+    raw?.room_width_meters ?? raw?.width_meters ?? raw?.width_m ?? raw?.width ?? raw?.dimensions_m?.[0],
+    DEFAULT_CANVAS_ROOM_WIDTH_M,
+  );
+  const depth = positiveNumber(
+    raw?.room_height_meters ?? raw?.room_depth_meters ?? raw?.depth_meters ?? raw?.height_meters ?? raw?.depth ?? raw?.dimensions_m?.[2] ?? raw?.dimensions_m?.[1],
+    DEFAULT_CANVAS_ROOM_DEPTH_M,
+  );
+  const rawNodes = Array.isArray(raw?.nodes) ? raw.nodes : [];
+  const nodes = rawNodes
+    .map((node, index) => {
+      const position = node?.position_m ?? node?.position ?? [];
+      const id = Number(node?.id ?? node?.node_id ?? index + 1);
+      const x = Number(node?.x ?? position?.[0] ?? position?.x);
+      const y = Number(node?.y ?? node?.z ?? position?.[2] ?? position?.z ?? position?.[1]);
+      return {
+        id,
+        x,
+        y,
+        label: text(node?.label, `N${id}`),
+        rangeM: Number(node?.range_m ?? node?.radius_m ?? node?.coverage?.radius_m),
+      };
+    })
+    .filter((node) => Number.isFinite(node.id) && Number.isFinite(node.x) && Number.isFinite(node.y));
+
+  return { width, depth, nodes, source };
+}
+
+async function loadRoomConfig() {
+  try {
+    const config = await fetchJson(ROOM_CONFIG_PATH);
+    state.roomConfig = normalizeRoomConfig(config, 'file');
+    state.roomConfigSource = 'file';
+  } catch (error) {
+    state.roomConfig = normalizeRoomConfig(DEFAULT_ROOM_CONFIG, 'default');
+    state.roomConfigSource = 'default';
+    logEvent(`room-config.json absent, plan Canvas2D par dÃ©faut ${DEFAULT_CANVAS_ROOM_WIDTH_M}m x ${DEFAULT_CANVAS_ROOM_DEPTH_M}m`, 'warn');
+  }
 }
 
 async function setModuleEnabled(id, enabled) {
@@ -452,7 +580,7 @@ function renderStatus() {
   const fusion = text(readiness.fusion_mode, 'offline');
   const source = text(topology?.source, 'offline');
   const frameRate = Math.max(0, ...(topology?.nodes || []).map((node) => Number(node.frame_rate_hz) || 0));
-  const [w, h, d] = roomDims();
+  const roomConfig = canvasRoomConfig();
 
   const master = $('#master-status');
   if (master) {
@@ -465,7 +593,7 @@ function renderStatus() {
   setText('fusion-mode', fusion);
   setText('source-mode', source);
   setText('scan-interface', text(topology?.wifi_scan?.interface, 'wlan0'));
-  setText('room-size', `${w.toFixed(1)} x ${h.toFixed(1)} x ${d.toFixed(1)} m`);
+  setText('room-size', `${roomConfig.width.toFixed(1)} x ${roomConfig.depth.toFixed(1)} m`);
   setText('readiness-label', ready ? 'prêt' : activeNodes > 0 ? 'limité' : 'pas prêt');
   setText('frame-rate', fmtHz(frameRate));
   setText('fleet-summary', `${activeNodes} live`);
@@ -818,38 +946,412 @@ function renderPersonEstimate(stage) {
   setText('person-position-summary', `${source} ${fmtPct(confidence)}`);
 }
 
+function canvasRoomConfig() {
+  return state.roomConfig || normalizeRoomConfig(DEFAULT_ROOM_CONFIG, 'default');
+}
+
+function liveNodeMap() {
+  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
+  return new Map(nodes.map((node) => [nodeIdOf(node), node]));
+}
+
+function isNodeActive(node) {
+  if (!node || node.active === false) return false;
+  const status = statusClass(node.health_status || node.status || node.sync_status || 'live');
+  return !['offline', 'stale', 'disabled', 'unavailable', 'error'].includes(status);
+}
+
+function canvasNodes() {
+  const config = canvasRoomConfig();
+  const live = liveNodeMap();
+  const fallbackRange = Math.max(config.width, config.depth) * 0.22;
+  return config.nodes.map((node) => {
+    const liveNode = live.get(Number(node.id));
+    const coverage = coverageOf(liveNode || node);
+    const coverageRange = Number(coverage.radiusM);
+    const configRange = Number(node.rangeM);
+    return {
+      ...node,
+      liveNode,
+      active: isNodeActive(liveNode),
+      rangeM: Number.isFinite(coverageRange) && coverageRange > 0
+        ? coverageRange
+        : Number.isFinite(configRange) && configRange > 0
+          ? configRange
+          : fallbackRange,
+    };
+  });
+}
+
+function vectorPlanPoint(value) {
+  if (Array.isArray(value) && value.length >= 3) {
+    return { x: Number(value[0]), y: Number(value[2]) };
+  }
+  if (Array.isArray(value) && value.length >= 2) {
+    return { x: Number(value[0]), y: Number(value[1]) };
+  }
+  if (value && typeof value === 'object') {
+    return { x: Number(value.x), y: Number(value.z ?? value.y) };
+  }
+  return null;
+}
+
+function normalizePlanPoint(point, config) {
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
+  let x = point.x;
+  let y = point.y;
+  const centeredX = x >= -config.width / 2 - 0.5 && x <= config.width / 2 + 0.5;
+  const centeredY = y >= -config.depth / 2 - 0.5 && y <= config.depth / 2 + 0.5;
+  if ((x < -0.001 || y < -0.001) && centeredX && centeredY) {
+    x += config.width / 2;
+    y += config.depth / 2;
+  }
+  return { x, y };
+}
+
+function pushCanvasPersons(target, source, sourceName, config) {
+  if (!Array.isArray(source)) return;
+  for (const [index, person] of source.entries()) {
+    const rawPoint =
+      vectorPlanPoint(person?.position_m) ||
+      vectorPlanPoint(person?.position) ||
+      vectorPlanPoint(person);
+    const point = normalizePlanPoint(rawPoint, config);
+    if (!point) continue;
+    const id = text(person?.id ?? person?.person_id ?? person?.track_id, `${sourceName}-${index + 1}`);
+    target.push({
+      id,
+      sourceName,
+      x: point.x,
+      y: point.y,
+      confidence: clamp(Number(person?.confidence ?? person?.score ?? person?.probability ?? 0), 0, 1),
+    });
+  }
+}
+
+function collectCanvasPersons() {
+  const config = canvasRoomConfig();
+  const persons = [];
+  if (!String(state.latest?.source || '').toLowerCase().includes('sim')) {
+    pushCanvasPersons(persons, state.latest?.persons, 'latest', config);
+  }
+  pushCanvasPersons(persons, state.pose?.persons, 'pose', config);
+  if (state.pose?.person) pushCanvasPersons(persons, [state.pose.person], 'pose', config);
+  pushCanvasPersons(persons, state.location?.persons, 'location', config);
+
+  const seen = new Set();
+  return persons.filter((person) => {
+    const key = person.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function detectedPersonCount(positionedPersons) {
+  const liveCount = Number(firstDefined(
+    state.latest?.count_evidence?.rendered_persons,
+    state.latest?.estimated_persons,
+    state.latest?.n_persons,
+    Array.isArray(state.location?.persons) ? state.location.persons.length : undefined,
+  ));
+  return Math.max(0, Math.round(Number.isFinite(liveCount) ? liveCount : positionedPersons.length));
+}
+
+function syncCanvasPersonTrails(persons) {
+  const liveIds = new Set(persons.map((person) => person.id));
+  for (const person of persons) {
+    const trail = state.personTrails.get(person.id) || [];
+    const last = trail[trail.length - 1];
+    if (!last || Math.hypot(last.x - person.x, last.y - person.y) > 0.03) {
+      trail.push({ x: person.x, y: person.y });
+    }
+    state.personTrails.set(person.id, trail.slice(-5));
+  }
+  for (const id of [...state.personTrails.keys()]) {
+    if (!liveIds.has(id)) state.personTrails.delete(id);
+  }
+}
+
+function canvasGeometry(width, height, config) {
+  const padding = { top: 28, right: 28, bottom: 52, left: 38 };
+  const availableWidth = Math.max(1, width - padding.left - padding.right);
+  const availableHeight = Math.max(1, height - padding.top - padding.bottom);
+  const scale = Math.min(availableWidth / config.width, availableHeight / config.depth);
+  const roomWidth = config.width * scale;
+  const roomHeight = config.depth * scale;
+  return {
+    scale,
+    roomX: padding.left + (availableWidth - roomWidth) / 2,
+    roomY: padding.top + (availableHeight - roomHeight) / 2,
+    roomWidth,
+    roomHeight,
+    config,
+  };
+}
+
+function planToCanvas(point, geometry) {
+  return {
+    x: geometry.roomX + clamp(point.x, 0, geometry.config.width) * geometry.scale,
+    y: geometry.roomY + geometry.roomHeight - clamp(point.y, 0, geometry.config.depth) * geometry.scale,
+  };
+}
+
+function canvasToPlanPoint(stage, clientX, clientY) {
+  const rect = stage.getBoundingClientRect();
+  const geometry = canvasGeometry(rect.width, rect.height, canvasRoomConfig());
+  return {
+    x: (clientX - rect.left - geometry.roomX) / geometry.scale,
+    y: (geometry.roomY + geometry.roomHeight - (clientY - rect.top)) / geometry.scale,
+  };
+}
+
+function pathRoundRect(ctx, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function confidenceColor(confidence) {
+  if (confidence > 0.7) return '#22c55e';
+  if (confidence > 0.4) return '#f59e0b';
+  return '#ef4444';
+}
+
+function hexToRgba(hex, alpha) {
+  const value = String(hex).replace('#', '');
+  const r = parseInt(value.slice(0, 2), 16);
+  const g = parseInt(value.slice(2, 4), 16);
+  const b = parseInt(value.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function drawCanvasGrid(ctx, geometry) {
+  const { config } = geometry;
+  ctx.save();
+  ctx.strokeStyle = '#1f2937';
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= config.width + 0.0001; x += 1) {
+    const p0 = planToCanvas({ x, y: 0 }, geometry);
+    const p1 = planToCanvas({ x, y: config.depth }, geometry);
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.lineTo(p1.x, p1.y);
+    ctx.stroke();
+  }
+  for (let y = 0; y <= config.depth + 0.0001; y += 1) {
+    const p0 = planToCanvas({ x: 0, y }, geometry);
+    const p1 = planToCanvas({ x: config.width, y }, geometry);
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.lineTo(p1.x, p1.y);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#374151';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(geometry.roomX, geometry.roomY, geometry.roomWidth, geometry.roomHeight);
+  ctx.restore();
+}
+
+function drawCanvasNodes(ctx, geometry, nodes) {
+  ctx.save();
+  for (const node of nodes) {
+    const p = planToCanvas(node, geometry);
+    if (node.active) {
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.13)';
+      ctx.strokeStyle = 'rgba(59, 130, 246, 0.32)';
+      ctx.lineWidth = 1;
+      ctx.arc(p.x, p.y, node.rangeM * geometry.scale, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+  for (const node of nodes) {
+    const p = planToCanvas(node, geometry);
+    const size = 26;
+    pathRoundRect(ctx, p.x - size / 2, p.y - size / 2, size, size, 5);
+    ctx.fillStyle = node.active ? '#3b82f6' : '#374151';
+    ctx.fill();
+    ctx.strokeStyle = node.active ? 'rgba(255, 255, 255, 0.72)' : 'rgba(148, 163, 184, 0.45)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 11px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`N${node.id}`, p.x, p.y + 0.5);
+  }
+  ctx.restore();
+}
+
+function drawCanvasPersons(ctx, geometry, persons, time) {
+  ctx.save();
+  for (const person of persons) {
+    const trail = state.personTrails.get(person.id) || [];
+    trail.forEach((point, index) => {
+      const p = planToCanvas(point, geometry);
+      const alpha = (index + 1) / Math.max(1, trail.length);
+      ctx.beginPath();
+      ctx.fillStyle = `rgba(148, 163, 184, ${0.08 + alpha * 0.18})`;
+      ctx.arc(p.x, p.y, 5 + alpha * 4, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+  persons.forEach((person, index) => {
+    const p = planToCanvas(person, geometry);
+    const color = confidenceColor(person.confidence);
+    const pulse = 0.5 + 0.5 * Math.sin(time / 320 + index);
+    ctx.beginPath();
+    ctx.fillStyle = hexToRgba(color, 0.10 + pulse * 0.12);
+    ctx.arc(p.x, p.y, 28 + pulse * 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.fillStyle = color;
+    ctx.arc(p.x, p.y, 20, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.82)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 12px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`P${index + 1}`, p.x, p.y + 0.5);
+  });
+  ctx.restore();
+}
+
+function drawCanvasFooter(ctx, width, height, geometry, persons) {
+  const detected = detectedPersonCount(persons);
+  const scaleMeters = geometry.config.width >= 6 ? 2 : 1;
+  const scaleWidth = scaleMeters * geometry.scale;
+  const scaleX = geometry.roomX;
+  const scaleY = height - 25;
+  ctx.save();
+  ctx.fillStyle = '#e5e7eb';
+  ctx.strokeStyle = '#e5e7eb';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(scaleX, scaleY);
+  ctx.lineTo(scaleX + scaleWidth, scaleY);
+  ctx.moveTo(scaleX, scaleY - 5);
+  ctx.lineTo(scaleX, scaleY + 5);
+  ctx.moveTo(scaleX + scaleWidth, scaleY - 5);
+  ctx.lineTo(scaleX + scaleWidth, scaleY + 5);
+  ctx.stroke();
+  ctx.font = '700 11px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(`${scaleMeters} m`, scaleX + scaleWidth / 2, scaleY - 7);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(`Personnes detectees: ${detected}`, 14, height - 12);
+  ctx.textAlign = 'right';
+  ctx.fillText(`${geometry.config.width.toFixed(1)} m x ${geometry.config.depth.toFixed(1)} m`, width - 14, height - 12);
+  ctx.restore();
+}
+
+function drawTopologyCanvas(canvas, time = performance.now()) {
+  const parent = canvas.parentElement;
+  if (!parent) return;
+  const rect = parent.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width));
+  const height = Math.max(1, Math.floor(rect.height));
+  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+  if (canvas.width !== Math.floor(width * dpr) || canvas.height !== Math.floor(height * dpr)) {
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+  }
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, width, height);
+
+  const config = canvasRoomConfig();
+  const geometry = canvasGeometry(width, height, config);
+  const persons = collectCanvasPersons();
+  drawCanvasGrid(ctx, geometry);
+  drawCanvasPersons(ctx, geometry, persons, time);
+  drawCanvasNodes(ctx, geometry, canvasNodes());
+  drawCanvasFooter(ctx, width, height, geometry, persons);
+}
+
+function ensureTopologyCanvas(stage) {
+  let canvas = stage.querySelector('canvas.topology-canvas');
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    canvas.className = 'topology-canvas';
+    canvas.setAttribute('role', 'img');
+    canvas.setAttribute('aria-label', 'Plan Canvas2D de la piece, noeuds et personnes detectees');
+    stage.replaceChildren(canvas);
+  } else {
+    for (const child of [...stage.children]) {
+      if (child !== canvas) child.remove();
+    }
+  }
+  return canvas;
+}
+
+function ensureTopologyAnimation() {
+  if (state.topologyAnimationId) return;
+  const tick = (time) => {
+    const canvas = $('#topology-stage canvas.topology-canvas');
+    if (canvas instanceof HTMLCanvasElement) drawTopologyCanvas(canvas, time);
+    state.topologyAnimationId = requestAnimationFrame(tick);
+  };
+  state.topologyAnimationId = requestAnimationFrame(tick);
+}
+
+function nodeIdAtCanvasPoint(event) {
+  const stage = $('#topology-stage');
+  if (!stage) return null;
+  const point = canvasToPlanPoint(stage, event.clientX, event.clientY);
+  let best = null;
+  let bestDistance = Infinity;
+  for (const node of canvasNodes()) {
+    if (!node.liveNode) continue;
+    const distance = Math.hypot(node.x - point.x, node.y - point.y);
+    if (distance < bestDistance) {
+      best = node;
+      bestDistance = distance;
+    }
+  }
+  const hitRadiusM = 18 / Math.max(1, canvasGeometry(stage.clientWidth, stage.clientHeight, canvasRoomConfig()).scale);
+  return best && bestDistance <= hitRadiusM ? Number(best.id) : null;
+}
+
 function renderTopology() {
   const stage = $('#topology-stage');
   if (!stage) return;
-  stage.replaceChildren();
   syncPlacementState();
   stage.classList.toggle('is-auto-placement', state.placementAutoMode);
-  updateStageViewportStyle(stage);
-  renderPlacementRoomFrame(stage);
+  updatePlacementViewControls();
 
-  const aps = Array.isArray(state.topology?.access_points) ? state.topology.access_points : [];
-  const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
-  const links = Array.isArray(state.topology?.links) ? state.topology.links : [];
-  const compact = nodes.length > 24 || window.innerWidth < 520;
+  const canvas = ensureTopologyCanvas(stage);
+  const nodes = canvasNodes();
+  const activeNodes = nodes.filter((node) => node.active).length;
+  const persons = collectCanvasPersons();
+  syncCanvasPersonTrails(persons);
+  drawTopologyCanvas(canvas);
+  ensureTopologyAnimation();
 
-  if (!aps.length && !nodes.length) {
-    stage.append(emptyRow('Aucun ESP32-C6 vu par le master'));
-    return;
-  }
-
-  const apsByBssid = new Map();
-  for (const ap of aps) {
-    for (const key of [ap.bssid, ap.ap_id, ap.id].filter(Boolean)) {
-      apsByBssid.set(String(key).toLowerCase(), ap);
-    }
-  }
-  const nodesById = new Map(nodes.map((node) => [nodeIdOf(node), node]));
-  renderCoverageLayers(stage, nodes);
-  renderPersonEstimate(stage);
-  for (const link of links) renderLink(stage, link, apsByBssid, nodesById);
-  renderNodeDistances(stage, nodes);
-  for (const ap of aps) stage.append(marker('ap', ap, compact && (aps.length > 12 || window.innerWidth < 520)));
-  for (const node of nodes) stage.append(marker('node', node, compact));
+  setText('coverage-summary', nodes.length ? `${activeNodes}/${nodes.length} noeud(s) actifs` : '0 noeud room-config');
+  setText('dead-zone-summary', state.roomConfigSource === 'file' ? 'room-config ok' : 'room-config defaut');
+  setText('person-position-summary', persons.length ? `${persons.length} position(s)` : 'position none');
 }
 
 function renderPlacementControls() {
@@ -899,6 +1401,102 @@ function denseRow(title, subtitle, meta, status) {
   return row;
 }
 
+function createRssiMeter(rssi) {
+  const active = rssiSegments(rssi);
+  const meter = create('div', 'rssi-meter');
+  meter.setAttribute('aria-label', `RSSI ${active}/5`);
+  for (let index = 0; index < 5; index += 1) {
+    const segment = create('span', index < active ? 'is-active' : '');
+    meter.append(segment);
+  }
+  return meter;
+}
+
+function nodeCard(node) {
+  const ageMs = nodeFrameAgeMs(node);
+  const tone = frameAgeTone(ageMs);
+  const card = create('article', `node-card card is-${tone}`);
+  const name = text(node.display_label || node.label, `ESP32-C6 #${node.node_id}`);
+  const rssi = Number(node.rssi_dbm);
+  const header = create('div', 'node-card-header');
+  const title = create('div', 'node-card-title');
+  title.append(
+    create('span', `node-freshness-dot is-${tone}`),
+    create('strong', '', name)
+  );
+  header.append(
+    title,
+    create('span', 'node-rssi-value', Number.isFinite(rssi) ? `${Math.round(rssi)} dBm` : '--')
+  );
+
+  const meta = create('div', 'node-card-meta');
+  meta.append(
+    create('span', '', `Dernière trame ${fmtFrameAge(ageMs)}`),
+    create('span', '', `${rssiSegments(rssi)}/5`)
+  );
+
+  card.append(header, meta, createRssiMeter(rssi));
+  return card;
+}
+
+function versionText() {
+  const payload = state.version;
+  if (typeof payload === 'string') return text(payload);
+  return text(payload?.version);
+}
+
+function systemModeInfo() {
+  const sourceMode = state.fleet?.source_mode;
+  const rawSource = text(sourceMode?.raw ?? state.fleet?.source ?? state.topology?.source, '');
+  const simulated = Boolean(sourceMode?.simulated)
+    || ['simulate', 'simulated'].includes(String(rawSource).toLowerCase());
+  return simulated
+    ? { label: 'SIMULATION', className: 'is-simulation' }
+    : { label: 'MODE LIVE', className: 'is-live' };
+}
+
+function renderSystemPanel() {
+  setText('system-version', versionText());
+  setText('system-uptime', fmtUptime(state.fleet?.uptime_seconds));
+  setText('system-frame-count', fmtInteger(firstDefined(
+    state.fleet?.frame_count,
+    state.fleet?.frames_processed,
+    state.fleet?.tick,
+    state.latest?.tick
+  )));
+  const badge = $('#system-mode-badge');
+  if (badge) {
+    const mode = systemModeInfo();
+    badge.textContent = mode.label;
+    badge.className = `system-mode-badge ${mode.className}`;
+  }
+}
+
+function currentLeftAction() {
+  return state.leftActions[state.leftActionCurrent] || state.leftActions.recalibrate;
+}
+
+function renderLeftActions() {
+  const recalibrate = state.leftActions.recalibrate;
+  const reloadModules = state.leftActions.reloadModules;
+  const recalibrateButton = $('#left-recalibrate');
+  const reloadButton = $('#left-reload-modules');
+  if (recalibrateButton) {
+    recalibrateButton.disabled = recalibrate.status === 'loading';
+    recalibrateButton.classList.toggle('is-loading', recalibrate.status === 'loading');
+  }
+  if (reloadButton) {
+    reloadButton.disabled = reloadModules.status === 'loading';
+    reloadButton.classList.toggle('is-loading', reloadModules.status === 'loading');
+  }
+  const current = currentLeftAction();
+  const status = $('#left-action-status');
+  if (status) {
+    status.textContent = current.message || 'Prêt';
+    status.className = `left-action-status is-${statusClass(current.status || 'idle')}`;
+  }
+}
+
 function renderFleet() {
   const nodes = Array.isArray(state.topology?.nodes) ? state.topology.nodes : [];
   const aps = Array.isArray(state.topology?.access_points) ? state.topology.access_points : [];
@@ -924,15 +1522,7 @@ function renderFleet() {
     nodeList?.append(emptyRow('Aucun ESP32-C6 vu par le master'));
   } else {
     for (const node of nodes) {
-      const pos = currentNodePosition(node);
-      const status = text(node.health_status || node.status, node.active ? 'live' : 'offline');
-      const coverage = coverageOf(node);
-      nodeList?.append(denseRow(
-        text(node.display_label || node.label, `ESP32-C6 #${node.node_id}`),
-        `node_id ${node.node_id} / ${text(node.remote_addr, 'no addr')} / X ${pos.x.toFixed(2)} Y ${pos.y.toFixed(2)} Z ${pos.z.toFixed(2)}`,
-        [coverage.quality, fmtPct(coverage.score), fmtHz(node.frame_rate_hz), `CSI ${fmtAge(node.last_csi_ms ?? node.last_seen_ms)}`, fmtPct(pos.confidence)],
-        status
-      ));
+      nodeList?.append(nodeCard(node));
     }
   }
 
@@ -949,6 +1539,8 @@ function renderFleet() {
       ));
     }
   }
+  renderSystemPanel();
+  renderLeftActions();
 }
 
 function renderModuleControls() {
@@ -1047,6 +1639,353 @@ function firstDefined(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '');
 }
 
+function finiteNumber(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function personKey(person, index) {
+  return String(firstDefined(person?.id, person?.track_id, person?.person_id, person?.label, `person_${index + 1}`));
+}
+
+function globalVitalsSources() {
+  const edge = String(state.latest?.type || '').includes('vitals') ? state.latest : {};
+  return [
+    state.latest?.vital_signs || {},
+    edge,
+    state.edgeVitals?.edge_vitals || {},
+    state.vitals?.vital_signs || state.vitals || {},
+  ];
+}
+
+function firstMetric(fieldNames, sources) {
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    for (const field of fieldNames) {
+      const n = finiteNumber(source[field]);
+      if (n != null) return n;
+    }
+  }
+  return null;
+}
+
+function detectedPersons() {
+  const latestPersons = Array.isArray(state.latest?.persons) ? state.latest.persons : [];
+  const posePersons = Array.isArray(state.pose?.persons) ? state.pose.persons : [];
+  const base = latestPersons.length
+    ? latestPersons
+    : posePersons.length
+      ? posePersons
+      : state.pose?.person
+        ? [state.pose.person]
+        : primaryPerson()
+          ? [primaryPerson()]
+          : [];
+  const reportedCount = Math.max(
+    0,
+    Number(firstDefined(
+      state.latest?.count_evidence?.rendered_persons,
+      state.latest?.count_evidence?.stable_persons,
+      state.latest?.estimated_persons,
+      state.edgeVitals?.edge_vitals?.n_persons,
+      state.edgeVitals?.n_persons,
+      base.length,
+    )) || 0,
+  );
+  const count = Math.max(base.length, reportedCount);
+  return Array.from({ length: count }, (_, index) => base[index] || {
+    id: `detected_${index + 1}`,
+    pose: index === 0 ? state.latest?.posture : undefined,
+    confidence: state.latest?.classification?.confidence,
+    position_source: 'count_evidence',
+  });
+}
+
+function personMetricSources(person, index) {
+  const own = [person?.vital_signs, person?.vitals, person, person?.features].filter(Boolean);
+  return index === 0 ? [...own, ...globalVitalsSources()] : own;
+}
+
+function breathingStatus(personId, breathing, timestamp) {
+  if (breathing == null || !state.vitalsOptIn) {
+    state.apneaZeroSince.delete(personId);
+    return { label: '--', className: 'no-data' };
+  }
+  if (breathing === 0) {
+    const started = state.apneaZeroSince.get(personId) || timestamp;
+    state.apneaZeroSince.set(personId, started);
+    if (timestamp - started > APNEA_ZERO_MS) return { label: 'APNEE', className: 'apnea' };
+    return { label: 'LENT', className: 'slow' };
+  }
+  state.apneaZeroSince.delete(personId);
+  if (breathing < 4) return { label: 'APNEE', className: 'apnea' };
+  if (breathing < 8) return { label: 'LENT', className: 'slow' };
+  if (breathing <= 25) return { label: 'NORMAL', className: 'normal' };
+  return { label: 'RAPIDE', className: 'slow' };
+}
+
+function activityLabel(value) {
+  if (value < 8) return 'IMMOBILE';
+  if (value < 35) return 'PEU ACTIF';
+  if (value < 70) return 'ACTIF';
+  return 'TR\u00c8S ACTIF';
+}
+
+function activityValue(person) {
+  const raw = finiteNumber(
+    person?.motion_energy,
+    person?.motionEnergy,
+    person?.activity,
+    person?.features?.motion_energy,
+    person?.features?.motionEnergy,
+    state.latest?.features?.motion_energy,
+    state.latest?.features?.motion_band_power,
+    state.latest?.classification?.motion_energy,
+  );
+  if (raw == null) return null;
+  return clamp(raw <= 1 ? raw * 100 : raw, 0, 100);
+}
+
+function rememberBreathing(personId, breathing, timestamp) {
+  if (breathing == null || !state.vitalsOptIn) return;
+  const history = state.breathingHistory.get(personId) || [];
+  history.push({ time: timestamp, value: breathing });
+  const cutoff = timestamp - BREATHING_TREND_MS;
+  while (history.length && history[0].time < cutoff) history.shift();
+  state.breathingHistory.set(personId, history);
+}
+
+function drawMiniSparkline(canvas, history) {
+  if (!(canvas instanceof HTMLCanvasElement)) return;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath();
+  ctx.moveTo(0, h - 1);
+  ctx.lineTo(w, h - 1);
+  ctx.stroke();
+  if (!history || history.length < 2) return;
+  const start = history[0].time;
+  const span = Math.max(1, history[history.length - 1].time - start);
+  ctx.strokeStyle = '#39d18f';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  history.forEach((point, index) => {
+    const x = ((point.time - start) / span) * (w - 2) + 1;
+    const y = h - 2 - (clamp(point.value, 0, 30) / 30) * (h - 4);
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function drawBreathingTrend(people) {
+  const canvas = $('#breathing-trend-canvas');
+  if (!(canvas instanceof HTMLCanvasElement)) return;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const left = 28;
+  const right = w - 8;
+  const top = 8;
+  const bottom = h - 16;
+  const nowMs = Date.now();
+  const primary = people[0];
+  const id = primary ? personKey(primary, 0) : null;
+  const history = id ? (state.breathingHistory.get(id) || []).filter((point) => point.time >= nowMs - BREATHING_TREND_MS) : [];
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(left, top);
+  ctx.lineTo(left, bottom);
+  ctx.lineTo(right, bottom);
+  ctx.stroke();
+
+  const thresholdY = bottom - (4 / 30) * (bottom - top);
+  ctx.save();
+  ctx.setLineDash([4, 3]);
+  ctx.strokeStyle = '#ff3040';
+  ctx.beginPath();
+  ctx.moveTo(left, thresholdY);
+  ctx.lineTo(right, thresholdY);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.fillStyle = 'rgba(232,236,224,0.58)';
+  ctx.font = '10px JetBrains Mono, Consolas, monospace';
+  ctx.fillText('30', 4, top + 4);
+  ctx.fillText('0', 10, bottom + 2);
+  ctx.fillText('4', 12, thresholdY + 3);
+
+  if (history.length < 2) {
+    ctx.fillStyle = 'rgba(232,236,224,0.36)';
+    ctx.fillText('no data', left + 56, top + 34);
+    setText('trend-person-label', primary ? text(primary.label || primary.id || primary.track_id, `person ${1}`) : '--');
+    return;
+  }
+
+  ctx.strokeStyle = '#39d18f';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  history.forEach((point, index) => {
+    const x = left + ((point.time - (nowMs - BREATHING_TREND_MS)) / BREATHING_TREND_MS) * (right - left);
+    const y = bottom - (clamp(point.value, 0, 30) / 30) * (bottom - top);
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  setText('trend-person-label', text(primary?.label || primary?.id || primary?.track_id, 'person 1'));
+}
+
+function renderVitalsTabs() {
+  for (const tab of $$('[data-vitals-tab]')) {
+    const active = tab.dataset.vitalsTab === state.vitalsTab;
+    tab.classList.toggle('is-active', active);
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+  }
+  for (const panel of $$('[data-vitals-panel]')) {
+    panel.classList.toggle('is-active', panel.dataset.vitalsPanel === state.vitalsTab);
+  }
+}
+
+function alertIcon(type) {
+  const value = String(type || '').toLowerCase();
+  if (value.includes('apnea')) return 'BR';
+  if (value.includes('cardiac') || value.includes('heart')) return 'HR';
+  if (value.includes('fall')) return 'CH';
+  if (value.includes('critical')) return '!';
+  return 'i';
+}
+
+function renderRightAlerts() {
+  const listed = getAlerts({ limit: 20 });
+  setText('alerts-count', String(listed.length));
+  setText('alerts-title-count', String(listed.length));
+  const list = $('#right-alert-list');
+  clear(list);
+  if (!listed.length) {
+    list?.append(emptyRow('Aucune alerte active'));
+    return;
+  }
+  for (const alert of listed) {
+    const item = create('li', `right-alert-item severity-${statusClass(alert.severity || 'warning')}`);
+    const stamp = new Date(Number(alert.created_at || alert.time || Date.now())).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    item.append(
+      create('span', 'right-alert-icon', alertIcon(alert.type)),
+      create('time', '', stamp),
+      create('strong', '', alert.title || String(alert.type || 'ALERTE').toUpperCase()),
+      create('p', '', alert.message || 'Alerte active.'),
+    );
+    list?.append(item);
+  }
+}
+
+function renderVitalsDashboard() {
+  const vitals = state.vitals?.vital_signs || state.vitals || {};
+  const edgeVitals = state.edgeVitals?.edge_vitals || {};
+  const latestVitals = state.latest?.vital_signs || {};
+  const edge = String(state.latest?.type || '').includes('vitals') ? state.latest : {};
+  const presence = firstDefined(state.latest?.classification?.presence, edge.presence, false);
+  const motion = firstDefined(state.latest?.classification?.motion_level, edge.motion ? 'motion' : undefined, 'unknown');
+  const persons = firstDefined(state.latest?.count_evidence?.rendered_persons, state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
+  const loc = locationPerson();
+  const person = primaryPerson();
+  const posture = normalizePoseName(firstDefined(person?.pose, person?.posture, state.latest?.posture, state.pose?.posture));
+  const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, edgeVitals.breathing_rate_bpm, vitals.breathing_rate_bpm);
+  const heart = firstDefined(latestVitals.heart_rate_bpm, edge.heartrate_bpm, edgeVitals.heartrate_bpm, vitals.heart_rate_bpm);
+  const quality = firstDefined(latestVitals.signal_quality, edge.presence_score, edgeVitals.presence_score, vitals.signal_quality);
+  const people = detectedPersons();
+  const cards = $('#vitals-person-cards');
+  const timestamp = Date.now();
+
+  setText('presence-state', presence ? 'prÃ©sence' : 'absent');
+  setText('person-count', String(Math.max(Number(persons || 0), people.length)));
+  setText('motion-level', text(motion, 'unknown'));
+  setText('location-vitals', loc ? `x ${loc.x.toFixed(2)} / y ${loc.y.toFixed(2)} / ${fmtPct(loc.confidence)}` : '--');
+  setText('posture-state', state.vitalsOptIn ? text(posture, '--') : 'masquee');
+  setText('breathing-rate', state.vitalsOptIn && breathing ? `${Number(breathing).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
+  setText('heart-rate', state.vitalsOptIn && heart ? `${Number(heart).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
+  setText('signal-quality', fmtPct(quality));
+  clear(cards);
+
+  if (!people.length) {
+    cards?.append(emptyRow('Aucune personne detectee'));
+  }
+
+  people.forEach((item, index) => {
+    const id = personKey(item, index);
+    const label = text(item.display_label || item.label || item.name || item.id || item.track_id, `Personne ${index + 1}`);
+    const sources = personMetricSources(item, index);
+    const breathingValue = state.vitalsOptIn
+      ? firstMetric(['breathing_rate_bpm', 'breathing_bpm', 'breathing_rate', 'respiration_bpm', 'br'], sources)
+      : null;
+    const heartValue = state.vitalsOptIn
+      ? firstMetric(['heart_rate_bpm', 'heartrate_bpm', 'hr_proxy_bpm', 'heart_rate', 'hr'], sources)
+      : null;
+    const activity = activityValue(item);
+    const activityPct = activity == null ? 0 : activity;
+    const status = breathingStatus(id, breathingValue, timestamp);
+
+    rememberBreathing(id, breathingValue, timestamp);
+
+    const card = create('article', `vitals-person-card breathing-${status.className}`);
+    const head = create('div', 'vitals-person-head');
+    head.append(
+      create('strong', '', label),
+      create('span', `breathing-status ${status.className}`, status.label),
+    );
+
+    const breathRow = create('div', 'breathing-readout');
+    const breathValue = create('span', 'breathing-value', breathingValue == null ? '--' : breathingValue.toFixed(1));
+    const breathUnit = create('span', 'breathing-unit', 'rpm');
+    const sparkline = create('canvas', 'breathing-sparkline');
+    sparkline.width = 100;
+    sparkline.height = 30;
+    breathRow.append(breathValue, breathUnit, sparkline);
+
+    const heartRow = create('div', 'heart-beta-row');
+    heartRow.title = 'Rythme cardiaque beta: estimation CSI non certifiee.';
+    heartRow.append(
+      create('span', 'heart-beta-label', 'Rythme cardiaque'),
+      create('span', 'heart-beta-pill', 'BETA'),
+      create('strong', '', heartValue == null ? '--' : `${Math.round(heartValue)} bpm`),
+    );
+
+    const activityRow = create('div', 'activity-row');
+    const progress = create('div', 'activity-progress');
+    const fill = create('span');
+    fill.style.width = `${activityPct}%`;
+    progress.append(fill);
+    activityRow.append(
+      create('span', 'activity-label', activity == null ? '--' : activityLabel(activityPct)),
+      progress,
+      create('span', 'activity-percent', activity == null ? '--' : `${Math.round(activityPct)}`),
+    );
+
+    card.append(head, breathRow, heartRow, activityRow);
+    cards?.append(card);
+    drawMiniSparkline(sparkline, state.breathingHistory.get(id) || []);
+  });
+
+  setText('vitals-status', state.vitalsOptIn ? breathing || heart || presence || people.length ? 'live' : 'attente' : 'opt-in off');
+  renderRightAlerts();
+  drawBreathingTrend(people);
+  renderVitalsTabs();
+}
+
 function appStateSnapshot(reason = 'update') {
   return {
     reason,
@@ -1081,6 +2020,8 @@ function publishSharedState(reason = 'update') {
 }
 
 function renderVitals() {
+  renderVitalsDashboard();
+  return;
   const vitals = state.vitals?.vital_signs || state.vitals || {};
   const edgeVitals = state.edgeVitals?.edge_vitals || {};
   const latestVitals = state.latest?.vital_signs || {};
@@ -1220,7 +2161,7 @@ function activatePanel(panel, updateHash = false) {
 }
 
 async function refreshRest() {
-  const [topologyResult, modulesResult, vitalsResult, locationResult, edgeVitalsResult, calibrationResult, poseResult] = await Promise.allSettled([
+  const [topologyResult, modulesResult, vitalsResult, locationResult, edgeVitalsResult, calibrationResult, poseResult, fleetResult, versionResult] = await Promise.allSettled([
     fetchJson('/api/v1/topology'),
     fetchJson('/api/v1/modules'),
     fetchJson('/api/v1/vital-signs').catch(() => null),
@@ -1228,6 +2169,8 @@ async function refreshRest() {
     fetchJson('/api/v1/edge-vitals').catch(() => null),
     fetchJson('/api/v1/calibration').catch(() => null),
     fetchJson('/api/v1/pose/current').catch(() => null),
+    fetchJson('/api/v1/fleet').catch(() => null),
+    fetchJson('/api/v1/version').catch(() => null),
   ]);
 
   if (topologyResult.status === 'fulfilled') {
@@ -1245,6 +2188,8 @@ async function refreshRest() {
   if (edgeVitalsResult.status === 'fulfilled') state.edgeVitals = edgeVitalsResult.value;
   if (calibrationResult.status === 'fulfilled') state.calibration = calibrationResult.value;
   if (poseResult.status === 'fulfilled') state.pose = poseResult.value;
+  if (fleetResult.status === 'fulfilled') state.fleet = fleetResult.value;
+  if (versionResult.status === 'fulfilled') state.version = versionResult.value;
   renderAll();
   publishSharedState('rest');
   await maybeAutoPersistPlacement();
@@ -1324,8 +2269,9 @@ function beginNodeDrag(event) {
   if (event.button !== undefined && event.button !== 0) return;
   const target = event.target instanceof Element ? event.target : null;
   const markerEl = target?.closest('.topology-marker.node');
-  if (!markerEl) return;
-  const nodeId = Number(markerEl.dataset.nodeId);
+  const nodeId = markerEl
+    ? Number(markerEl.dataset.nodeId)
+    : nodeIdAtCanvasPoint(event);
   if (!Number.isFinite(nodeId)) return;
   event.preventDefault();
   state.draggingNodeId = nodeId;
@@ -1337,6 +2283,7 @@ function beginPlacementPan(event) {
   const stage = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
   const target = event.target instanceof Element ? event.target : null;
   if (!stage || target?.closest('.topology-marker')) return;
+  if (!state.placementAutoMode && nodeIdAtCanvasPoint(event) !== null) return;
   event.preventDefault();
   state.placementPanDrag = {
     pointerId: event.pointerId,
@@ -1570,6 +2517,56 @@ function setPlacementAutoMode(enabled) {
   renderPlacementControls();
 }
 
+function setLeftAction(action, status, message) {
+  state.leftActionCurrent = action;
+  state.leftActions[action] = { status, message };
+  renderLeftActions();
+}
+
+async function finishLeftActionAfter(startedAt) {
+  const elapsed = Date.now() - startedAt;
+  if (elapsed < ACTION_SPINNER_MS) await sleep(ACTION_SPINNER_MS - elapsed);
+}
+
+async function recalibrateFromLeftColumn() {
+  const startedAt = Date.now();
+  setLeftAction('recalibrate', 'loading', 'Recalibration...');
+  try {
+    const result = await fetchJson('/api/v1/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recalibrate: true }),
+    });
+    if (result?.success === false) throw new Error(result.error || result.message || 'Recalibration rejetee');
+    await finishLeftActionAfter(startedAt);
+    setLeftAction('recalibrate', 'ok', 'OK');
+    logEvent('Recalibration demandee');
+    await refreshRest();
+  } catch (error) {
+    await finishLeftActionAfter(startedAt);
+    setLeftAction('recalibrate', 'error', 'Erreur');
+    logEvent(`Recalibrer: ${error.message}`, 'warn');
+  }
+}
+
+async function reloadModulesFromLeftColumn() {
+  const startedAt = Date.now();
+  setLeftAction('reloadModules', 'loading', 'Rechargement modules...');
+  try {
+    const result = await fetchJson('/api/v1/modules');
+    state.modules = result.modules || [];
+    state.modulePresets = result.presets || [];
+    renderModules();
+    await finishLeftActionAfter(startedAt);
+    setLeftAction('reloadModules', 'ok', 'OK');
+    logEvent('Modules recharges');
+  } catch (error) {
+    await finishLeftActionAfter(startedAt);
+    setLeftAction('reloadModules', 'error', 'Erreur');
+    logEvent(`Recharger modules: ${error.message}`, 'warn');
+  }
+}
+
 function bindActions() {
   for (const button of $$('[data-panel]')) {
     button.addEventListener('click', () => activatePanel(button.dataset.panel, true));
@@ -1579,6 +2576,8 @@ function bindActions() {
     state.logSeen.clear();
     $('#event-log')?.replaceChildren();
   });
+  $('#left-recalibrate')?.addEventListener('click', recalibrateFromLeftColumn);
+  $('#left-reload-modules')?.addEventListener('click', reloadModulesFromLeftColumn);
   $('#module-filter')?.addEventListener('input', (event) => {
     state.moduleFilter = event.target.value;
     renderModules();
@@ -1697,6 +2696,18 @@ function bindActions() {
     renderVitals();
     publishSharedState('vitals-opt-in');
   });
+  for (const tab of $$('[data-vitals-tab]')) {
+    tab.addEventListener('click', () => {
+      state.vitalsTab = tab.dataset.vitalsTab || 'vitals';
+      renderVitalsTabs();
+      if (state.vitalsTab === 'trends') drawBreathingTrend(detectedPersons());
+    });
+  }
+  $('#clear-alerts')?.addEventListener('click', () => {
+    clearAlerts();
+    renderRightAlerts();
+  });
+  window.addEventListener('ruvsense:alerts-changed', () => renderRightAlerts());
   const topologyStage = $('#topology-stage');
   topologyStage?.addEventListener('pointerdown', beginNodeDrag);
   topologyStage?.addEventListener('pointerdown', beginPlacementPan);
@@ -1711,6 +2722,7 @@ function bindActions() {
   window.addEventListener('resize', () => {
     renderTopology();
     renderLocationPlan();
+    drawBreathingTrend(detectedPersons());
   });
   $('#placement-zoom-in')?.addEventListener('click', () => zoomPlacementBy(1.2));
   $('#placement-zoom-out')?.addEventListener('click', () => zoomPlacementBy(1 / 1.2));
@@ -1843,6 +2855,7 @@ window.__ruvsenseConsoleTestApi = {
 async function init() {
   bindActions();
   activatePanel(panelFromHash());
+  await loadRoomConfig();
   await refreshRest();
   connectWs();
   setInterval(refreshRest, 3000);

@@ -12,6 +12,7 @@
 mod adaptive_classifier;
 pub mod cli;
 pub mod csi;
+mod feature_flags;
 mod field_bridge;
 mod multistatic_bridge;
 pub mod pose;
@@ -41,7 +42,7 @@ use axum::{
         Path, Query, State,
     },
     http::StatusCode,
-    response::{Html, IntoResponse, Json, Redirect},
+    response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{delete, get, post, put},
     Extension, Router,
 };
@@ -60,6 +61,7 @@ use tracing::{debug, error, info, warn};
 
 use rvf_container::{RvfBuilder, RvfContainerInfo, RvfReader, VitalSignConfig};
 use rvf_pipeline::ProgressiveLoader;
+use feature_flags::{BetaFeature, FeatureFlags};
 use vital_signs::{VitalSignDetector, VitalSigns};
 
 // ADR-022 Phase 3: Multi-BSSID pipeline integration
@@ -2751,6 +2753,7 @@ struct AppStateInner {
     frame_history: VecDeque<Vec<f64>>,
     tick: u64,
     source: String,
+    feature_flags: FeatureFlags,
     /// Instant of the last ESP32 UDP frame received (for offline detection).
     last_esp32_frame: Option<std::time::Instant>,
     tx: broadcast::Sender<String>,
@@ -4817,13 +4820,17 @@ fn presence_persons(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_jso
         .or(s.latest_vitals.breathing_rate_bpm)
         .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.breathing_rate_bpm))
         .unwrap_or(0.0);
-    let heart_rate_bpm = update
-        .vital_signs
-        .as_ref()
-        .and_then(|vitals| vitals.heart_rate_bpm)
-        .or(s.latest_vitals.heart_rate_bpm)
-        .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.heartrate_bpm))
-        .unwrap_or(0.0);
+    let include_heart_rate = s.feature_flags.beta_enabled(BetaFeature::PreciseHeartRate);
+    let heart_rate_bpm = include_heart_rate
+        .then(|| {
+            update
+                .vital_signs
+                .as_ref()
+                .and_then(|vitals| vitals.heart_rate_bpm)
+                .or(s.latest_vitals.heart_rate_bpm)
+                .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.heartrate_bpm))
+                .unwrap_or(0.0)
+        });
     let motion_energy = current_motion_energy(s, update, now);
 
     if let Some(tracking) = update.state.as_ref() {
@@ -4891,20 +4898,23 @@ fn presence_person_json(
     y: f64,
     confidence: f64,
     breathing_bpm: f64,
-    heart_rate_bpm: f64,
+    heart_rate_bpm: Option<f64>,
     is_present: bool,
     motion_energy: f64,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "id": id,
         "x": finite_or_zero(x),
         "y": finite_or_zero(y),
         "confidence": clamp_unit(confidence),
         "breathing_bpm": finite_or_zero(breathing_bpm),
-        "heart_rate_bpm": finite_or_zero(heart_rate_bpm),
         "is_present": is_present,
         "motion_energy": clamp_unit(motion_energy),
-    })
+    });
+    if let (Some(obj), Some(hr)) = (payload.as_object_mut(), heart_rate_bpm) {
+        obj.insert("heart_rate_bpm".to_string(), serde_json::json!(finite_or_zero(hr)));
+    }
+    payload
 }
 
 fn current_motion_energy(
@@ -4940,10 +4950,11 @@ fn current_motion_energy(
 fn vitals_update_payload(s: &AppStateInner, now: std::time::Instant) -> serde_json::Value {
     let node_count = active_node_count(s, now);
     let system_status = if node_count == 0 { "no_nodes" } else { "live" };
+    let include_heart_rate = s.feature_flags.beta_enabled(BetaFeature::PreciseHeartRate);
     let mut nodes: Vec<serde_json::Value> = s
         .node_states
         .iter()
-        .map(|(&node_id, node)| node_vitals_json(node_id, node, now))
+        .map(|(&node_id, node)| node_vitals_json(node_id, node, now, include_heart_rate))
         .collect();
     nodes.sort_by_key(|node| node.get("node_id").and_then(|id| id.as_u64()).unwrap_or(0));
 
@@ -4956,7 +4967,12 @@ fn vitals_update_payload(s: &AppStateInner, now: std::time::Instant) -> serde_js
     })
 }
 
-fn node_vitals_json(node_id: u8, node: &NodeState, now: std::time::Instant) -> serde_json::Value {
+fn node_vitals_json(
+    node_id: u8,
+    node: &NodeState,
+    now: std::time::Instant,
+    include_heart_rate: bool,
+) -> serde_json::Value {
     let active = is_node_active(node, now);
     let last_seen_ms = node
         .last_frame_time
@@ -4966,10 +4982,11 @@ fn node_vitals_json(node_id: u8, node: &NodeState, now: std::time::Instant) -> s
         .map(|vitals| vitals.breathing_rate_bpm)
         .or(node.latest_vitals.breathing_rate_bpm)
         .unwrap_or(0.0);
-    let heart_rate_bpm = edge
-        .map(|vitals| vitals.heartrate_bpm)
-        .or(node.latest_vitals.heart_rate_bpm)
-        .unwrap_or(0.0);
+    let heart_rate_bpm = include_heart_rate.then(|| {
+        edge.map(|vitals| vitals.heartrate_bpm)
+            .or(node.latest_vitals.heart_rate_bpm)
+            .unwrap_or(0.0)
+    });
     let motion_energy = edge
         .map(|vitals| vitals.motion_energy as f64)
         .unwrap_or_else(|| node.smoothed_motion);
@@ -4980,7 +4997,7 @@ fn node_vitals_json(node_id: u8, node: &NodeState, now: std::time::Instant) -> s
         .map(|vitals| vitals.presence)
         .unwrap_or_else(|| node_supports_presence(node, now));
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "node_id": node_id,
         "active": active,
         "is_present": is_present,
@@ -4991,10 +5008,7 @@ fn node_vitals_json(node_id: u8, node: &NodeState, now: std::time::Instant) -> s
         "motion_energy": normalize_motion_energy(motion_energy),
         "breathing_rate_bpm": finite_or_zero(breathing_rate_bpm),
         "breathing_bpm": finite_or_zero(breathing_rate_bpm),
-        "heart_rate_bpm": finite_or_zero(heart_rate_bpm),
-        "heartrate_bpm": finite_or_zero(heart_rate_bpm),
         "breathing_confidence": clamp_unit(node.latest_vitals.breathing_confidence),
-        "heartbeat_confidence": clamp_unit(node.latest_vitals.heartbeat_confidence),
         "signal_quality": clamp_unit(node.latest_vitals.signal_quality),
         "rssi_dbm": node.rssi_history.back().copied(),
         "n_persons": edge.map(|vitals| vitals.n_persons).unwrap_or(node.prev_person_count as u8),
@@ -5004,7 +5018,16 @@ fn node_vitals_json(node_id: u8, node: &NodeState, now: std::time::Instant) -> s
         "last_vitals_ms": age_ms(now, node.last_vitals_time),
         "source": if edge.is_some() { "edge_vitals" } else { "csi" },
         "esp32_timestamp_ms": edge.map(|vitals| vitals.timestamp_ms),
-    })
+    });
+    if let (Some(obj), Some(hr)) = (payload.as_object_mut(), heart_rate_bpm) {
+        obj.insert("heart_rate_bpm".to_string(), serde_json::json!(finite_or_zero(hr)));
+        obj.insert("heartrate_bpm".to_string(), serde_json::json!(finite_or_zero(hr)));
+        obj.insert(
+            "heartbeat_confidence".to_string(),
+            serde_json::json!(clamp_unit(node.latest_vitals.heartbeat_confidence)),
+        );
+    }
+    payload
 }
 
 fn normalize_motion_energy(value: f64) -> f64 {
@@ -7184,6 +7207,18 @@ async fn health_metrics(State(state): State<SharedState>) -> Json<serde_json::Va
     }))
 }
 
+fn feature_disabled_response(feature: BetaFeature) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "feature_disabled",
+            "feature": feature.as_str(),
+            "reason": "beta",
+        })),
+    )
+        .into_response()
+}
+
 async fn api_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     Json(serde_json::json!({
@@ -7192,18 +7227,30 @@ async fn api_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
         "backend": "rust",
         "source": s.effective_source(),
         "features": {
-            "wifi_sensing": true,
-            "pose_estimation": true,
+            "wifi_sensing": s.feature_flags.stable.presence_detection,
+            "pose_estimation": s.feature_flags.beta_enabled(BetaFeature::SkeletonPoseEstimation),
             "signal_processing": true,
             "ruvector": true,
-            "localization": true,
+            "localization": s.feature_flags.stable.zone_localization,
             "streaming": true,
-        }
+        },
+        "feature_flags": s.feature_flags.as_json(),
     }))
 }
 
-async fn pose_current(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn features_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
+    Json(s.feature_flags.as_json())
+}
+
+async fn pose_current(State(state): State<SharedState>) -> Response {
+    let s = state.read().await;
+    if !s
+        .feature_flags
+        .beta_enabled(BetaFeature::SkeletonPoseEstimation)
+    {
+        return feature_disabled_response(BetaFeature::SkeletonPoseEstimation);
+    }
     let persons = match &s.latest_update {
         Some(update) => update
             .persons
@@ -7217,6 +7264,29 @@ async fn pose_current(State(state): State<SharedState>) -> Json<serde_json::Valu
         "total_persons": persons.len(),
         "source": s.effective_source(),
     }))
+    .into_response()
+}
+
+async fn cardiac_endpoint(State(state): State<SharedState>) -> Response {
+    let s = state.read().await;
+    if !s
+        .feature_flags
+        .beta_enabled(BetaFeature::CardiacArrestDetection)
+    {
+        return feature_disabled_response(BetaFeature::CardiacArrestDetection);
+    }
+    let vs = &s.latest_vitals;
+    let cardiac_risk_score = cardiac_risk_score(vs);
+    Json(serde_json::json!({
+        "status": "beta",
+        "clinical_validation": "not_validated",
+        "heart_rate_bpm": vs.heart_rate_bpm,
+        "heartbeat_confidence": vs.heartbeat_confidence,
+        "cardiac_risk_score": cardiac_risk_score,
+        "source": s.effective_source(),
+        "warning": "Research feature only; do not use for medical decisions.",
+    }))
+    .into_response()
 }
 
 async fn pose_stats(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -8145,11 +8215,67 @@ async fn location_endpoint(State(state): State<SharedState>) -> Json<serde_json:
     Json(location_payload(&s, std::time::Instant::now()))
 }
 
+fn cardiac_risk_score(vs: &VitalSigns) -> f64 {
+    let Some(hr) = vs.heart_rate_bpm else {
+        return 0.0;
+    };
+    if !hr.is_finite() {
+        return 0.0;
+    }
+    let rate_risk = if !(40.0..=120.0).contains(&hr) {
+        0.8
+    } else if !(50.0..=110.0).contains(&hr) {
+        0.4
+    } else {
+        0.1
+    };
+    (rate_risk * vs.heartbeat_confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+}
+
 async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let vs = &s.latest_vitals;
     let (br_len, br_cap, hb_len, hb_cap) = s.vital_detector.buffer_status();
     let timestamp_ms = unix_timestamp_ms();
+    let now = std::time::Instant::now();
+    let breathing_bpm = vs
+        .breathing_rate_bpm
+        .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.breathing_rate_bpm));
+    let motion_energy = s
+        .latest_update
+        .as_ref()
+        .map(|update| current_motion_energy(&s, update, now))
+        .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.motion_energy as f64))
+        .unwrap_or(s.smoothed_motion);
+    let presence_score = s
+        .edge_vitals
+        .as_ref()
+        .map(|vitals| vitals.presence_score as f64)
+        .or_else(|| s.latest_update.as_ref().map(|update| update.classification.confidence))
+        .unwrap_or(0.0);
+    let fall_suspected = s
+        .edge_vitals
+        .as_ref()
+        .map(|vitals| vitals.fall_detected)
+        .unwrap_or(false);
+    let zone_id = s
+        .environment
+        .nodes
+        .iter()
+        .find(|node| {
+            s.node_states
+                .get(&node.node_id)
+                .map(|node_state| is_node_active(node_state, now))
+                .unwrap_or(false)
+        })
+        .map(|node| node.zone.clone())
+        .unwrap_or_else(|| {
+            if presence_score > 0.0 {
+                "zone_1".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
     let location = s
         .latest_update
         .as_ref()
@@ -8180,14 +8306,36 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
                     })
                 })
         });
+    let mut vital_signs = serde_json::json!({
+        "breathing_bpm": breathing_bpm,
+        "breathing_rate_bpm": breathing_bpm,
+        "breathing_confidence": vs.breathing_confidence,
+        "motion_energy": normalize_motion_energy(motion_energy),
+        "presence_score": clamp_unit(presence_score),
+        "fall_suspected": fall_suspected,
+        "zone_id": zone_id,
+        "signal_quality": vs.signal_quality,
+    });
+    if let Some(obj) = vital_signs.as_object_mut() {
+        if s.feature_flags.beta_enabled(BetaFeature::PreciseHeartRate) {
+            obj.insert("heart_rate_bpm".to_string(), serde_json::json!(vs.heart_rate_bpm));
+            obj.insert(
+                "heartbeat_confidence".to_string(),
+                serde_json::json!(vs.heartbeat_confidence),
+            );
+        }
+        if s
+            .feature_flags
+            .beta_enabled(BetaFeature::CardiacArrestDetection)
+        {
+            obj.insert(
+                "cardiac_risk_score".to_string(),
+                serde_json::json!(cardiac_risk_score(vs)),
+            );
+        }
+    }
     Json(serde_json::json!({
-        "vital_signs": {
-            "breathing_rate_bpm": vs.breathing_rate_bpm,
-            "heart_rate_bpm": vs.heart_rate_bpm,
-            "breathing_confidence": vs.breathing_confidence,
-            "heartbeat_confidence": vs.heartbeat_confidence,
-            "signal_quality": vs.signal_quality,
-        },
+        "vital_signs": vital_signs,
         "buffer_status": {
             "breathing_samples": br_len,
             "breathing_capacity": br_cap,
@@ -12232,12 +12380,23 @@ async fn main() {
         );
     }
 
+    let feature_flags = FeatureFlags::load();
+    info!(
+        "Feature flags active: {}",
+        feature_flags.active_names().join(", ")
+    );
+    info!(
+        "Feature flags disabled: {}",
+        feature_flags.disabled_names().join(", ")
+    );
+
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         latest_update: None,
         rssi_history: VecDeque::new(),
         frame_history: VecDeque::new(),
         tick: 0,
         source: source.into(),
+        feature_flags,
         last_esp32_frame: None,
         tx,
         intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
@@ -12474,6 +12633,7 @@ async fn main() {
         .route("/metrics", get(prometheus_metrics_endpoint))
         // API info
         .route("/api/v1/info", get(api_info))
+        .route("/api/v1/features", get(features_endpoint))
         .route("/api/v1/status", get(health_ready))
         .route("/api/v1/metrics", get(health_metrics))
         // Sensing endpoints
@@ -12506,6 +12666,7 @@ async fn main() {
         // Vital sign endpoints
         .route("/api/v1/location", get(location_endpoint))
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
+        .route("/api/v1/cardiac", get(cardiac_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
         // ADR-102: Edge Module Registry — surfaces the canonical Cognitum cog
         // catalog (`https://storage.googleapis.com/cognitum-apps/app-registry.json`)
@@ -12521,6 +12682,7 @@ async fn main() {
         .route("/api/v1/model/sona/profiles", get(sona_profiles))
         .route("/api/v1/model/sona/activate", post(sona_activate))
         // Pose endpoints (WiFi-derived)
+        .route("/api/v1/pose", get(pose_current))
         .route("/api/v1/pose/current", get(pose_current))
         .route("/api/v1/pose/stats", get(pose_stats))
         .route("/api/v1/pose/zones/summary", get(pose_zones_summary))

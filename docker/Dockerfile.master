@@ -23,10 +23,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=builder /build/target/release/ruvsense-master /app/ruvsense-master
+COPY config/features.toml /app/config/features.toml
 COPY ui/ /app/ui/
 COPY docker/ruvsense-master-entrypoint.sh /app/ruvsense-master-entrypoint.sh
 
 RUN chmod +x /app/ruvsense-master /app/ruvsense-master-entrypoint.sh \
+ && test -f /app/config/features.toml \
  && test -f /app/ui/index.html \
  && test -f /app/ui/console.html \
  && test -f /app/ui/observatory.html \
@@ -42,6 +44,7 @@ ENV RUVSENSE_UDP_PORT=5005
 ENV RUVSENSE_MIN_NODES=1
 ENV RUVSENSE_WIFI_INTERFACE=wlan0
 ENV RUVSENSE_AP_SCAN_INTERVAL_SECS=10
+ENV RUVSENSE_BETA_FEATURES=
 ENV SENSING_ALLOWED_HOSTS=
 ENV RUVIEW_API_TOKEN=
 

@@ -1,0 +1,15 @@
+[stable]
+presence_detection = true
+motion_detection = true
+breathing_rate = true
+zone_localization = true
+fall_detection = true
+
+[beta]
+# Ces features sont experimentales et desactivees par defaut
+# Mettre a true pour activer a vos risques et perils
+skeleton_pose_estimation = false
+cardiac_arrest_detection = false
+precise_heart_rate = false
+precise_person_counting = false
+densepose_3d = false

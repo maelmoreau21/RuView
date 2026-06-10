@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-RuvSense Edge beta/research health monitoring bootstrap.
+RuvSense Edge stable health monitoring bootstrap.
 
-Loads the full health-related runtime modules, including cardiac research
-modules, then polls vital signs and writes a JSONL audit stream under logs/.
+Loads only stable runtime modules, then polls respiration and fall/non-movement
+signals from /api/v1/vital-signs into logs/.
 """
 
 import datetime
@@ -17,22 +17,19 @@ import requests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-DEFAULT_CONFIG_PATH = os.path.join(REPO_ROOT, "scripts", "health_alert_config.json")
+DEFAULT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "health_alert_config.json")
 DEFAULT_LOG_DIR = os.path.join(REPO_ROOT, "logs")
 
 DEFAULT_CONFIG = {
     "apnea_threshold_seconds": 20,
     "breathing_min_bpm": 4,
     "breathing_max_bpm": 40,
-    "heartrate_min_bpm": 40,
-    "heartrate_max_bpm": 150,
     "master_ip": "127.0.0.1",
     "master_port": 3000,
 }
 
 MODULE_LOAD_PLAN = [
     {
-        # Filter first so noisy occupied-room multipath is gated before downstream health modules.
         "requested_id": "coherence-gate",
         "priority": 0,
         "runtime_ids": ["coherence_gate", "coherence-gate"],
@@ -46,16 +43,6 @@ MODULE_LOAD_PLAN = [
         "requested_id": "sleep-apnea",
         "priority": 2,
         "runtime_ids": ["sleep_apnea", "sleep_apnea_screening"],
-    },
-    {
-        "requested_id": "cardiac-arrhythmia",
-        "priority": 3,
-        "runtime_ids": ["cardiac_arrhythmia"],
-    },
-    {
-        "requested_id": "vital-trend",
-        "priority": 4,
-        "runtime_ids": ["vital_trend", "respiration_tracking", "cardiac_arrhythmia"],
     },
 ]
 
@@ -96,9 +83,16 @@ def alert(message):
 def load_config():
     path = os.environ.get("HEALTH_ALERT_CONFIG", DEFAULT_CONFIG_PATH)
     config = dict(DEFAULT_CONFIG)
-    with open(path, "r", encoding="utf-8-sig") as f:
-        loaded = json.load(f)
-    config.update(loaded)
+
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8-sig") as f:
+            loaded = json.load(f)
+        config.update(loaded)
+    elif os.environ.get("HEALTH_ALERT_CONFIG"):
+        raise FileNotFoundError(path)
+    else:
+        log_warning("config file not found; using built-in defaults: " + path)
+
     if os.environ.get("RUVSENSE_MASTER_IP"):
         config["master_ip"] = os.environ["RUVSENSE_MASTER_IP"]
     if os.environ.get("RUVSENSE_MASTER_PORT"):
@@ -243,23 +237,7 @@ def load_modules(url, headers):
                     )
                 )
             except requests.RequestException as exc:
-                log_warning(
-                    "failed to load {} as {}: {}".format(module["requested_id"], runtime_id, exc)
-                )
-
-        refreshed = fetch_modules(url, headers)
-        refreshed_available = module_map(refreshed)
-        for runtime_id in runtime_ids:
-            current = refreshed_available.get(runtime_id, {})
-            log_info(
-                "verified {} via {}: enabled={} status={} capability_status={}".format(
-                    module["requested_id"],
-                    runtime_id,
-                    current.get("enabled"),
-                    current.get("status"),
-                    current.get("capability_status"),
-                )
-            )
+                log_warning("failed to load {} as {}: {}".format(module["requested_id"], runtime_id, exc))
 
 
 def nested_vitals(payload):
@@ -303,8 +281,8 @@ def write_health_log(handle, payload):
 
 
 def monitor_vitals(url, headers, config):
-    apnea_started_at = None
-    apnea_alert_active = False
+    low_breathing_started_at = None
+    low_breathing_alert_active = False
     once = os.environ.get("HEALTH_MONITOR_ONCE", "") == "1"
 
     with open_log_file() as log_file:
@@ -315,44 +293,44 @@ def monitor_vitals(url, headers, config):
                 vitals = nested_vitals(payload)
                 breathing = first_number(
                     vitals,
-                    ["breathing_rate", "breathing_rate_bpm", "respiration_rate_bpm"],
+                    ["breathing_bpm", "breathing_rate", "breathing_rate_bpm", "respiration_rate_bpm"],
                 )
-                heart_rate = first_number(
+                fall_detected = first_bool(payload, vitals, ["fall_suspected", "fall_detected", "fall"])
+                non_movement = first_bool(
+                    payload,
                     vitals,
-                    ["heart_rate", "heart_rate_bpm", "heartrate_bpm"],
+                    ["non_movement_prolonged", "prolonged_non_movement", "immobility_detected"],
                 )
-                fall_detected = first_bool(payload, vitals, ["fall_detected", "fall"])
 
                 if breathing is not None and breathing < float(config["breathing_min_bpm"]):
-                    if apnea_started_at is None:
-                        apnea_started_at = time.time()
-                    apnea_seconds = time.time() - apnea_started_at
-                    if apnea_seconds > float(config["apnea_threshold_seconds"]) and not apnea_alert_active:
-                        apnea_alert_active = True
+                    if low_breathing_started_at is None:
+                        low_breathing_started_at = time.time()
+                    low_breathing_seconds = time.time() - low_breathing_started_at
+                    if (
+                        low_breathing_seconds > float(config["apnea_threshold_seconds"])
+                        and not low_breathing_alert_active
+                    ):
+                        low_breathing_alert_active = True
                         alert(
-                            "apnea threshold exceeded: breathing_rate={:.1f} bpm for {:.0f}s".format(
-                                breathing, apnea_seconds
+                            "low/paused breathing threshold exceeded: breathing_rate={:.1f} bpm for {:.0f}s".format(
+                                breathing, low_breathing_seconds
                             )
                         )
                 else:
-                    apnea_started_at = None
-                    apnea_alert_active = False
+                    low_breathing_started_at = None
+                    low_breathing_alert_active = False
 
                 if breathing is not None and breathing > float(config["breathing_max_bpm"]):
                     alert("breathing anomaly: breathing_rate={:.1f} bpm".format(breathing))
 
-                if heart_rate is not None:
-                    if heart_rate < float(config["heartrate_min_bpm"]) or heart_rate > float(
-                        config["heartrate_max_bpm"]
-                    ):
-                        alert("heart-rate anomaly: heart_rate={:.1f} bpm".format(heart_rate))
-
                 if fall_detected:
                     alert("fall detected")
+                if non_movement:
+                    alert("prolonged non-movement detected")
 
                 log_info(
-                    "vitals breathing={} heart_rate={} fall_detected={}".format(
-                        breathing, heart_rate, fall_detected
+                    "vitals breathing={} fall_detected={} non_movement={}".format(
+                        breathing, fall_detected, non_movement
                     )
                 )
             except requests.RequestException as exc:

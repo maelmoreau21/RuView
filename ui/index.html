@@ -3,333 +3,1011 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="theme-color" content="#07110f">
-  <meta name="description" content="Accueil opérateur RuvSense Edge pour master Raspberry Pi et nœuds ESP32-C6 live">
-  <title>RuvSense Edge - Accueil opérateur</title>
+  <meta name="theme-color" content="#0a0e1a">
+  <meta name="description" content="Console live RuvSense Edge">
+  <title>RuvSense</title>
   <link rel="stylesheet" href="style.css">
-  <link rel="manifest" href="manifest.json">
-  <meta http-equiv="refresh" content="0; url=/ui/console.html#fleet">
-  <script>
-    window.location.replace('/ui/console.html#fleet');
-  </script>
 </head>
-<body class="home-page">
-  <a href="#main" class="skip-to-content">Aller au contenu principal</a>
-
-  <header class="topbar home-topbar">
-    <div class="brand-lockup">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <div>
-        <p>RuvSense Edge</p>
-        <h1>Accueil opérateur</h1>
-      </div>
+<body>
+  <header class="app-header">
+    <div class="brand" aria-label="Etat de connexion RuvSense">
+      <span id="connection-dot" class="status-dot is-offline" aria-hidden="true"></span>
+      <span class="brand-name">RuvSense</span>
     </div>
-    <nav class="global-nav" aria-label="Navigation globale">
-      <a class="is-active" href="/ui/index.html">Accueil</a>
-      <a href="/ui/console.html#fleet">Console live</a>
-      <a href="/ui/observatory.html" target="_blank" rel="noopener">Vue 3D</a>
-      <a href="/ui/pose-fusion.html">Pose Fusion</a>
-      <a href="#diagnostics-api">Diagnostics/API</a>
-    </nav>
+    <div class="live-strip" aria-live="polite">
+      <span id="live-badge" class="live-badge is-offline">HORS LIGNE</span>
+      <span id="active-node-summary" class="active-node-summary">--</span>
+    </div>
+    <time id="header-clock" class="header-clock" datetime="">--:--:--</time>
   </header>
 
-  <main id="main" class="home-shell">
-    <section class="home-intro" aria-labelledby="home-title">
-      <div>
-        <p class="eyebrow">Raspberry Pi master + ESP32-C6</p>
-        <h2 id="home-title">Guide opérateur live-only</h2>
-        <p class="home-lead">
-          Cette page sert de point d’entrée terrain pour installer, vérifier et exploiter RuvSense Edge.
-          En production, l’état reste fermé si le master ou les nœuds live ne répondent pas.
-        </p>
-      </div>
-      <div class="operator-actions" aria-label="Accès rapides">
-        <a class="primary-link" href="/ui/console.html#fleet">Ouvrir la console live</a>
-        <a href="/ui/observatory.html" target="_blank" rel="noopener">Vue 3D</a>
-      </div>
-    </section>
+  <main class="app-layout">
+    <aside class="left-column" aria-label="Noeuds et systeme">
+      <section class="panel-section" aria-labelledby="nodes-title">
+        <h2 id="nodes-title" class="section-title">NŒUDS</h2>
+        <div id="nodes-list" class="card-stack" aria-live="polite"></div>
+      </section>
 
-    <section class="live-band" aria-labelledby="live-title" aria-live="polite">
-      <div class="section-head compact">
-        <div>
-          <p class="eyebrow">État master</p>
-          <h2 id="live-title">Bandeau live</h2>
+      <section class="panel-section" aria-labelledby="system-title">
+        <h2 id="system-title" class="section-title">SYSTÈME</h2>
+        <div class="card system-card">
+          <dl class="metric-list">
+            <div>
+              <dt>Version</dt>
+              <dd id="system-version">--</dd>
+            </div>
+            <div>
+              <dt>Uptime</dt>
+              <dd id="system-uptime">--</dd>
+            </div>
+            <div>
+              <dt>Frames CSI</dt>
+              <dd id="system-frame-count">--</dd>
+            </div>
+            <div>
+              <dt>Mode</dt>
+              <dd><span id="system-mode" class="mode-badge is-empty">--</span></dd>
+            </div>
+          </dl>
         </div>
-        <span id="live-updated" class="badge">Mise à jour en attente</span>
-      </div>
+      </section>
 
-      <div class="endpoint-strip" aria-label="Endpoints interrogés">
-        <span class="endpoint-chip is-unknown" data-endpoint="/health/ready">/health/ready</span>
-        <span class="endpoint-chip is-unknown" data-endpoint="/api/v1/nodes">/api/v1/nodes</span>
-        <span class="endpoint-chip is-unknown" data-endpoint="/api/v1/topology">/api/v1/topology</span>
-        <span class="endpoint-chip is-unknown" data-endpoint="/api/v1/modules">/api/v1/modules</span>
-      </div>
-
-      <div class="live-grid">
-        <article id="live-readiness-card" class="live-card is-unknown">
-          <span>Readiness</span>
-          <strong id="live-readiness">Inconnue</strong>
-          <small id="live-readiness-detail">Le master n’a pas encore répondu.</small>
-        </article>
-        <article id="live-nodes-card" class="live-card is-unknown">
-          <span>Nœuds</span>
-          <strong id="live-nodes">0/1</strong>
-          <small id="live-nodes-detail">Aucun nœud live confirmé.</small>
-        </article>
-        <article id="live-geometry-card" class="live-card is-unknown">
-          <span>Géométrie</span>
-          <strong id="live-geometry">Non évaluée</strong>
-          <small id="live-geometry-detail">3+ nœuds donnent une meilleure géométrie multistatique.</small>
-        </article>
-        <article id="live-modules-card" class="live-card is-unknown">
-          <span>Modules</span>
-          <strong id="live-modules">0 actifs</strong>
-          <small id="live-modules-detail">Catalogue module indisponible.</small>
-        </article>
-      </div>
-    </section>
-
-    <section id="comment-ca-marche" class="operator-section">
-      <div class="section-head">
-        <div>
-          <p class="eyebrow">Vue d’ensemble</p>
-          <h2>Comment ça marche</h2>
+      <section class="panel-section" aria-labelledby="actions-title">
+        <h2 id="actions-title" class="section-title">ACTIONS</h2>
+        <div class="card action-card">
+          <button id="recalibrate-button" class="outline-button" type="button">Recalibrer</button>
+          <button id="reload-modules-button" class="outline-button" type="button">Recharger modules</button>
+          <div id="action-status" class="action-status" aria-live="polite">--</div>
         </div>
-      </div>
-      <div class="doc-grid">
-        <article class="doc-card">
-          <h3>Master</h3>
-          <p>Le Raspberry Pi exécute `ruvsense-master`, reçoit les trames CSI UDP et publie les API HTTP/WS.</p>
-        </article>
-        <article class="doc-card">
-          <h3>Nœuds</h3>
-          <p>Les ESP32-C6 envoient du CSI live. Un nœud actif suffit au quorum V1, puis 3+ nœuds améliorent la fusion.</p>
-        </article>
-        <article class="doc-card">
-          <h3>Modules</h3>
-          <p>Les modules restent limités par le nombre de nœuds et leur statut live. Aucun matériel absent n’est simulé.</p>
-        </article>
+      </section>
+    </aside>
+
+    <section class="room-column" aria-labelledby="room-title">
+      <div class="room-stage">
+        <h1 id="room-title" class="room-title">VUE DE LA PIÈCE</h1>
+        <canvas id="room-canvas" class="room-canvas" aria-label="Vue de dessus de la piece"></canvas>
+        <div id="person-halos" class="person-halos" aria-hidden="true"></div>
       </div>
     </section>
 
-    <section id="placement" class="operator-section">
-      <div class="section-head">
-        <div>
-          <p class="eyebrow">Guide placement V1</p>
-          <h2>Placement recommandé</h2>
-        </div>
-      </div>
-      <div class="doc-grid placement-grid">
-        <article class="doc-card">
-          <h3>Quorum</h3>
-          <p>Prévoir au minimum 1 nœud ESP32-C6 live. Pour la meilleure géométrie, installer 3 nœuds ou plus.</p>
-        </article>
-        <article class="doc-card">
-          <h3>Disposition</h3>
-          <p>Placer les nœuds autour de la zone à observer, en évitant de les aligner sur un seul mur ou une seule ligne.</p>
-        </article>
-        <article class="doc-card">
-          <h3>Coordonnées</h3>
-          <p>Mesurer les positions en mètres et les saisir dans `position_m`. Les hauteurs différentes sont autorisées.</p>
-        </article>
-      </div>
-    </section>
+    <aside class="right-column" aria-label="Vitaux alertes tendances">
+      <section class="panel-section" aria-labelledby="vitals-title">
+        <h2 id="vitals-title" class="section-title">VITAUX</h2>
+        <div id="vitals-list" class="card-stack" aria-live="polite"></div>
+      </section>
 
-    <section id="demarrage" class="operator-section">
-      <div class="section-head">
-        <div>
-          <p class="eyebrow">Mise en route</p>
-          <h2>Démarrage</h2>
+      <section class="panel-section alerts-section" aria-labelledby="alerts-title">
+        <div class="section-row">
+          <h2 id="alerts-title" class="section-title">ALERTES</h2>
+          <span id="alerts-count" class="alert-count">0</span>
         </div>
-      </div>
-      <ol class="step-list">
-        <li>Démarrer le master sur Raspberry Pi avec la configuration production et les ports HTTP/WS/UDP prévus.</li>
-        <li>Provisionner chaque ESP32-C6 avec le SSID, le mot de passe WiFi et l’adresse IP cible du master.</li>
-        <li>Ouvrir la <a href="/ui/console.html#fleet">Console live</a> et attendre que le quorum de nœuds actifs soit atteint.</li>
-        <li>Renseigner les positions mesurées en mètres pour stabiliser la topologie et la fusion.</li>
-      </ol>
-    </section>
+        <div id="alerts-list" class="alerts-list" aria-live="polite"></div>
+        <button id="clear-alerts-button" class="clear-alerts-button" type="button">Tout effacer</button>
+      </section>
 
-    <section id="calibration" class="operator-section">
-      <div class="section-head">
-        <div>
-          <p class="eyebrow">Pièce vide</p>
-          <h2>Calibration</h2>
+      <section class="panel-section" aria-labelledby="trends-title">
+        <div class="section-row">
+          <h2 id="trends-title" class="section-title">TENDANCES</h2>
+          <button id="trend-tab-breathing" class="trend-tab is-active" type="button">Respiration</button>
         </div>
-      </div>
-      <div class="doc-grid">
-        <article class="doc-card">
-          <h3>Avant</h3>
-          <p>Vider la zone, vérifier que le master est prêt et que les nœuds attendus sont live.</p>
-        </article>
-        <article class="doc-card">
-          <h3>Pendant</h3>
-          <p>Lancer la calibration depuis la console, laisser la pièce stable, puis arrêter quand le modèle est collecté.</p>
-        </article>
-        <article class="doc-card">
-          <h3>Après</h3>
-          <p>Recalibrer après déplacement de nœuds, changement de mobilier important ou dérive de cohérence persistante.</p>
-        </article>
-      </div>
-    </section>
-
-    <section id="depannage" class="operator-section">
-      <div class="section-head">
-        <div>
-          <p class="eyebrow">Terrain</p>
-          <h2>Dépannage</h2>
+        <div class="card trends-card">
+          <canvas id="trends-canvas" class="trends-canvas" width="240" height="80" aria-label="Tendance respiration sur 10 minutes"></canvas>
         </div>
-      </div>
-      <div class="troubleshoot-list">
-        <article>
-          <strong>Readiness `not_ready`</strong>
-          <span>Contrôler le quorum `RUVSENSE_MIN_NODES`, l’UDP 5005, l’adresse cible et l’alimentation des nœuds.</span>
-        </article>
-        <article>
-          <strong>Nœud `stale` ou `sync_only`</strong>
-          <span>Vérifier le firmware CSI, le port série au besoin, puis confirmer que les trames CSI arrivent au master.</span>
-        </article>
-        <article>
-          <strong>Module indisponible</strong>
-          <span>Comparer le nombre de nœuds actifs avec `required_nodes`; certains modules attendent 2 ou 3+ nœuds.</span>
-        </article>
-        <article>
-          <strong>Topologie imprécise</strong>
-          <span>Mesurer les coordonnées, saisir `position_m` et éviter les nœuds colinéaires autour de la zone.</span>
-        </article>
-      </div>
-    </section>
-
-    <section id="diagnostics-api" class="operator-section api-section">
-      <div class="section-head">
-        <div>
-          <p class="eyebrow">Liens directs</p>
-          <h2>Diagnostics/API</h2>
-        </div>
-      </div>
-      <div class="advanced-links" aria-label="Diagnostics et API">
-        <a href="/ui/console.html#diagnostics">Panneau diagnostics</a>
-        <a href="/health/ready">Health ready</a>
-        <a href="/api/v1/nodes">Nodes JSON</a>
-        <a href="/api/v1/topology">Topology JSON</a>
-        <a href="/api/v1/modules">Modules JSON</a>
-        <a href="/metrics">Metrics</a>
-      </div>
-    </section>
+      </section>
+    </aside>
   </main>
 
-  <script type="module">
-    const endpointPaths = ['/health/ready', '/api/v1/nodes', '/api/v1/topology', '/api/v1/modules'];
-    const endpointEls = new Map([...document.querySelectorAll('[data-endpoint]')].map((el) => [el.dataset.endpoint, el]));
+  <script src="state.js"></script>
+  <script src="api.js"></script>
+  <script src="alerts.js"></script>
+  <script src="websocket.js"></script>
+  <script>
+    (() => {
+      const DEFAULT_ROOM = {
+        room_width_meters: 5,
+        room_height_meters: 4,
+        nodes: [
+          { id: 1, x: 0, y: 0, label: 'Node 1' },
+          { id: 2, x: 5, y: 0, label: 'Node 2' },
+          { id: 3, x: 0, y: 4, label: 'Node 3' },
+        ],
+      };
 
-    function setText(id, value) {
-      const node = document.getElementById(id);
-      if (node) node.textContent = value;
-    }
+      const els = {};
+      const trails = new Map();
+      const zeroBreathingSince = new Map();
+      let canvasMetrics = null;
+      let trendMode = 'breathing';
+      let lastRenderAt = 0;
 
-    function firstValue(...values) {
-      return values.find((value) => value !== undefined && value !== null && value !== '');
-    }
+      function $(id) {
+        return document.getElementById(id);
+      }
 
-    function numberValue(...values) {
-      const n = Number(firstValue(...values));
-      return Number.isFinite(n) ? n : 0;
-    }
+      function getElements() {
+        [
+          'connection-dot',
+          'live-badge',
+          'active-node-summary',
+          'header-clock',
+          'nodes-list',
+          'system-version',
+          'system-uptime',
+          'system-frame-count',
+          'system-mode',
+          'recalibrate-button',
+          'reload-modules-button',
+          'action-status',
+          'room-canvas',
+          'person-halos',
+          'vitals-list',
+          'alerts-count',
+          'alerts-list',
+          'clear-alerts-button',
+          'trends-canvas',
+          'trend-tab-breathing',
+        ].forEach((id) => {
+          els[id] = $(id);
+        });
+      }
 
-    function setCardState(id, state) {
-      const card = document.getElementById(id);
-      if (!card) return;
-      card.classList.remove('is-ready', 'is-warning', 'is-error', 'is-unknown');
-      card.classList.add(`is-${state}`);
-    }
+      function dispatchUpdate() {
+        window.dispatchEvent(new CustomEvent('rs:update'));
+      }
 
-    async function fetchEndpoint(path) {
-      const started = performance.now();
-      try {
-        const response = await fetch(path, { cache: 'no-store' });
-        const raw = await response.text();
-        let data = null;
-        if (raw.trim().startsWith('{') || raw.trim().startsWith('[')) {
-          data = JSON.parse(raw);
+      function formatClock(date = new Date()) {
+        return date.toLocaleTimeString('fr-FR', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        });
+      }
+
+      function updateClock() {
+        const now = new Date();
+        els['header-clock'].textContent = formatClock(now);
+        els['header-clock'].dateTime = now.toISOString();
+      }
+
+      function safeNumber(value) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+      }
+
+      function normalizeId(value) {
+        return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      }
+
+      function roomConfig() {
+        return window.RS.room_config || DEFAULT_ROOM;
+      }
+
+      function roomWidth() {
+        const config = roomConfig();
+        return safeNumber(config.room_width_meters)
+          || safeNumber(config.width_meters)
+          || safeNumber(config.width_m)
+          || safeNumber(config.dimensions?.width)
+          || safeNumber(config.dimensions_m?.[0])
+          || 5;
+      }
+
+      function roomHeight() {
+        const config = roomConfig();
+        return safeNumber(config.room_height_meters)
+          || safeNumber(config.height_meters)
+          || safeNumber(config.depth_meters)
+          || safeNumber(config.height_m)
+          || safeNumber(config.dimensions?.height)
+          || safeNumber(config.dimensions_m?.[1])
+          || 4;
+      }
+
+      function configuredNodes() {
+        const config = roomConfig();
+        const rawNodes = Array.isArray(config.nodes) ? config.nodes : [];
+        return rawNodes.length ? rawNodes : DEFAULT_ROOM.nodes;
+      }
+
+      function nodeKeyCandidates(node) {
+        const id = node.id ?? node.node_id ?? node.name ?? node.label;
+        return [
+          String(id),
+          normalizeId(id),
+          normalizeId(`node ${id}`),
+          normalizeId(node.label),
+          normalizeId(node.name),
+          normalizeId(node.node_id),
+        ].filter(Boolean);
+      }
+
+      function stateNodeFor(configNode) {
+        const candidates = nodeKeyCandidates(configNode);
+        for (const candidate of candidates) {
+          if (window.RS.nodes[candidate]) return window.RS.nodes[candidate];
         }
-        return { path, status: response.status, ok: response.ok, data, ms: performance.now() - started };
-      } catch (error) {
-        return { path, status: 0, ok: false, error: error.message, ms: performance.now() - started };
+        const entries = Object.entries(window.RS.nodes);
+        return entries.find(([key, node]) => {
+          const values = [key, node.id, node.node_id, node.label, node.name].map(normalizeId);
+          return values.some((value) => candidates.includes(value));
+        })?.[1] || null;
       }
-    }
 
-    function endpointState(result) {
-      if (!result || result.status === 0) return 'error';
-      if (!result.ok) {
-        if (result.path === '/health/ready' && result.status === 503 && result.data?.status === 'not_ready') return 'warning';
-        return 'error';
+      function allNodesForUi() {
+        const configNodes = configuredNodes().map((node, index) => ({
+          config: node,
+          state: stateNodeFor(node),
+          index,
+        }));
+
+        const known = new Set(configNodes.flatMap((entry) => nodeKeyCandidates(entry.config)));
+        Object.entries(window.RS.nodes).forEach(([key, node]) => {
+          const normalized = normalizeId(key || node.id || node.node_id || node.label);
+          if (known.has(normalized)) return;
+          configNodes.push({
+            config: {
+              id: node.id || node.node_id || key,
+              label: node.label || node.name || `Node ${configNodes.length + 1}`,
+              x: node.x,
+              y: node.y,
+            },
+            state: node,
+            index: configNodes.length,
+          });
+        });
+
+        return configNodes;
       }
-      if (result.path === '/health/ready' && result.data?.status !== 'ready') return 'warning';
-      return 'ready';
-    }
 
-    function updateEndpointChip(result) {
-      const chip = endpointEls.get(result.path);
-      if (!chip) return;
-      const state = endpointState(result);
-      chip.classList.remove('is-ready', 'is-warning', 'is-error', 'is-unknown');
-      chip.classList.add(`is-${state}`);
-      const suffix = result.status ? `HTTP ${result.status}` : 'inaccessible';
-      chip.title = result.error ? `${suffix}: ${result.error}` : `${suffix}, ${Math.round(result.ms)} ms`;
-    }
+      function isNodeActive(nodeState) {
+        if (!nodeState) return false;
+        if (nodeState.active === false) return false;
+        const seenAt = lastSeenMs(nodeState);
+        if (seenAt == null) return Boolean(nodeState.active);
+        return Date.now() - seenAt < 30000;
+      }
 
-    function roomLabel(topology) {
-      const dims = topology?.room?.dimensions_m;
-      if (!Array.isArray(dims) || dims.length < 3) return 'Pièce non déclarée';
-      return `${Number(dims[0]).toFixed(1)} x ${Number(dims[1]).toFixed(1)} x ${Number(dims[2]).toFixed(1)} m`;
-    }
+      function lastSeenMs(nodeState) {
+        if (!nodeState) return null;
+        const raw = nodeState.last_seen ?? nodeState.lastSeen ?? nodeState.last_frame_at ?? nodeState.last_frame_ms;
+        if (raw == null || raw === '') return null;
+        if (typeof raw === 'number') {
+          if (raw > 100000000000) return raw;
+          if (raw > 1000000000) return raw * 1000;
+          return Date.now() - raw;
+        }
+        const parsed = Date.parse(raw);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
 
-    function renderLive(results) {
-      const byPath = Object.fromEntries(results.map((result) => [result.path, result]));
-      const health = byPath['/health/ready'];
-      const nodes = byPath['/api/v1/nodes']?.data || {};
-      const topology = byPath['/api/v1/topology']?.data || {};
-      const modules = byPath['/api/v1/modules']?.data || {};
-      const moduleList = Array.isArray(modules.modules) ? modules.modules : [];
-      const ready = health?.data?.status === 'ready' || nodes.ready === true || topology.readiness?.ready === true;
-      const masterReachable = Boolean(health?.data && (health.ok || health.status === 503));
-      const active = numberValue(health?.data?.active_nodes, nodes.active, topology.readiness?.active_nodes, 0);
-      const minNodes = Math.max(1, numberValue(health?.data?.min_nodes, nodes.min_nodes, topology.readiness?.min_nodes, 1));
-      const totalNodes = numberValue(nodes.total, Array.isArray(topology.nodes) ? topology.nodes.length : 0);
-      const source = firstValue(health?.data?.source, topology.source, 'source inconnue');
-      const enabledModules = moduleList.length
-        ? moduleList.filter((mod) => mod.enabled !== false).length
-        : (Array.isArray(modules.enabled_modules) ? modules.enabled_modules.length : 0);
-      const activeModules = moduleList.filter((mod) => ['active', 'live'].includes(String(mod.effective_status || mod.status))).length;
-      const apCount = Array.isArray(topology.access_points) ? topology.access_points.length : 0;
+      function ageLabel(nodeState) {
+        const seenAt = lastSeenMs(nodeState);
+        if (seenAt == null) return '--';
+        const age = Math.max(0, Date.now() - seenAt);
+        if (age < 1000) return `${Math.round(age)}ms`;
+        return `${(age / 1000).toFixed(age < 10000 ? 1 : 0)}s`;
+      }
 
-      setText('live-readiness', ready ? 'Prêt' : masterReachable ? 'Non prêt' : 'Inaccessible');
-      setText('live-readiness-detail', `${source} · quorum ${active}/${minNodes}`);
-      setCardState('live-readiness-card', ready ? 'ready' : active > 0 ? 'warning' : 'error');
+      function freshnessClass(nodeState) {
+        const seenAt = lastSeenMs(nodeState);
+        if (seenAt == null) return 'is-red';
+        const age = Date.now() - seenAt;
+        if (age < 5000) return 'is-green';
+        if (age < 30000) return 'is-orange';
+        return 'is-red';
+      }
 
-      setText('live-nodes', `${active}/${minNodes}`);
-      setText('live-nodes-detail', `${totalNodes} nœud(s) connus côté master`);
-      setCardState('live-nodes-card', ready ? 'ready' : active > 0 ? 'warning' : 'error');
+      function rssiSegments(rssi) {
+        const value = safeNumber(rssi);
+        if (value == null) return 0;
+        if (value >= -50) return 5;
+        if (value >= -60) return 4;
+        if (value >= -70) return 3;
+        if (value >= -80) return 2;
+        return 1;
+      }
 
-      const geometryState = active >= 3 ? 'ready' : active >= 1 ? 'warning' : 'error';
-      setText('live-geometry', active >= 3 ? '3+ nœuds' : active >= 1 ? 'V1 minimal' : 'Absente');
-      setText('live-geometry-detail', `${roomLabel(topology)} · ${apCount} AP visible(s)`);
-      setCardState('live-geometry-card', geometryState);
+      function displayNodeName(entry) {
+        return entry.config.label || entry.config.name || `Node ${entry.index + 1}`;
+      }
 
-      setText('live-modules', `${activeModules} actifs`);
-      setText('live-modules-detail', `${enabledModules}/${moduleList.length || enabledModules} modules activés`);
-      setCardState('live-modules-card', activeModules > 0 ? 'ready' : enabledModules > 0 ? 'warning' : 'error');
-      setText('live-updated', `Mis à jour ${new Date().toLocaleTimeString()}`);
-    }
+      function setStatus() {
+        const connected = Boolean(window.RS.connected);
+        els['connection-dot'].classList.toggle('is-online', connected);
+        els['connection-dot'].classList.toggle('is-offline', !connected);
+        els['live-badge'].classList.toggle('is-online', connected);
+        els['live-badge'].classList.toggle('is-offline', !connected);
+        els['live-badge'].textContent = connected ? 'LIVE' : 'HORS LIGNE';
 
-    async function refreshLive() {
-      const results = await Promise.all(endpointPaths.map(fetchEndpoint));
-      for (const result of results) updateEndpointChip(result);
-      renderLive(results);
-    }
+        const activeNames = allNodesForUi()
+          .filter((entry) => isNodeActive(entry.state))
+          .map(displayNodeName);
+        const nodeLabel = activeNames.length === 1 ? 'nœud actif' : 'nœuds actifs';
+        els['active-node-summary'].textContent = activeNames.length ? activeNames.join(', ') : '--';
+      }
 
-    refreshLive();
-    window.setInterval(refreshLive, 5000);
+      function renderNodes() {
+        const nodes = allNodesForUi();
+        els['nodes-list'].replaceChildren();
+
+        if ((!window.RS.connected && !Object.keys(window.RS.nodes).length) || !nodes.length) {
+          const card = document.createElement('article');
+          card.className = 'card node-card';
+          card.textContent = '--';
+          els['nodes-list'].append(card);
+          return;
+        }
+
+        nodes.forEach((entry) => {
+          const node = entry.state;
+          const active = isNodeActive(node);
+          const rssi = active ? safeNumber(node?.rssi ?? node?.rssi_dbm ?? node?.signal) : null;
+          const filled = rssiSegments(rssi);
+
+          const card = document.createElement('article');
+          card.className = 'card node-card';
+
+          const row = document.createElement('div');
+          row.className = 'node-row';
+
+          const indicator = document.createElement('span');
+          indicator.className = `node-indicator ${freshnessClass(node)}`;
+          indicator.setAttribute('aria-hidden', 'true');
+
+          const name = document.createElement('strong');
+          name.textContent = displayNodeName(entry);
+
+          row.append(indicator, name);
+
+          const details = document.createElement('div');
+          details.className = 'node-details';
+
+          const rssiLine = document.createElement('span');
+          rssiLine.textContent = rssi == null ? '-- dBm' : `${Math.round(rssi)} dBm`;
+
+          const ageLine = document.createElement('span');
+          ageLine.textContent = active ? ageLabel(node) : 'inactif';
+
+          details.append(rssiLine, ageLine);
+
+          const signal = document.createElement('div');
+          signal.className = 'signal-bar';
+          for (let i = 0; i < 5; i += 1) {
+            const segment = document.createElement('span');
+            if (i < filled) segment.className = 'is-filled';
+            signal.append(segment);
+          }
+
+          card.append(row, details, signal);
+          els['nodes-list'].append(card);
+        });
+      }
+
+      function modeValue() {
+        const features = window.RS.features || {};
+        const explicitMode = features.mode || features.runtime_mode || window.RS.mode;
+        if (String(explicitMode).toLowerCase().includes('sim')) return 'SIMULATION';
+        if (window.RS.connected) return 'LIVE';
+        return '--';
+      }
+
+      function renderSystem() {
+        els['system-version'].textContent = window.RS.server_version || '--';
+        els['system-uptime'].textContent = window.RS.uptime || '--';
+        els['system-frame-count'].textContent = window.RS.connected ? String(window.RS.frame_count ?? 0) : '--';
+        const mode = modeValue();
+        els['system-mode'].textContent = mode;
+        els['system-mode'].className = 'mode-badge';
+        if (mode === 'LIVE') els['system-mode'].classList.add('is-live');
+        else if (mode === 'SIMULATION') els['system-mode'].classList.add('is-simulation');
+        else els['system-mode'].classList.add('is-empty');
+      }
+
+      function confidencePercent(person) {
+        const raw = safeNumber(person?.confidence);
+        if (raw == null) return null;
+        return raw <= 1 ? raw * 100 : raw;
+      }
+
+      function personColor(person) {
+        const confidence = confidencePercent(person);
+        if (confidence == null || confidence <= 40) return '#ef4444';
+        if (confidence <= 70) return '#f59e0b';
+        return '#10b981';
+      }
+
+      function updateTrails() {
+        window.RS.persons.forEach((person, index) => {
+          const id = String(person.id ?? person.person_id ?? person.track_id ?? index + 1);
+          const x = safeNumber(person.x ?? person.position?.x ?? person.location?.x);
+          const y = safeNumber(person.y ?? person.position?.y ?? person.location?.y);
+          if (x == null || y == null) return;
+          const list = trails.get(id) || [];
+          const last = list[list.length - 1];
+          if (!last || Math.abs(last.x - x) > 0.02 || Math.abs(last.y - y) > 0.02) {
+            list.push({ x, y });
+            while (list.length > 6) list.shift();
+            trails.set(id, list);
+          }
+        });
+      }
+
+      function resizeCanvas(canvas) {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(1, Math.round(rect.width * dpr));
+        const height = Math.max(1, Math.round(rect.height * dpr));
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        return { ctx, width: rect.width, height: rect.height };
+      }
+
+      function roundRect(ctx, x, y, width, height, radius) {
+        const r = Math.min(radius, width / 2, height / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + width, y, x + width, y + height, r);
+        ctx.arcTo(x + width, y + height, x, y + height, r);
+        ctx.arcTo(x, y + height, x, y, r);
+        ctx.arcTo(x, y, x + width, y, r);
+        ctx.closePath();
+      }
+
+      function roomToScreen(x, y) {
+        if (!canvasMetrics) return { x: 0, y: 0 };
+        return {
+          x: canvasMetrics.roomX + x * canvasMetrics.scale,
+          y: canvasMetrics.roomY + y * canvasMetrics.scale,
+        };
+      }
+
+      function drawGrid(ctx, metrics) {
+        ctx.strokeStyle = '#1f2937';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let x = 0; x <= metrics.roomW + 0.001; x += 1) {
+          const sx = metrics.roomX + x * metrics.scale;
+          ctx.moveTo(sx, metrics.roomY);
+          ctx.lineTo(sx, metrics.roomY + metrics.roomH * metrics.scale);
+        }
+        for (let y = 0; y <= metrics.roomH + 0.001; y += 1) {
+          const sy = metrics.roomY + y * metrics.scale;
+          ctx.moveTo(metrics.roomX, sy);
+          ctx.lineTo(metrics.roomX + metrics.roomW * metrics.scale, sy);
+        }
+        ctx.stroke();
+      }
+
+      function drawNodes(ctx) {
+        allNodesForUi().forEach((entry) => {
+          const x = safeNumber(entry.config.x ?? entry.config.position?.x ?? entry.config.position_m?.[0]);
+          const y = safeNumber(entry.config.y ?? entry.config.position?.y ?? entry.config.position_m?.[1]);
+          if (x == null || y == null) return;
+          const active = isNodeActive(entry.state);
+          const p = roomToScreen(x, y);
+
+          if (active) {
+            ctx.beginPath();
+            ctx.fillStyle = 'rgba(59, 130, 246, 0.10)';
+            ctx.strokeStyle = 'rgba(59, 130, 246, 0.28)';
+            ctx.lineWidth = 1;
+            ctx.arc(p.x, p.y, Math.max(34, canvasMetrics.scale * 1.1), 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          }
+
+          roundRect(ctx, p.x - 18, p.y - 14, 36, 28, 6);
+          ctx.fillStyle = active ? '#3b82f6' : '#374151';
+          ctx.fill();
+          ctx.strokeStyle = active ? 'rgba(249, 250, 251, 0.42)' : 'rgba(107, 114, 128, 0.35)';
+          ctx.stroke();
+
+          ctx.fillStyle = '#f9fafb';
+          ctx.font = '600 12px system-ui, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(`N${entry.index + 1}`, p.x, p.y);
+        });
+      }
+
+      function drawPersons(ctx) {
+        updateTrails();
+        window.RS.persons.forEach((person, index) => {
+          const id = String(person.id ?? person.person_id ?? person.track_id ?? index + 1);
+          const x = safeNumber(person.x ?? person.position?.x ?? person.location?.x);
+          const y = safeNumber(person.y ?? person.position?.y ?? person.location?.y);
+          if (x == null || y == null) return;
+          const trail = trails.get(id) || [];
+
+          trail.slice(0, -1).slice(-5).forEach((point, trailIndex, points) => {
+            const p = roomToScreen(point.x, point.y);
+            const alpha = (trailIndex + 1) / (points.length + 1);
+            ctx.beginPath();
+            ctx.fillStyle = `rgba(16, 185, 129, ${alpha * 0.42})`;
+            ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
+            ctx.fill();
+          });
+
+          const p = roomToScreen(x, y);
+          ctx.beginPath();
+          ctx.fillStyle = personColor(person);
+          ctx.arc(p.x, p.y, 20, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(249, 250, 251, 0.68)';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '700 12px system-ui, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(`P${index + 1}`, p.x, p.y);
+        });
+      }
+
+      function drawScale(ctx, metrics) {
+        const rulerWidth = Math.min(metrics.roomW, 3) * metrics.scale;
+        const x = Math.max(metrics.roomX, (metrics.width - rulerWidth) / 2);
+        const y = metrics.height - 42;
+        ctx.strokeStyle = '#6b7280';
+        ctx.fillStyle = '#6b7280';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + rulerWidth, y);
+        for (let i = 0; i <= Math.min(metrics.roomW, 3); i += 1) {
+          const tx = x + i * metrics.scale;
+          ctx.moveTo(tx, y - 5);
+          ctx.lineTo(tx, y + 5);
+          ctx.fillText(`${i}m`, tx, y + 17);
+        }
+        ctx.stroke();
+      }
+
+      function drawRoomFooter(ctx, metrics) {
+        ctx.fillStyle = '#f9fafb';
+        ctx.font = '600 12px system-ui, sans-serif';
+        ctx.textBaseline = 'bottom';
+        ctx.textAlign = 'left';
+        const count = window.RS.connected ? String(window.RS.persons.length) : '--';
+        ctx.fillText(`${count} personne(s) détectée(s)`, 16, metrics.height - 16);
+
+        ctx.textAlign = 'right';
+        ctx.fillText(`${metrics.roomW.toFixed(1)}m × ${metrics.roomH.toFixed(1)}m`, metrics.width - 16, metrics.height - 16);
+      }
+
+      function syncHalos() {
+        const container = els['person-halos'];
+        const wanted = new Set();
+        window.RS.persons.forEach((person, index) => {
+          const x = safeNumber(person.x ?? person.position?.x ?? person.location?.x);
+          const y = safeNumber(person.y ?? person.position?.y ?? person.location?.y);
+          if (x == null || y == null || !canvasMetrics) return;
+          const id = String(person.id ?? person.person_id ?? person.track_id ?? index + 1);
+          wanted.add(id);
+          let halo = container.querySelector(`[data-person-id="${CSS.escape(id)}"]`);
+          if (!halo) {
+            halo = document.createElement('span');
+            halo.className = 'person-halo';
+            halo.dataset.personId = id;
+            container.append(halo);
+          }
+          const p = roomToScreen(x, y);
+          halo.style.left = `${p.x}px`;
+          halo.style.top = `${p.y}px`;
+          halo.classList.toggle('is-high', (confidencePercent(person) ?? 0) > 70);
+          halo.classList.toggle('is-mid', (confidencePercent(person) ?? 0) > 40 && (confidencePercent(person) ?? 0) <= 70);
+          halo.classList.toggle('is-low', (confidencePercent(person) ?? 0) <= 40);
+        });
+
+        [...container.querySelectorAll('.person-halo')].forEach((halo) => {
+          if (!wanted.has(halo.dataset.personId)) halo.remove();
+        });
+      }
+
+      function drawRoom() {
+        const canvas = els['room-canvas'];
+        const { ctx, width, height } = resizeCanvas(canvas);
+        const roomW = roomWidth();
+        const roomH = roomHeight();
+        if (!roomW || !roomH) {
+          ctx.clearRect(0, 0, width, height);
+          ctx.fillStyle = '#0d1117';
+          ctx.fillRect(0, 0, width, height);
+          canvasMetrics = null;
+          syncHalos();
+          return;
+        }
+        const margins = { left: 46, right: 32, top: 52, bottom: 70 };
+        const availableW = Math.max(80, width - margins.left - margins.right);
+        const availableH = Math.max(80, height - margins.top - margins.bottom);
+        const scale = Math.min(availableW / roomW, availableH / roomH);
+        canvasMetrics = {
+          width,
+          height,
+          roomW,
+          roomH,
+          scale,
+          roomX: margins.left + (availableW - roomW * scale) / 2,
+          roomY: margins.top + (availableH - roomH * scale) / 2,
+        };
+
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#0d1117';
+        ctx.fillRect(0, 0, width, height);
+
+        drawGrid(ctx, canvasMetrics);
+
+        ctx.strokeStyle = '#374151';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(
+          canvasMetrics.roomX,
+          canvasMetrics.roomY,
+          roomW * scale,
+          roomH * scale,
+        );
+
+        drawNodes(ctx);
+        drawPersons(ctx);
+        drawScale(ctx, canvasMetrics);
+        drawRoomFooter(ctx, canvasMetrics);
+        syncHalos();
+      }
+
+      function breathingValue(person) {
+        return safeNumber(person?.breathing_bpm ?? person?.breathing_rate_bpm ?? person?.respiration_bpm);
+      }
+
+      function motionValue(person) {
+        const raw = safeNumber(person?.motion_energy ?? person?.activity ?? person?.motion);
+        if (raw == null) return null;
+        return Math.max(0, Math.min(100, raw <= 1 ? raw * 100 : raw));
+      }
+
+      function activityLabel(percent) {
+        if (percent == null) return '--';
+        if (percent < 15) return 'IMMOBILE';
+        if (percent < 45) return 'PEU ACTIF';
+        if (percent < 75) return 'ACTIF';
+        return 'TRÈS ACTIF';
+      }
+
+      function breathingStatus(person) {
+        const bpm = breathingValue(person);
+        if (bpm == null) return { label: '--', cls: 'is-empty' };
+        const id = String(person.id ?? person.person_id ?? person.track_id ?? 'person');
+        if (bpm === 0 && !zeroBreathingSince.has(id)) zeroBreathingSince.set(id, Date.now());
+        if (bpm > 0) zeroBreathingSince.delete(id);
+        const zeroSince = zeroBreathingSince.get(id);
+        if (bpm < 4 || (bpm === 0 && zeroSince && Date.now() - zeroSince > 15000)) {
+          return { label: 'APNÉE', cls: 'is-critical' };
+        }
+        if (bpm < 8) return { label: 'LENT', cls: 'is-warning' };
+        if (bpm <= 25) return { label: 'NORMAL', cls: 'is-normal' };
+        return { label: 'RAPIDE', cls: 'is-warning' };
+      }
+
+      function renderVitals() {
+        els['vitals-list'].replaceChildren();
+        if (!window.RS.persons.length) {
+          const card = document.createElement('article');
+          card.className = 'card empty-card';
+          card.textContent = '--';
+          els['vitals-list'].append(card);
+          return;
+        }
+
+        window.RS.persons.forEach((person, index) => {
+          const id = String(person.id ?? person.person_id ?? person.track_id ?? index + 1);
+          const bpm = breathingValue(person);
+          const status = breathingStatus(person);
+          const motion = motionValue(person);
+
+          if (status.cls === 'is-critical') {
+            window.RSAlerts.addAlert('warning', `Respiration critique P${index + 1}`, 'critical', bpm);
+          }
+
+          const card = document.createElement('article');
+          card.className = 'card vital-card';
+
+          const title = document.createElement('h3');
+          title.className = 'person-title';
+          title.textContent = `Personne ${index + 1}`;
+
+          const breathing = document.createElement('div');
+          breathing.className = 'vital-block';
+          const breathingHeading = document.createElement('div');
+          breathingHeading.className = 'vital-heading';
+          const breathingLabel = document.createElement('span');
+          breathingLabel.textContent = 'RESPIRATION';
+          const statusBadge = document.createElement('span');
+          statusBadge.className = `status-badge ${status.cls}`;
+          statusBadge.textContent = status.label;
+          breathingHeading.append(breathingLabel, statusBadge);
+          const vitalValue = document.createElement('div');
+          vitalValue.className = 'vital-value';
+          vitalValue.append(document.createTextNode(bpm == null ? '--' : String(Math.round(bpm))));
+          const unit = document.createElement('span');
+          unit.textContent = 'rpm';
+          vitalValue.append(unit);
+          const miniSparkline = document.createElement('canvas');
+          miniSparkline.className = 'mini-sparkline';
+          miniSparkline.width = 100;
+          miniSparkline.height = 30;
+          miniSparkline.dataset.personId = id;
+          miniSparkline.setAttribute('aria-label', 'Historique respiration');
+          breathing.append(breathingHeading, vitalValue, miniSparkline);
+
+          const heart = document.createElement('div');
+          heart.className = 'vital-block';
+          const heartHeading = document.createElement('div');
+          heartHeading.className = 'vital-heading';
+          const heartLabel = document.createElement('span');
+          heartLabel.textContent = 'RYTHME CARDIAQUE';
+          const beta = document.createElement('span');
+          beta.className = 'beta-badge';
+          beta.title = 'Fonctionnalité beta - non fiable';
+          beta.textContent = 'BETA';
+          heartHeading.append(heartLabel, beta);
+          const heartRow = document.createElement('div');
+          heartRow.className = 'heart-row';
+          heartRow.title = 'Fonctionnalité beta - non fiable';
+          heartRow.append(document.createTextNode('❤️ '));
+          const heartValue = document.createElement('strong');
+          heartValue.textContent = '--';
+          const heartUnit = document.createElement('span');
+          heartUnit.textContent = 'bpm';
+          heartRow.append(heartValue, heartUnit);
+          heart.append(heartHeading, heartRow);
+
+          const activity = document.createElement('div');
+          activity.className = 'vital-block';
+          const progress = document.createElement('div');
+          progress.className = 'progress-bar';
+          const fill = document.createElement('span');
+          fill.style.width = `${motion ?? 0}%`;
+          progress.append(fill);
+          const label = document.createElement('div');
+          label.className = 'activity-label';
+          label.textContent = activityLabel(motion);
+          const activityHeading = document.createElement('div');
+          activityHeading.className = 'vital-heading';
+          const activityTitle = document.createElement('span');
+          activityTitle.textContent = 'NIVEAU D\'ACTIVITÉ';
+          activityHeading.append(activityTitle);
+          activity.append(activityHeading, progress, label);
+
+          card.append(title, breathing, heart, activity);
+          els['vitals-list'].append(card);
+        });
+
+        drawMiniSparklines();
+      }
+
+      function drawSparkline(canvas, values, options = {}) {
+        const ctx = canvas.getContext('2d');
+        const width = canvas.width;
+        const height = canvas.height;
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = options.background || '#111827';
+        ctx.fillRect(0, 0, width, height);
+        ctx.strokeStyle = '#1f2937';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, height - 1);
+        ctx.lineTo(width, height - 1);
+        ctx.stroke();
+
+        const numeric = values.map((value) => Number(value)).filter(Number.isFinite);
+        if (!numeric.length) return;
+        const min = options.min ?? Math.min(...numeric);
+        const max = options.max ?? Math.max(...numeric, min + 1);
+        ctx.strokeStyle = options.color || '#10b981';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        numeric.forEach((value, index) => {
+          const x = numeric.length === 1 ? width : (index / (numeric.length - 1)) * width;
+          const y = height - ((value - min) / Math.max(1, max - min)) * (height - 4) - 2;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      function drawMiniSparklines() {
+        els['vitals-list'].querySelectorAll('.mini-sparkline').forEach((canvas) => {
+          const values = window.RS.vitals_history[canvas.dataset.personId] || [];
+          drawSparkline(canvas, values, { min: 0, max: 30, color: '#10b981', background: '#0d1117' });
+        });
+      }
+
+      function renderAlerts() {
+        const alerts = window.RS.alerts.slice(0, 20);
+        els['alerts-count'].textContent = String(alerts.length);
+        els['alerts-count'].classList.toggle('is-visible', alerts.length > 0);
+        els['alerts-list'].replaceChildren();
+
+        if (!alerts.length) {
+          const empty = document.createElement('div');
+          empty.className = 'alert-empty';
+          empty.textContent = '--';
+          els['alerts-list'].append(empty);
+          return;
+        }
+
+        alerts.forEach((alert) => {
+          const row = document.createElement('article');
+          row.className = `alert-item severity-${alert.severity || 'info'}`;
+          const time = new Date(alert.time || Date.now());
+          const icon = alert.severity === 'critical' ? '❌' : alert.severity === 'warning' ? '⚠️' : 'ℹ️';
+          const timeEl = document.createElement('time');
+          timeEl.textContent = time.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+          const iconEl = document.createElement('span');
+          iconEl.textContent = icon;
+          const message = document.createElement('strong');
+          message.textContent = alert.message || '--';
+          row.append(timeEl, iconEl, message);
+          els['alerts-list'].append(row);
+        });
+      }
+
+      function drawTrends() {
+        const canvas = els['trends-canvas'];
+        const ctx = canvas.getContext('2d');
+        const width = canvas.width;
+        const height = canvas.height;
+        const pad = { left: 24, right: 4, top: 6, bottom: 16 };
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#111827';
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.strokeStyle = '#1f2937';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let y = 0; y <= 3; y += 1) {
+          const py = pad.top + y * ((height - pad.top - pad.bottom) / 3);
+          ctx.moveTo(pad.left, py);
+          ctx.lineTo(width - pad.right, py);
+        }
+        ctx.stroke();
+
+        ctx.fillStyle = '#6b7280';
+        ctx.font = '9px system-ui, sans-serif';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        [0, 10, 20, 30].forEach((tick) => {
+          const py = height - pad.bottom - (tick / 30) * (height - pad.top - pad.bottom);
+          ctx.fillText(String(tick), pad.left - 4, py);
+        });
+
+        const thresholdY = height - pad.bottom - (4 / 30) * (height - pad.top - pad.bottom);
+        ctx.strokeStyle = '#ef4444';
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, thresholdY);
+        ctx.lineTo(width - pad.right, thresholdY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        const points = window.RS.breathing_history
+          .filter((point) => point && point.time >= cutoff && Number.isFinite(Number(point.value)))
+          .slice(-240);
+
+        if (trendMode === 'breathing' && points.length) {
+          ctx.strokeStyle = '#10b981';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          points.forEach((point, index) => {
+            const x = pad.left + (index / Math.max(1, points.length - 1)) * (width - pad.left - pad.right);
+            const y = height - pad.bottom - (Math.max(0, Math.min(30, point.value)) / 30) * (height - pad.top - pad.bottom);
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+        }
+
+        ctx.fillStyle = '#6b7280';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillText('-10min', pad.left, height - 4);
+        ctx.textAlign = 'right';
+        ctx.fillText('maintenant', width - pad.right, height - 4);
+      }
+
+      function renderAll() {
+        setStatus();
+        renderNodes();
+        renderSystem();
+        drawRoom();
+        renderVitals();
+        renderAlerts();
+        drawTrends();
+      }
+
+      async function runAction(button, payload) {
+        button.disabled = true;
+        els['action-status'].replaceChildren();
+        const spinner = document.createElement('span');
+        spinner.className = 'spinner';
+        spinner.setAttribute('aria-hidden', 'true');
+        els['action-status'].append(spinner, document.createTextNode(' En cours'));
+        const started = Date.now();
+        const result = await window.RSApi.postConfig(payload);
+        const remaining = Math.max(0, 3000 - (Date.now() - started));
+        window.setTimeout(() => {
+          els['action-status'].textContent = result.ok ? 'OK' : 'Erreur';
+          button.disabled = false;
+        }, remaining);
+      }
+
+      function bindEvents() {
+        window.addEventListener('rs:update', () => {
+          const now = performance.now();
+          if (now - lastRenderAt < 80) return;
+          lastRenderAt = now;
+          renderAll();
+        });
+        window.addEventListener('resize', drawRoom);
+        els['clear-alerts-button'].addEventListener('click', () => {
+          window.RSAlerts.clearAlerts();
+        });
+        els['trend-tab-breathing'].addEventListener('click', () => {
+          trendMode = 'breathing';
+          drawTrends();
+        });
+        els['recalibrate-button'].addEventListener('click', () => {
+          runAction(els['recalibrate-button'], { recalibrate: true });
+        });
+        els['reload-modules-button'].addEventListener('click', () => {
+          runAction(els['reload-modules-button'], { reload_modules: true });
+        });
+      }
+
+      async function loadInitialData() {
+        try {
+          const config = await window.RSApi.loadRoomConfig();
+          window.RS.room_config = config || DEFAULT_ROOM;
+        } catch {
+          window.RS.room_config = DEFAULT_ROOM;
+        }
+
+        const [version, features] = await Promise.all([
+          window.RSApi.getVersion(),
+          window.RSApi.getFeatures(),
+        ]);
+        if (version) window.RS.server_version = version;
+        if (features) window.RS.features = features;
+        dispatchUpdate();
+      }
+
+      function animationLoop() {
+        drawRoom();
+        drawTrends();
+        requestAnimationFrame(animationLoop);
+      }
+
+      function init() {
+        getElements();
+        updateClock();
+        window.setInterval(updateClock, 1000);
+        bindEvents();
+        renderAll();
+        loadInitialData();
+        animationLoop();
+      }
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init, { once: true });
+      } else {
+        init();
+      }
+    })();
   </script>
 </body>
 </html>
