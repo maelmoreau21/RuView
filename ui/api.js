@@ -42,10 +42,11 @@
   }
 
   async function loadRoomConfig() {
-    const result = await safeFetch('/room-config.json');
+    const result = await safeFetch('/ui/room-config.json');
     const config = result.ok && result.data && typeof result.data === 'object' ? result.data : null;
     if (config && window.RS) {
       window.RS.room_config = config;
+      window.RS.room_config_source = 'file';
       dispatchUpdate();
     }
     return config;

@@ -1,4 +1,4 @@
-import { clearAlerts, getAlerts, initAlerts, processAlertState } from './alerts.js';
+import { clearAlerts, getAlerts, initAlerts, processAlertState } from './alerts.js?v=module';
 
 const state = {
   topology: null,

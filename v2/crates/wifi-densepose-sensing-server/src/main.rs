@@ -60,7 +60,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, error, info, warn};
 
-use wifi_densepose_sensing_server::alerts::{AlertManager, AlertSample};
+use wifi_densepose_sensing_server::alerts::{AlertManager, AlertSample, AlertThresholds};
 use rvf_container::{RvfBuilder, RvfContainerInfo, RvfReader, VitalSignConfig};
 use rvf_pipeline::ProgressiveLoader;
 use feature_flags::{BetaFeature, FeatureFlags};
@@ -2191,6 +2191,18 @@ const DEFAULT_ENABLED_MODULES: &[&str] = &[
 ];
 
 const MODULE_CONFIG_VERSION: u8 = 1;
+const ROOM_CONFIG_FILENAME: &str = "room-config.json";
+const ROOM_DIMENSION_MIN_METERS: f64 = 1.0;
+const ROOM_DIMENSION_MAX_METERS: f64 = 30.0;
+const ROOM_CONFIG_MAX_NODES: usize = 6;
+const DEFAULT_ROOM_VERTICAL_METERS: f64 = 2.6;
+const DEFAULT_ROOM_NODE_HEIGHT_METERS: f64 = 1.0;
+const APNEA_SECONDS_MIN: u64 = 10;
+const APNEA_SECONDS_MAX: u64 = 60;
+const NO_MOTION_SECONDS_MIN: u64 = 60;
+const NO_MOTION_SECONDS_MAX: u64 = 300;
+const BREATHING_CONFIDENCE_MIN: f64 = 0.10;
+const BREATHING_CONFIDENCE_MAX: f64 = 0.90;
 
 #[derive(Debug, Clone, Copy)]
 struct ModulePreset {
@@ -2246,6 +2258,31 @@ const MODULE_PRESETS: &[ModulePreset] = &[
 
 fn default_enabled_modules() -> Vec<String> {
     DEFAULT_ENABLED_MODULES.iter().map(|id| (*id).to_string()).collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UiRoomNodeConfig {
+    id: u8,
+    x: f64,
+    y: f64,
+    active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UiRoomConfig {
+    room_width_meters: f64,
+    room_height_meters: f64,
+    nodes: Vec<UiRoomNodeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlertConfigUpdate {
+    apnea_seconds: u64,
+    no_motion_seconds: u64,
+    breathing_confidence: f64,
 }
 
 /// Physical room profile used by the 3D console and calibration UI.
@@ -3019,6 +3056,8 @@ struct AppStateInner {
     pub(crate) min_nodes: usize,
     /// Data directory for persisting runtime config (parent of `firmware_dir`).
     pub(crate) data_dir: std::path::PathBuf,
+    /// Static UI directory served at `/ui`, used for `room-config.json`.
+    pub(crate) ui_path: std::path::PathBuf,
     /// Runtime config file currently owned by runtime mutations.
     pub(crate) runtime_config_path: std::path::PathBuf,
     /// Persisted room/AP/node topology consumed by the RuvSense Console.
@@ -9066,6 +9105,186 @@ async fn topology_endpoint(State(state): State<SharedState>) -> Json<serde_json:
     Json(topology_payload(&s, std::time::Instant::now()))
 }
 
+fn validate_dimension_meters(name: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite()
+        || !(ROOM_DIMENSION_MIN_METERS..=ROOM_DIMENSION_MAX_METERS).contains(&value)
+    {
+        return Err(format!(
+            "{name} must be a finite value in [{ROOM_DIMENSION_MIN_METERS}, {ROOM_DIMENSION_MAX_METERS}] meters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ui_room_config(config: &UiRoomConfig) -> Result<(), String> {
+    validate_dimension_meters("room_width_meters", config.room_width_meters)?;
+    validate_dimension_meters("room_height_meters", config.room_height_meters)?;
+    if config.nodes.is_empty() {
+        return Err("nodes must include at least one node".to_string());
+    }
+    if config.nodes.len() > ROOM_CONFIG_MAX_NODES {
+        return Err(format!(
+            "nodes must contain at most {ROOM_CONFIG_MAX_NODES} entries"
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    for node in &config.nodes {
+        if !(1..=ROOM_CONFIG_MAX_NODES as u8).contains(&node.id) {
+            return Err(format!(
+                "node id {} must be in [1, {}]",
+                node.id, ROOM_CONFIG_MAX_NODES
+            ));
+        }
+        if !seen.insert(node.id) {
+            return Err(format!("duplicate node id {}", node.id));
+        }
+        if !node.x.is_finite() || !(0.0..=config.room_width_meters).contains(&node.x) {
+            return Err(format!(
+                "node {} x must be finite and inside the room width",
+                node.id
+            ));
+        }
+        if !node.y.is_finite() || !(0.0..=config.room_height_meters).contains(&node.y) {
+            return Err(format!(
+                "node {} y must be finite and inside the room height",
+                node.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn room_vertical_meters(env: &EnvironmentConfig) -> f64 {
+    let y = env.room.dimensions_m[1];
+    if y.is_finite() && (ROOM_DIMENSION_MIN_METERS..=ROOM_DIMENSION_MAX_METERS).contains(&y) {
+        y
+    } else {
+        DEFAULT_ROOM_VERTICAL_METERS
+    }
+}
+
+fn environment_from_ui_room_config(
+    existing: &EnvironmentConfig,
+    config: &UiRoomConfig,
+) -> EnvironmentConfig {
+    let mut environment = existing.clone();
+    let vertical_m = room_vertical_meters(existing);
+    let node_height_m = DEFAULT_ROOM_NODE_HEIGHT_METERS.min(vertical_m);
+    environment.room.dimensions_m = [
+        config.room_width_meters,
+        vertical_m,
+        config.room_height_meters,
+    ];
+
+    let active_total = config.nodes.iter().filter(|node| node.active).count().max(1) as u8;
+    let mut active_ids = HashSet::new();
+    environment.nodes = config
+        .nodes
+        .iter()
+        .filter(|node| node.active)
+        .enumerate()
+        .map(|(index, node)| {
+            active_ids.insert(node.id);
+            let previous = existing.nodes.iter().find(|existing| existing.node_id == node.id);
+            EnvironmentNodeConfig {
+                node_id: node.id,
+                label: previous
+                    .map(|existing| existing.label.clone())
+                    .unwrap_or_else(|| format!("ESP32-C6 #{}", node.id)),
+                kind: previous
+                    .map(|existing| existing.kind.clone())
+                    .unwrap_or_else(|| "esp32_c6".to_string()),
+                zone: previous
+                    .map(|existing| existing.zone.clone())
+                    .unwrap_or_else(|| "primary".to_string()),
+                position_m: [node.x, node_height_m, node.y],
+                tdm_slot: previous
+                    .map(|existing| existing.tdm_slot)
+                    .unwrap_or(index as u8),
+                tdm_total: previous
+                    .map(|existing| existing.tdm_total.max(1))
+                    .unwrap_or(active_total),
+                linked_ap: previous
+                    .map(|existing| existing.linked_ap.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    environment.nodes.sort_by_key(|node| node.node_id);
+    environment
+        .links
+        .retain(|link| active_ids.contains(&link.node_id));
+    environment
+}
+
+fn save_ui_room_config_file(ui_path: &StdPath, config: &UiRoomConfig) -> Result<(), String> {
+    validate_ui_room_config(config)?;
+    let path = ui_path.join(ROOM_CONFIG_FILENAME);
+    let text = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("failed to serialize room config: {e}"))?;
+    std::fs::create_dir_all(ui_path)
+        .map_err(|e| format!("failed to create {}: {e}", ui_path.display()))?;
+
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    {
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("failed to create {}: {e}", tmp_path.display()))?;
+        use std::io::Write as _;
+        file.write_all(text.as_bytes())
+            .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
+        file.write_all(b"\n")
+            .map_err(|e| format!("failed to finalize {}: {e}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to sync {}: {e}", tmp_path.display()))?;
+    }
+
+    if let Err(first) = std::fs::rename(&tmp_path, &path) {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("failed to replace {}: {e}", path.display()))?;
+            std::fs::rename(&tmp_path, &path)
+                .map_err(|e| format!("failed to save {}: {e}", path.display()))?;
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("failed to save {}: {first}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn alert_thresholds_from_update(
+    current: &AlertThresholds,
+    body: &AlertConfigUpdate,
+) -> Result<AlertThresholds, String> {
+    if !(APNEA_SECONDS_MIN..=APNEA_SECONDS_MAX).contains(&body.apnea_seconds) {
+        return Err(format!(
+            "apnea_seconds must be in [{APNEA_SECONDS_MIN}, {APNEA_SECONDS_MAX}]"
+        ));
+    }
+    if !(NO_MOTION_SECONDS_MIN..=NO_MOTION_SECONDS_MAX).contains(&body.no_motion_seconds) {
+        return Err(format!(
+            "no_motion_seconds must be in [{NO_MOTION_SECONDS_MIN}, {NO_MOTION_SECONDS_MAX}]"
+        ));
+    }
+    if !body.breathing_confidence.is_finite()
+        || !(BREATHING_CONFIDENCE_MIN..=BREATHING_CONFIDENCE_MAX)
+            .contains(&body.breathing_confidence)
+    {
+        return Err(format!(
+            "breathing_confidence must be a finite value in [{BREATHING_CONFIDENCE_MIN}, {BREATHING_CONFIDENCE_MAX}]"
+        ));
+    }
+
+    let mut thresholds = current.clone();
+    thresholds.apnea_trigger_seconds = body.apnea_seconds;
+    thresholds.no_motion_trigger_seconds = body.no_motion_seconds;
+    thresholds.apnea_min_confidence = body.breathing_confidence;
+    Ok(thresholds)
+}
+
 fn validate_environment(env: &EnvironmentConfig) -> Result<(), String> {
     if env
         .room
@@ -9164,13 +9383,15 @@ fn configured_fuser_positions(env: &EnvironmentConfig) -> Vec<[f32; 3]> {
 
 fn apply_environment_node_positions(fuser: &mut MultistaticFuser, env: &EnvironmentConfig) {
     let positions = configured_fuser_positions(env);
-    if !positions.is_empty() {
+    if positions.is_empty() {
+        info!("Clearing configured environment node positions from multistatic fuser");
+    } else {
         info!(
             "Applying {} configured environment node position(s) to multistatic fuser",
             positions.len()
         );
-        fuser.set_node_positions(positions);
     }
+    fuser.set_node_positions(positions);
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12749,6 +12970,7 @@ async fn main() {
         enabled_modules: runtime_config.enabled_modules.iter().cloned().collect(),
         min_nodes: args.min_nodes.max(1),
         data_dir: data_dir.clone(),
+        ui_path: args.ui_path.clone(),
         runtime_config_path: runtime_config_path.clone(),
         environment: runtime_config.environment.clone(),
     }));
@@ -12872,6 +13094,7 @@ async fn main() {
         .route("/metrics", get(prometheus_metrics_endpoint))
         // API info
         .route("/api/v1/info", get(api_info))
+        .route("/api/v1/version", get(health_version))
         .route("/api/v1/features", get(features_endpoint))
         .route("/api/v1/status", get(health_ready))
         .route("/api/v1/metrics", get(health_metrics))
@@ -12973,6 +13196,8 @@ async fn main() {
             "/api/v1/config/dedup-factor",
             get(config_get_dedup_factor).post(config_set_dedup_factor),
         )
+        .route("/api/v1/config/room", post(config_set_room))
+        .route("/api/v1/config/alerts", post(config_set_alerts))
         .route("/api/v1/config/ground-truth", post(config_set_ground_truth))
         .route("/api/v1/config/schema", get(config_schema_endpoint))
         // Static UI files
@@ -13062,15 +13287,17 @@ async fn main() {
 #[cfg(test)]
 mod topology_console_tests {
     use super::{
-        business_modules, default_dedup_factor, default_enabled_modules, enabled_module_set_from_ids,
+        alert_thresholds_from_update, business_modules, default_dedup_factor,
+        default_enabled_modules, enabled_module_set_from_ids, environment_from_ui_room_config,
         load_runtime_config, load_runtime_config_file, module_status, normalize_runtime_config,
         parse_log_format, runtime_config_schema, save_runtime_config, save_runtime_config_file,
-        schema_for_config_kind, topology_nodes_json, topology_readiness_json,
-        upsert_environment_node_positions, validate_config_file, validate_runtime_config,
-        AccessPointConfig, ConfigSchemaKind, EnvironmentConfig, EnvironmentLinkConfig,
-        EnvironmentObstacleConfig,
-        EnvironmentNodeConfig, LogFormat, NodePositionUpdate, NodeState, RoomConfig, RuntimeConfig,
-        ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION, MODULE_PRESETS,
+        save_ui_room_config_file, schema_for_config_kind, topology_nodes_json,
+        topology_readiness_json, upsert_environment_node_positions, validate_config_file,
+        validate_runtime_config, validate_ui_room_config, AccessPointConfig, AlertConfigUpdate,
+        ConfigSchemaKind, EnvironmentConfig, EnvironmentLinkConfig, EnvironmentObstacleConfig,
+        EnvironmentNodeConfig, LogFormat, NodePositionUpdate, NodeState, RoomConfig,
+        RuntimeConfig, UiRoomConfig, UiRoomNodeConfig, ESP32_OFFLINE_TIMEOUT,
+        MODULE_CONFIG_VERSION, MODULE_PRESETS,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -13184,6 +13411,105 @@ mod topology_console_tests {
 
         env.obstacles[0].confidence = 1.2;
         assert!(super::validate_environment(&env).is_err());
+    }
+
+    fn valid_ui_room_config() -> UiRoomConfig {
+        UiRoomConfig {
+            room_width_meters: 6.0,
+            room_height_meters: 4.0,
+            nodes: vec![
+                UiRoomNodeConfig {
+                    id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    active: true,
+                },
+                UiRoomNodeConfig {
+                    id: 2,
+                    x: 6.0,
+                    y: 4.0,
+                    active: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn ui_room_config_validates_dimensions_ids_and_bounds() {
+        let config = valid_ui_room_config();
+        assert!(validate_ui_room_config(&config).is_ok());
+
+        let mut bad_width = config.clone();
+        bad_width.room_width_meters = 31.0;
+        assert!(validate_ui_room_config(&bad_width)
+            .expect_err("width above 30m must fail")
+            .contains("room_width_meters"));
+
+        let mut bad_id = config.clone();
+        bad_id.nodes[0].id = 7;
+        assert!(validate_ui_room_config(&bad_id)
+            .expect_err("node ids are capped at six")
+            .contains("node id 7"));
+
+        let mut out_of_room = config;
+        out_of_room.nodes[0].x = 6.1;
+        assert!(validate_ui_room_config(&out_of_room)
+            .expect_err("coordinates outside the room must fail")
+            .contains("inside the room width"));
+    }
+
+    #[test]
+    fn ui_room_config_updates_environment_with_active_nodes_only() {
+        let env =
+            environment_from_ui_room_config(&configured_test_environment(), &valid_ui_room_config());
+
+        assert_eq!(env.room.dimensions_m, [6.0, 3.0, 4.0]);
+        assert_eq!(env.nodes.len(), 1, "inactive UI nodes are not fed to sensing");
+        assert_eq!(env.nodes[0].node_id, 1);
+        assert_eq!(env.nodes[0].position_m, [0.0, 1.0, 0.0]);
+        assert_eq!(env.links.len(), 1, "links for still-active nodes are preserved");
+    }
+
+    #[test]
+    fn save_ui_room_config_writes_served_json_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = valid_ui_room_config();
+
+        save_ui_room_config_file(dir.path(), &config).expect("room config should save");
+
+        let path = dir.path().join("room-config.json");
+        let saved = fs::read_to_string(path).expect("room-config.json should exist");
+        let loaded: UiRoomConfig = serde_json::from_str(&saved).expect("saved JSON should parse");
+        assert_eq!(loaded.room_width_meters, 6.0);
+        assert!(!loaded.nodes[1].active);
+    }
+
+    #[test]
+    fn alert_config_update_validates_and_maps_thresholds() {
+        let current = wifi_densepose_sensing_server::alerts::AlertThresholds::default();
+        let update = AlertConfigUpdate {
+            apnea_seconds: 20,
+            no_motion_seconds: 300,
+            breathing_confidence: 0.55,
+        };
+
+        let thresholds = alert_thresholds_from_update(&current, &update).expect("valid update");
+        assert_eq!(thresholds.apnea_trigger_seconds, 20);
+        assert_eq!(thresholds.no_motion_trigger_seconds, 300);
+        assert_eq!(thresholds.apnea_min_confidence, 0.55);
+        assert_eq!(
+            thresholds.presence_score_threshold,
+            current.presence_score_threshold,
+            "fields outside the endpoint body are preserved"
+        );
+
+        let bad = AlertConfigUpdate {
+            breathing_confidence: 0.0,
+            ..update
+        };
+        assert!(alert_thresholds_from_update(&current, &bad)
+            .expect_err("unsafe low confidence threshold must fail")
+            .contains("breathing_confidence"));
     }
 
     #[test]
@@ -14008,7 +14334,79 @@ mod novelty_tests {
 
 // ── ADR-044 §5.3: dedup_factor runtime configuration endpoints ────────────────
 
-/// `GET /api/v1/config/dedup-factor` — read the current dedup factor.
+/// `POST /api/v1/config/room` - persist the operator room layout.
+async fn config_set_room(
+    State(state): State<SharedState>,
+    Json(body): Json<UiRoomConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_ui_room_config(&body).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        )
+    })?;
+
+    let s = state.read().await;
+    let environment = environment_from_ui_room_config(&s.environment, &body);
+    validate_environment(&environment).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        )
+    })?;
+    let ui_path = s.ui_path.clone();
+    let runtime_config_path = s.runtime_config_path.clone();
+    let dedup_factor = s.dedup_factor;
+    let enabled_modules = sorted_module_ids(&s.enabled_modules);
+    drop(s);
+
+    save_ui_room_config_file(&ui_path, &body).map_err(|message| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        )
+    })?;
+    save_runtime_config_file(
+        &runtime_config_path,
+        &RuntimeConfig {
+            dedup_factor,
+            environment: environment.clone(),
+            module_config_version: MODULE_CONFIG_VERSION,
+            enabled_modules,
+        },
+    )
+    .map_err(|message| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": message })),
+        )
+    })?;
+
+    let mut s = state.write().await;
+    s.environment = environment.clone();
+    apply_environment_node_positions(&mut s.multistatic_fuser, &environment);
+
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// `POST /api/v1/config/alerts` - update in-memory alert thresholds.
+async fn config_set_alerts(
+    State(state): State<SharedState>,
+    Json(body): Json<AlertConfigUpdate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let mut s = state.write().await;
+    let thresholds =
+        alert_thresholds_from_update(s.alert_manager.thresholds(), &body).map_err(|message| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "status": "error", "message": message })),
+            )
+        })?;
+    s.alert_manager.set_thresholds(thresholds);
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// `GET /api/v1/config/dedup-factor` - read the current dedup factor.
 async fn config_get_dedup_factor(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     Json(serde_json::json!({

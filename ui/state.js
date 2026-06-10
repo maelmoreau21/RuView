@@ -10,5 +10,6 @@
     server_version: '--',
     uptime: '--',
     room_config: null,
+    room_config_source: 'pending',
   };
 })();

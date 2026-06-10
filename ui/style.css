@@ -55,7 +55,7 @@ button {
 
 .brand,
 .live-strip,
-.header-clock {
+.header-actions {
   min-width: 0;
   padding-inline: var(--column-padding);
 }
@@ -134,10 +134,51 @@ button {
 }
 
 .header-clock {
-  justify-self: end;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
   font-size: 14px;
+}
+
+.header-actions {
+  justify-self: end;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.view-3d-button,
+.settings-button {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.view-3d-button {
+  background: #7c3aed;
+  color: #fff;
+  padding: 5px 10px;
+}
+
+.view-3d-button:hover {
+  background: #6d28d9;
+}
+
+.settings-button {
+  border: 1px solid rgba(59, 130, 246, 0.72);
+  background: transparent;
+  color: var(--accent);
+  padding: 5px 9px;
+}
+
+.settings-button:hover {
+  background: rgba(59, 130, 246, 0.12);
 }
 
 .app-layout {
@@ -194,6 +235,28 @@ button {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 1px;
+}
+
+.room-config-banner {
+  position: absolute;
+  top: 40px;
+  left: 50%;
+  z-index: 3;
+  max-width: min(620px, calc(100% - 32px));
+  transform: translateX(-50%);
+  border: 1px solid rgba(245, 158, 11, 0.42);
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.94);
+  color: #fbbf24;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 800;
+  text-align: center;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.24);
+}
+
+.room-config-banner[hidden] {
+  display: none;
 }
 
 .room-canvas {
@@ -490,6 +553,16 @@ button {
   gap: 2px;
   color: var(--text-secondary);
   font-size: 12px;
+}
+
+.node-status.is-red {
+  color: var(--alert-red);
+  font-weight: 800;
+}
+
+.node-status.is-orange {
+  color: var(--alert-orange);
+  font-weight: 800;
 }
 
 .signal-bar {
@@ -956,6 +1029,12 @@ button {
 
   .header-clock {
     justify-self: start;
+  }
+
+  .header-actions {
+    justify-self: start;
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .app-layout {

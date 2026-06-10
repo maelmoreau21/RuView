@@ -150,6 +150,18 @@ impl AlertManager {
         }
     }
 
+    pub fn thresholds(&self) -> &AlertThresholds {
+        &self.thresholds
+    }
+
+    pub fn set_thresholds(&mut self, thresholds: AlertThresholds) {
+        self.thresholds = thresholds;
+        self.apnea_since = None;
+        self.no_motion_since = None;
+        self.clear_trigger(AlertTrigger::Apnea);
+        self.clear_trigger(AlertTrigger::NoMotionExtended);
+    }
+
     pub fn evaluate(&mut self, sample: &AlertSample) -> Vec<AlertEvent> {
         let now = Duration::from_millis(sample.timestamp_ms);
         let mut emitted = Vec::new();
@@ -458,6 +470,34 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].alert_id, "apnea_001");
         assert_eq!(alerts[0].severity, AlertSeverity::Warning);
+    }
+
+    #[test]
+    fn runtime_threshold_update_changes_apnea_window() {
+        let mut manager = AlertManager::default();
+        let mut thresholds = manager.thresholds().clone();
+        thresholds.apnea_trigger_seconds = 30;
+        thresholds.apnea_min_confidence = 0.8;
+        manager.set_thresholds(thresholds);
+
+        let mut sample = sample_at(0);
+        sample.breathing_bpm = Some(2.0);
+        sample.breathing_confidence = 0.75;
+        assert!(manager.evaluate(&sample).is_empty());
+
+        sample.timestamp_ms = 40_000;
+        assert!(
+            manager.evaluate(&sample).is_empty(),
+            "confidence below the runtime threshold must not alert"
+        );
+
+        sample.breathing_confidence = 0.9;
+        assert!(manager.evaluate(&sample).is_empty());
+
+        sample.timestamp_ms = 71_000;
+        let alerts = manager.evaluate(&sample);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].alert_id, "apnea_001");
     }
 
     #[test]

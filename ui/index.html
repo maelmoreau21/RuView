@@ -18,7 +18,11 @@
       <span id="live-badge" class="live-badge is-offline">HORS LIGNE</span>
       <span id="active-node-summary" class="active-node-summary">--</span>
     </div>
-    <time id="header-clock" class="header-clock" datetime="">--:--:--</time>
+    <div class="header-actions">
+      <button id="settings-button" class="settings-button" type="button" title="Paramètres" aria-label="Paramètres" onclick="window.open('settings.html', '_blank')">⚙️ Paramètres</button>
+      <button id="view-3d-button" class="view-3d-button" type="button">Vue 3D 🔭</button>
+      <time id="header-clock" class="header-clock" datetime="">--:--:--</time>
+    </div>
   </header>
 
   <main class="app-layout">
@@ -65,6 +69,7 @@
     <section class="room-column" aria-labelledby="room-title">
       <div class="room-stage">
         <h1 id="room-title" class="room-title">VUE DE LA PIÈCE</h1>
+        <div id="room-config-banner" class="room-config-banner" role="status" hidden>⚠️ Positions des nœuds non configurées — cliquez sur ⚙️ Paramètres</div>
         <canvas id="room-canvas" class="room-canvas" aria-label="Vue de dessus de la piece"></canvas>
         <div id="person-halos" class="person-halos" aria-hidden="true"></div>
       </div>
@@ -99,7 +104,7 @@
 
   <script src="state.js"></script>
   <script src="api.js"></script>
-  <script src="alerts.js"></script>
+  <script type="module" src="alerts.js"></script>
   <script src="websocket.js"></script>
   <script>
     (() => {
@@ -109,9 +114,11 @@
         nodes: [
           { id: 1, x: 0, y: 0, label: 'Node 1' },
           { id: 2, x: 5, y: 0, label: 'Node 2' },
-          { id: 3, x: 0, y: 4, label: 'Node 3' },
+          { id: 3, x: 5, y: 4, label: 'Node 3' },
+          { id: 4, x: 0, y: 4, label: 'Node 4' },
         ],
       };
+      const ROOM_CANVAS_MARGIN = 40;
 
       const els = {};
       const trails = new Map();
@@ -119,6 +126,7 @@
       let canvasMetrics = null;
       let trendMode = 'breathing';
       let lastRenderAt = 0;
+      let roomResizeObserver = null;
 
       function $(id) {
         return document.getElementById(id);
@@ -129,6 +137,8 @@
           'connection-dot',
           'live-badge',
           'active-node-summary',
+          'view-3d-button',
+          'settings-button',
           'header-clock',
           'nodes-list',
           'system-version',
@@ -138,6 +148,7 @@
           'recalibrate-button',
           'reload-modules-button',
           'action-status',
+          'room-config-banner',
           'room-canvas',
           'person-halos',
           'vitals-list',
@@ -212,14 +223,14 @@
 
       function nodeKeyCandidates(node) {
         const id = node.id ?? node.node_id ?? node.name ?? node.label;
-        return [
-          String(id),
-          normalizeId(id),
-          normalizeId(`node ${id}`),
-          normalizeId(node.label),
-          normalizeId(node.name),
-          normalizeId(node.node_id),
-        ].filter(Boolean);
+        return [...new Set([
+          id,
+          `node ${id}`,
+          node.id,
+          node.node_id,
+          node.label,
+          node.name,
+        ].map(normalizeId).filter(Boolean))];
       }
 
       function stateNodeFor(configNode) {
@@ -238,21 +249,33 @@
         const configNodes = configuredNodes().map((node, index) => ({
           config: node,
           state: stateNodeFor(node),
+          configured: true,
           index,
         }));
 
         const known = new Set(configNodes.flatMap((entry) => nodeKeyCandidates(entry.config)));
+        const seenLive = new Set();
         Object.entries(window.RS.nodes).forEach(([key, node]) => {
-          const normalized = normalizeId(key || node.id || node.node_id || node.label);
-          if (known.has(normalized)) return;
+          const liveCandidates = nodeKeyCandidates({
+            id: node.id ?? node.node_id ?? key,
+            node_id: node.node_id,
+            label: node.label,
+            name: node.name,
+          });
+          if (liveCandidates.some((candidate) => known.has(candidate))) return;
+          const canonical = liveCandidates[0] || normalizeId(key);
+          if (seenLive.has(canonical)) return;
+          seenLive.add(canonical);
+          const id = node.id ?? node.node_id ?? key;
           configNodes.push({
             config: {
-              id: node.id || node.node_id || key,
+              id,
               label: node.label || node.name || `Node ${configNodes.length + 1}`,
-              x: node.x,
-              y: node.y,
+              x: node.x ?? node.position?.x ?? node.position_m?.[0],
+              y: node.y ?? node.position?.y ?? node.position_m?.[1],
             },
             state: node,
+            configured: false,
             index: configNodes.length,
           });
         });
@@ -312,6 +335,23 @@
         return entry.config.label || entry.config.name || `Node ${entry.index + 1}`;
       }
 
+      function nodeShortLabel(entry) {
+        const id = entry.config.id ?? entry.config.node_id ?? entry.index + 1;
+        const numeric = String(id).match(/\d+/)?.[0];
+        return numeric ? `N${numeric}` : String(id || `N${entry.index + 1}`);
+      }
+
+      function isFreshNode(nodeState) {
+        const seenAt = lastSeenMs(nodeState);
+        return seenAt != null && Date.now() - seenAt < 5000;
+      }
+
+      function nodeIndicatorClass(entry, nodeState) {
+        if (!entry.configured) return 'is-orange';
+        if (!nodeState) return 'is-red';
+        return freshnessClass(nodeState);
+      }
+
       function setStatus() {
         const connected = Boolean(window.RS.connected);
         els['connection-dot'].classList.toggle('is-online', connected);
@@ -331,7 +371,7 @@
         const nodes = allNodesForUi();
         els['nodes-list'].replaceChildren();
 
-        if ((!window.RS.connected && !Object.keys(window.RS.nodes).length) || !nodes.length) {
+        if (!nodes.length) {
           const card = document.createElement('article');
           card.className = 'card node-card';
           card.textContent = '--';
@@ -342,17 +382,19 @@
         nodes.forEach((entry) => {
           const node = entry.state;
           const active = isNodeActive(node);
-          const rssi = active ? safeNumber(node?.rssi ?? node?.rssi_dbm ?? node?.signal) : null;
+          const rssi = node ? safeNumber(node.rssi ?? node.rssi_dbm ?? node.signal) : null;
           const filled = rssiSegments(rssi);
 
           const card = document.createElement('article');
           card.className = 'card node-card';
+          if (!entry.configured) card.classList.add('is-unconfigured');
+          else if (!node) card.classList.add('is-stale');
 
           const row = document.createElement('div');
           row.className = 'node-row';
 
           const indicator = document.createElement('span');
-          indicator.className = `node-indicator ${freshnessClass(node)}`;
+          indicator.className = `node-indicator ${nodeIndicatorClass(entry, node)}`;
           indicator.setAttribute('aria-hidden', 'true');
 
           const name = document.createElement('strong');
@@ -367,7 +409,16 @@
           rssiLine.textContent = rssi == null ? '-- dBm' : `${Math.round(rssi)} dBm`;
 
           const ageLine = document.createElement('span');
-          ageLine.textContent = active ? ageLabel(node) : 'inactif';
+          ageLine.className = 'node-status';
+          if (!entry.configured) {
+            ageLine.textContent = 'Position non configurée';
+            ageLine.classList.add('is-orange');
+          } else if (!node) {
+            ageLine.textContent = 'Non connecté';
+            ageLine.classList.add('is-red');
+          } else {
+            ageLine.textContent = active ? ageLabel(node) : 'inactif';
+          }
 
           details.append(rssiLine, ageLine);
 
@@ -402,6 +453,12 @@
         if (mode === 'LIVE') els['system-mode'].classList.add('is-live');
         else if (mode === 'SIMULATION') els['system-mode'].classList.add('is-simulation');
         else els['system-mode'].classList.add('is-empty');
+      }
+
+      function renderRoomConfigBanner() {
+        const banner = els['room-config-banner'];
+        if (!banner) return;
+        banner.hidden = window.RS.room_config_source !== 'default';
       }
 
       function confidencePercent(person) {
@@ -461,8 +518,8 @@
       function roomToScreen(x, y) {
         if (!canvasMetrics) return { x: 0, y: 0 };
         return {
-          x: canvasMetrics.roomX + x * canvasMetrics.scale,
-          y: canvasMetrics.roomY + y * canvasMetrics.scale,
+          x: canvasMetrics.roomX + (x / canvasMetrics.roomW) * canvasMetrics.usableW,
+          y: canvasMetrics.roomY + (y / canvasMetrics.roomH) * canvasMetrics.usableH,
         };
       }
 
@@ -471,47 +528,52 @@
         ctx.lineWidth = 1;
         ctx.beginPath();
         for (let x = 0; x <= metrics.roomW + 0.001; x += 1) {
-          const sx = metrics.roomX + x * metrics.scale;
+          const sx = metrics.roomX + (x / metrics.roomW) * metrics.usableW;
           ctx.moveTo(sx, metrics.roomY);
-          ctx.lineTo(sx, metrics.roomY + metrics.roomH * metrics.scale);
+          ctx.lineTo(sx, metrics.roomY + metrics.usableH);
         }
         for (let y = 0; y <= metrics.roomH + 0.001; y += 1) {
-          const sy = metrics.roomY + y * metrics.scale;
+          const sy = metrics.roomY + (y / metrics.roomH) * metrics.usableH;
           ctx.moveTo(metrics.roomX, sy);
-          ctx.lineTo(metrics.roomX + metrics.roomW * metrics.scale, sy);
+          ctx.lineTo(metrics.roomX + metrics.usableW, sy);
         }
         ctx.stroke();
       }
 
       function drawNodes(ctx) {
         allNodesForUi().forEach((entry) => {
+          if (!entry.configured) return;
           const x = safeNumber(entry.config.x ?? entry.config.position?.x ?? entry.config.position_m?.[0]);
           const y = safeNumber(entry.config.y ?? entry.config.position?.y ?? entry.config.position_m?.[1]);
           if (x == null || y == null) return;
-          const active = isNodeActive(entry.state);
+          const hasLiveState = Boolean(entry.state);
           const p = roomToScreen(x, y);
 
-          if (active) {
+          if (hasLiveState) {
             ctx.beginPath();
             ctx.fillStyle = 'rgba(59, 130, 246, 0.10)';
-            ctx.strokeStyle = 'rgba(59, 130, 246, 0.28)';
-            ctx.lineWidth = 1;
-            ctx.arc(p.x, p.y, Math.max(34, canvasMetrics.scale * 1.1), 0, Math.PI * 2);
+            ctx.arc(p.x, p.y, 80, 0, Math.PI * 2);
             ctx.fill();
-            ctx.stroke();
           }
 
-          roundRect(ctx, p.x - 18, p.y - 14, 36, 28, 6);
-          ctx.fillStyle = active ? '#3b82f6' : '#374151';
+          roundRect(ctx, p.x - 8, p.y - 8, 16, 16, 3);
+          ctx.fillStyle = hasLiveState ? '#3b82f6' : '#374151';
           ctx.fill();
-          ctx.strokeStyle = active ? 'rgba(249, 250, 251, 0.42)' : 'rgba(107, 114, 128, 0.35)';
+          ctx.strokeStyle = hasLiveState ? 'rgba(249, 250, 251, 0.42)' : 'rgba(107, 114, 128, 0.35)';
           ctx.stroke();
 
-          ctx.fillStyle = '#f9fafb';
+          ctx.fillStyle = hasLiveState ? '#f9fafb' : '#9ca3af';
           ctx.font = '600 12px system-ui, sans-serif';
           ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(`N${entry.index + 1}`, p.x, p.y);
+          ctx.textBaseline = 'bottom';
+          ctx.fillText(`${nodeShortLabel(entry)}${hasLiveState ? '' : ' ✕'}`, p.x, p.y - 14);
+
+          if (hasLiveState && isFreshNode(entry.state)) {
+            ctx.beginPath();
+            ctx.fillStyle = '#10b981';
+            ctx.arc(p.x, p.y - 8, 3, 0, Math.PI * 2);
+            ctx.fill();
+          }
         });
       }
 
@@ -551,7 +613,8 @@
       }
 
       function drawScale(ctx, metrics) {
-        const rulerWidth = Math.min(metrics.roomW, 3) * metrics.scale;
+        const rulerMeters = Math.min(metrics.roomW, 3);
+        const rulerWidth = (rulerMeters / metrics.roomW) * metrics.usableW;
         const x = Math.max(metrics.roomX, (metrics.width - rulerWidth) / 2);
         const y = metrics.height - 42;
         ctx.strokeStyle = '#6b7280';
@@ -560,8 +623,8 @@
         ctx.beginPath();
         ctx.moveTo(x, y);
         ctx.lineTo(x + rulerWidth, y);
-        for (let i = 0; i <= Math.min(metrics.roomW, 3); i += 1) {
-          const tx = x + i * metrics.scale;
+        for (let i = 0; i <= rulerMeters; i += 1) {
+          const tx = x + (i / metrics.roomW) * metrics.usableW;
           ctx.moveTo(tx, y - 5);
           ctx.lineTo(tx, y + 5);
           ctx.fillText(`${i}m`, tx, y + 17);
@@ -623,18 +686,19 @@
           syncHalos();
           return;
         }
-        const margins = { left: 46, right: 32, top: 52, bottom: 70 };
-        const availableW = Math.max(80, width - margins.left - margins.right);
-        const availableH = Math.max(80, height - margins.top - margins.bottom);
-        const scale = Math.min(availableW / roomW, availableH / roomH);
+        const margin = ROOM_CANVAS_MARGIN;
+        const usableW = Math.max(1, width - margin * 2);
+        const usableH = Math.max(1, height - margin * 2);
         canvasMetrics = {
           width,
           height,
           roomW,
           roomH,
-          scale,
-          roomX: margins.left + (availableW - roomW * scale) / 2,
-          roomY: margins.top + (availableH - roomH * scale) / 2,
+          usableW,
+          usableH,
+          scale: Math.min(usableW / roomW, usableH / roomH),
+          roomX: margin,
+          roomY: margin,
         };
 
         ctx.clearRect(0, 0, width, height);
@@ -648,8 +712,8 @@
         ctx.strokeRect(
           canvasMetrics.roomX,
           canvasMetrics.roomY,
-          roomW * scale,
-          roomH * scale,
+          canvasMetrics.usableW,
+          canvasMetrics.usableH,
         );
 
         drawNodes(ctx);
@@ -924,6 +988,7 @@
         setStatus();
         renderNodes();
         renderSystem();
+        renderRoomConfigBanner();
         drawRoom();
         renderVitals();
         renderAlerts();
@@ -946,6 +1011,19 @@
         }, remaining);
       }
 
+      async function loadRoomConfigForDashboard() {
+        const apiConfig = await window.RSApi?.loadRoomConfig?.();
+        if (apiConfig) return apiConfig;
+        try {
+          const response = await fetch('/ui/room-config.json', { cache: 'no-store' });
+          if (!response.ok) return null;
+          const config = await response.json();
+          return config && typeof config === 'object' ? config : null;
+        } catch {
+          return null;
+        }
+      }
+
       function bindEvents() {
         window.addEventListener('rs:update', () => {
           const now = performance.now();
@@ -954,6 +1032,15 @@
           renderAll();
         });
         window.addEventListener('resize', drawRoom);
+        if (window.ResizeObserver && els['room-canvas']) {
+          roomResizeObserver = new ResizeObserver(() => {
+            window.requestAnimationFrame(drawRoom);
+          });
+          roomResizeObserver.observe(els['room-canvas']);
+        }
+        els['view-3d-button'].addEventListener('click', () => {
+          window.open('/ui/observatory.html', '_blank');
+        });
         els['clear-alerts-button'].addEventListener('click', () => {
           window.RSAlerts.clearAlerts();
         });
@@ -971,10 +1058,12 @@
 
       async function loadInitialData() {
         try {
-          const config = await window.RSApi.loadRoomConfig();
+          const config = await loadRoomConfigForDashboard();
           window.RS.room_config = config || DEFAULT_ROOM;
+          window.RS.room_config_source = config ? 'file' : 'default';
         } catch {
           window.RS.room_config = DEFAULT_ROOM;
+          window.RS.room_config_source = 'default';
         }
 
         const [version, features] = await Promise.all([

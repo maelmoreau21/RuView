@@ -5,8 +5,124 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RuvSense Console - Edge Sensing Observatory</title>
   <link rel="stylesheet" href="observatory/css/observatory.css">
+  <style>
+    :root {
+      --observatory-header-height: 40px;
+    }
+
+    .observatory-top-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 80;
+      min-height: var(--observatory-header-height);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid #1f2937;
+      background: #0a0e1a;
+      color: #f9fafb;
+      padding: 4px 12px;
+      font-family: Inter, "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+      pointer-events: auto;
+    }
+
+    #hud {
+      top: var(--observatory-header-height);
+      height: calc(100% - var(--observatory-header-height));
+    }
+
+    .observatory-dashboard-button {
+      min-height: 30px;
+      justify-self: start;
+      border: 1px solid rgba(59, 130, 246, 0.72);
+      border-radius: 6px;
+      background: transparent;
+      color: #3b82f6;
+      cursor: pointer;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      padding: 4px 10px;
+    }
+
+    .observatory-dashboard-button:hover {
+      background: rgba(59, 130, 246, 0.12);
+    }
+
+    .observatory-ws-status,
+    .observatory-person-count {
+      min-width: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #6b7280;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .observatory-ws-status {
+      justify-self: center;
+    }
+
+    .observatory-person-count {
+      justify-self: end;
+    }
+
+    .observatory-status-dot {
+      width: 10px;
+      height: 10px;
+      display: inline-block;
+      border-radius: 50%;
+      flex: 0 0 auto;
+      background: #ef4444;
+      box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.12);
+    }
+
+    .observatory-status-dot.is-online {
+      background: #10b981;
+      box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.12);
+    }
+
+    .observatory-count-value {
+      color: #f9fafb;
+      font-variant-numeric: tabular-nums;
+    }
+
+    @media (max-width: 640px) {
+      .observatory-top-header {
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        gap: 8px;
+      }
+
+      .observatory-ws-status {
+        justify-self: start;
+      }
+
+      .observatory-ws-label,
+      .observatory-person-label {
+        display: none;
+      }
+    }
+  </style>
 </head>
 <body>
+  <header class="observatory-top-header" aria-label="Observatory status">
+    <button id="observatory-dashboard-button" class="observatory-dashboard-button" type="button">← Dashboard</button>
+    <div class="observatory-ws-status" aria-live="polite">
+      <span id="observatory-header-dot" class="observatory-status-dot" aria-hidden="true"></span>
+      <span class="observatory-ws-label">WebSocket</span>
+      <span id="observatory-header-ws-label">OFFLINE</span>
+    </div>
+    <div class="observatory-person-count" aria-live="polite">
+      <span class="observatory-person-label">Personnes détectées</span>
+      <span id="observatory-header-person-count" class="observatory-count-value">0</span>
+    </div>
+  </header>
+
   <canvas id="observatory-canvas"></canvas>
   <div id="scene-status-overlay" class="scene-status-overlay scene-status-overlay--connecting">En attente du serveur...</div>
 
@@ -357,5 +473,38 @@
   </script>
 
   <script type="module" src="observatory/js/main.js"></script>
+  <script>
+    (() => {
+      const dashboardButton = document.getElementById('observatory-dashboard-button');
+      const headerDot = document.getElementById('observatory-header-dot');
+      const headerStatus = document.getElementById('observatory-header-ws-label');
+      const headerPersonCount = document.getElementById('observatory-header-person-count');
+
+      function syncObservatoryHeader() {
+        const sourceDot = document.querySelector('#data-source-badge .dot');
+        const sourceLabel = document.getElementById('data-source-label');
+        const personsValue = document.getElementById('persons-value');
+        const connected = sourceDot?.classList.contains('dot--live') || sourceLabel?.textContent === 'LIVE';
+
+        headerDot?.classList.toggle('is-online', Boolean(connected));
+        if (headerStatus) headerStatus.textContent = connected ? 'LIVE' : (sourceLabel?.textContent || 'OFFLINE');
+        if (headerPersonCount) headerPersonCount.textContent = personsValue?.textContent?.trim() || '0';
+      }
+
+      dashboardButton?.addEventListener('click', () => {
+        window.open('/ui/index.html', '_blank');
+      });
+
+      const observer = new MutationObserver(syncObservatoryHeader);
+      const observeTargets = [
+        document.getElementById('data-source-badge'),
+        document.getElementById('persons-value'),
+      ].filter(Boolean);
+      observeTargets.forEach((target) => {
+        observer.observe(target, { attributes: true, childList: true, characterData: true, subtree: true });
+      });
+      syncObservatoryHeader();
+    })();
+  </script>
 </body>
 </html>

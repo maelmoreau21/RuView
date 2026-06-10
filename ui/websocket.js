@@ -5,6 +5,7 @@
   let reconnectTimer = null;
   let probePending = false;
   let stopped = false;
+  let configChannel = null;
 
   function ensureState() {
     if (!window.RS) {
@@ -180,7 +181,10 @@
         if (seconds != null) state.uptime = formatUptime(seconds);
       }
     }
-    if (message.room_config !== undefined) state.room_config = message.room_config;
+    if (message.room_config !== undefined) {
+      state.room_config = message.room_config;
+      state.room_config_source = 'websocket';
+    }
   }
 
   function formatUptime(totalSeconds) {
@@ -291,10 +295,34 @@
     dispatchUpdate();
   }
 
+  async function reloadRoomConfig() {
+    if (typeof window.loadRoomConfig === 'function') {
+      await window.loadRoomConfig();
+      return;
+    }
+    if (window.RSApi && typeof window.RSApi.loadRoomConfig === 'function') {
+      const config = await window.RSApi.loadRoomConfig();
+      const state = ensureState();
+      state.room_config = config || state.room_config;
+      if (config) state.room_config_source = 'file';
+      dispatchUpdate();
+    }
+  }
+
+  function bindConfigChannel() {
+    if (typeof window.BroadcastChannel !== 'function' || configChannel) return;
+    configChannel = new window.BroadcastChannel('ruvsense-config');
+    configChannel.addEventListener('message', (event) => {
+      if (event.data?.type !== 'config_updated') return;
+      void reloadRoomConfig();
+    });
+  }
+
   window.RSWebSocket = {
     connect,
     disconnect,
   };
 
+  bindConfigChannel();
   connect();
 })();

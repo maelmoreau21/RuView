@@ -17,7 +17,7 @@ import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION } from './hud-controller.js';
-import { initAlerts, processAlertState } from '../../alerts.js';
+import { initAlerts, processAlertState } from '../../alerts.js?v=module';
 
 // ---- Palette ----
 const C = {
