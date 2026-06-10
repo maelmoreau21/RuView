@@ -146,9 +146,9 @@
       </div>
       <div id="global-health-badge" class="global-health-badge global-health-badge--normal">NORMAL</div>
       <div id="fps-counter" style="display:none">60 FPS</div>
-      <label class="hud-toggle object-detection-toggle" for="object-detection-toggle">
+      <label class="hud-toggle object-detection-toggle" for="object-detection-toggle" hidden>
         <span>Objets</span>
-        <input id="object-detection-toggle" type="checkbox" role="switch">
+        <input id="object-detection-toggle" type="checkbox" role="switch" disabled>
         <i aria-hidden="true"></i>
       </label>
       <button id="room-config-btn" class="topbar-btn" type="button">Config pièce</button>
@@ -243,17 +243,26 @@
             <span class="signal-value" id="attenuation-value">--</span>
           </div>
           <div class="signal-row">
-            <span class="signal-label">Persons</span>
+            <span class="signal-label">Pr&eacute;sence</span>
             <span class="signal-value" id="persons-value">0</span>
             <span id="persons-dots" class="persons-dots"></span>
           </div>
+          <div class="signal-row">
+            <span class="signal-label">Zone</span>
+            <span class="signal-value" id="zone-confidence-value">Zone : approximative</span>
+          </div>
+          <div class="signal-row">
+            <span class="signal-label">Respiration</span>
+            <span class="signal-value" id="respiration-confidence-value">Respiration : -- rpm (confiance --)</span>
+          </div>
           <canvas id="rssi-sparkline" width="200" height="48"></canvas>
 
-          <div class="panel-header" style="margin-top:12px">Presence</div>
+          <div class="panel-header" style="margin-top:12px">Pr&eacute;sence</div>
           <div id="presence-indicator" class="presence-state presence--absent">
             <span id="presence-label">ABSENT</span>
           </div>
-          <div id="fall-alert" class="fall-alert" style="display:none">FALL DETECTED</div>
+          <div id="presence-confidence-value" class="presence-confidence-detail">Pr&eacute;sence : -- &#9675;&#9675;&#9675;&#9675;&#9675;</div>
+          <div id="fall-alert" class="fall-alert" style="display:none" hidden></div>
         </div>
       </div>
     </div>
@@ -288,7 +297,7 @@
 
       <div class="settings-tabs">
         <button class="stab active" data-stab="rendering">Rendering</button>
-        <button class="stab" data-stab="wireframe">Wireframe</button>
+        <button class="stab" data-stab="wireframe" hidden>Wireframe</button>
         <button class="stab" data-stab="scene">Scene</button>
         <button class="stab" data-stab="data">Data</button>
       </div>
@@ -333,7 +342,7 @@
       </div>
 
       <!-- Wireframe tab -->
-      <div class="stab-content" id="stab-wireframe">
+      <div class="stab-content" id="stab-wireframe" hidden>
         <label class="setting-row">
           <span>Bone Thickness</span>
           <input type="range" id="opt-bone-thick" min="0.005" max="0.06" step="0.002" value="0.02">
@@ -409,9 +418,9 @@
           <span>Show Room Boundary</span>
           <input type="checkbox" id="opt-room" checked>
         </label>
-        <label class="setting-row check-row">
+        <label class="setting-row check-row" hidden>
           <span>Mode Obstacles</span>
-          <input type="checkbox" id="opt-obstacles">
+          <input type="checkbox" id="opt-obstacles" disabled>
         </label>
       </div>
 
@@ -431,7 +440,7 @@
         </label>
         <div class="setting-row readonly-row">
           <span>Live stream</span>
-          <span id="live-stream-url">WebSocket /ws/pose</span>
+          <span id="live-stream-url">WebSocket /ws/presence</span>
         </div>
         <button id="btn-reset-camera" class="settings-btn">Reset Camera</button>
         <button id="btn-reset-settings" class="settings-btn">Reset to Defaults</button>

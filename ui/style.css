@@ -1190,6 +1190,28 @@ button {
   background: #0d1117;
 }
 
+.person-confidence-lines {
+  display: grid;
+  gap: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  font-size: 11px;
+}
+
+.person-confidence-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-secondary);
+}
+
+.person-confidence-line strong {
+  color: var(--text-primary);
+  font-weight: 800;
+  text-align: right;
+}
+
 .heart-beta-row {
   border-top: 1px solid var(--border);
   padding-top: 8px;

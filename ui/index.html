@@ -114,8 +114,7 @@
         nodes: [
           { id: 1, x: 0, y: 0, label: 'Node 1' },
           { id: 2, x: 5, y: 0, label: 'Node 2' },
-          { id: 3, x: 5, y: 4, label: 'Node 3' },
-          { id: 4, x: 0, y: 4, label: 'Node 4' },
+          { id: 3, x: 2.5, y: 4, label: 'Node 3' },
         ],
       };
       const ROOM_CANVAS_MARGIN = 40;
@@ -123,6 +122,7 @@
       const els = {};
       const trails = new Map();
       const zeroBreathingSince = new Map();
+      const nodeProjectionLogKeys = new Map();
       let canvasMetrics = null;
       let trendMode = 'breathing';
       let lastRenderAt = 0;
@@ -190,6 +190,17 @@
         return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
       }
 
+      function normalizeNodeId(value) {
+        const raw = String(value ?? '').trim();
+        if (!raw) return '';
+        const numeric = Number(raw);
+        return Number.isFinite(numeric) ? String(numeric) : raw;
+      }
+
+      function nodeIdFrom(node, fallback = null) {
+        return normalizeNodeId(node?.node_id ?? node?.id ?? fallback);
+      }
+
       function roomConfig() {
         return window.RS.room_config || DEFAULT_ROOM;
       }
@@ -221,66 +232,67 @@
         return rawNodes.length ? rawNodes : DEFAULT_ROOM.nodes;
       }
 
-      function nodeKeyCandidates(node) {
-        const id = node.id ?? node.node_id ?? node.name ?? node.label;
-        return [...new Set([
-          id,
-          `node ${id}`,
-          node.id,
-          node.node_id,
-          node.label,
-          node.name,
-        ].map(normalizeId).filter(Boolean))];
-      }
-
-      function stateNodeFor(configNode) {
-        const candidates = nodeKeyCandidates(configNode);
-        for (const candidate of candidates) {
-          if (window.RS.nodes[candidate]) return window.RS.nodes[candidate];
-        }
-        const entries = Object.entries(window.RS.nodes);
-        return entries.find(([key, node]) => {
-          const values = [key, node.id, node.node_id, node.label, node.name].map(normalizeId);
-          return values.some((value) => candidates.includes(value));
-        })?.[1] || null;
-      }
-
-      function allNodesForUi() {
-        const configNodes = configuredNodes().map((node, index) => ({
-          config: node,
-          state: stateNodeFor(node),
-          configured: true,
-          index,
-        }));
-
-        const known = new Set(configNodes.flatMap((entry) => nodeKeyCandidates(entry.config)));
-        const seenLive = new Set();
-        Object.entries(window.RS.nodes).forEach(([key, node]) => {
-          const liveCandidates = nodeKeyCandidates({
-            id: node.id ?? node.node_id ?? key,
-            node_id: node.node_id,
-            label: node.label,
-            name: node.name,
+      function liveNodesById() {
+        const nodesById = new Map();
+        Object.entries(window.RS.nodes || {}).forEach(([key, node]) => {
+          const id = nodeIdFrom(node, key);
+          if (!id) return;
+          const previous = nodesById.get(id) || {};
+          nodesById.set(id, {
+            ...previous,
+            ...node,
+            id: node?.id ?? previous.id ?? id,
+            node_id: node?.node_id ?? previous.node_id ?? id,
           });
-          if (liveCandidates.some((candidate) => known.has(candidate))) return;
-          const canonical = liveCandidates[0] || normalizeId(key);
-          if (seenLive.has(canonical)) return;
-          seenLive.add(canonical);
-          const id = node.id ?? node.node_id ?? key;
-          configNodes.push({
+        });
+        return nodesById;
+      }
+
+      function nodesByIdForUi() {
+        const nodesById = new Map();
+        const liveById = liveNodesById();
+
+        configuredNodes().forEach((node, index) => {
+          const id = nodeIdFrom(node, index + 1);
+          if (!id) return;
+          nodesById.set(id, {
+            node_id: id,
+            config: {
+              ...node,
+              id: node.id ?? id,
+              node_id: node.node_id ?? id,
+            },
+            state: liveById.get(id) || null,
+            configured: true,
+            index: nodesById.size,
+          });
+        });
+
+        liveById.forEach((node, id) => {
+          if (nodesById.has(id)) return;
+          nodesById.set(id, {
+            node_id: id,
             config: {
               id,
-              label: node.label || node.name || `Node ${configNodes.length + 1}`,
+              node_id: id,
+              label: node.label || node.name || `Node ${id}`,
               x: node.x ?? node.position?.x ?? node.position_m?.[0],
               y: node.y ?? node.position?.y ?? node.position_m?.[1],
             },
             state: node,
             configured: false,
-            index: configNodes.length,
+            index: nodesById.size,
           });
         });
 
-        return configNodes;
+        return nodesById;
+      }
+
+      function allNodesForUi() {
+        return [...nodesByIdForUi().values()].map((entry, index) => ({
+          ...entry,
+          index,
+        }));
       }
 
       function isNodeActive(nodeState) {
@@ -330,11 +342,17 @@
       }
 
       function displayNodeName(entry) {
-        return entry.config.label || entry.config.name || `Node ${entry.index + 1}`;
+        return entry.config.label || entry.config.name || `Node ${entry.node_id || entry.index + 1}`;
+      }
+
+      function nodeAlertName(entry) {
+        const id = String(entry.node_id ?? entry.config.id ?? entry.index + 1);
+        const numeric = id.match(/\d+/)?.[0];
+        return `Node ${numeric || id}`;
       }
 
       function nodeShortLabel(entry) {
-        const id = entry.config.id ?? entry.config.node_id ?? entry.index + 1;
+        const id = entry.node_id ?? entry.config.id ?? entry.config.node_id ?? entry.index + 1;
         const numeric = String(id).match(/\d+/)?.[0];
         return numeric ? `N${numeric}` : String(id || `N${entry.index + 1}`);
       }
@@ -342,6 +360,115 @@
       function nodeIndicatorClass(entry, nodeState) {
         if (!nodeState) return 'is-red';
         return isNodeActive(nodeState) ? 'is-green' : freshnessClass(nodeState);
+      }
+
+      function nodePosition(entry) {
+        const config = entry?.config || {};
+        const state = entry?.state || {};
+        const x = safeNumber(
+          config.x
+          ?? config.position?.x
+          ?? config.position_m?.[0]
+          ?? state.x
+          ?? state.position?.x
+          ?? state.position_m?.[0],
+        );
+        const y = safeNumber(
+          config.y
+          ?? config.position?.y
+          ?? config.position_m?.[1]
+          ?? state.y
+          ?? state.position?.y
+          ?? state.position_m?.[1],
+        );
+        return x == null || y == null ? null : { x, y };
+      }
+
+      function defaultNodePosition(entry) {
+        const id = Number(entry?.node_id ?? entry?.config?.id ?? entry?.index + 1);
+        const roomW = roomWidth();
+        const roomH = roomHeight();
+        const anchors = [
+          { x: 0, y: 0 },
+          { x: roomW, y: 0 },
+          { x: roomW, y: roomH },
+          { x: 0, y: roomH },
+          { x: roomW / 2, y: 0 },
+          { x: roomW / 2, y: roomH },
+          { x: 0, y: roomH / 2 },
+          { x: roomW, y: roomH / 2 },
+        ];
+        return anchors[((Number.isFinite(id) ? Math.max(1, id) : entry.index + 1) - 1) % anchors.length];
+      }
+
+      function isOutsideConfiguredRoom(x, y, roomW = roomWidth(), roomH = roomHeight()) {
+        return x < 0 || y < 0 || x > roomW || y > roomH;
+      }
+
+      function nodeOutsideConfiguredRoom(entry) {
+        const position = nodePosition(entry);
+        return Boolean(position && isOutsideConfiguredRoom(position.x, position.y));
+      }
+
+      function outOfBoundsArrow(x, y, roomW, roomH) {
+        if (x < 0 || x > roomW) return '→';
+        if (y < 0 || y > roomH) return '↑';
+        return '';
+      }
+
+      function activeNodesWithPositions(nodes = allNodesForUi()) {
+        return nodes
+          .filter((entry) => isNodeActive(entry.state))
+          .map((entry) => ({ entry, position: nodePosition(entry) }))
+          .filter((item) => item.position);
+      }
+
+      function zoomToFitBounds(nodes, roomW, roomH) {
+        const activePositioned = activeNodesWithPositions(nodes);
+        if (!activePositioned.length) return { originX: 0, originY: 0, roomW, roomH, zoomed: false };
+        const allOutside = activePositioned.every(({ position }) => (
+          isOutsideConfiguredRoom(position.x, position.y, roomW, roomH)
+        ));
+        if (!allOutside) return { originX: 0, originY: 0, roomW, roomH, zoomed: false };
+
+        const xs = activePositioned.map(({ position }) => position.x);
+        const ys = activePositioned.map(({ position }) => position.y);
+        const originX = Math.min(0, ...xs);
+        const originY = Math.min(0, ...ys);
+        const maxX = Math.max(roomW, ...xs);
+        const maxY = Math.max(roomH, ...ys);
+        return {
+          originX,
+          originY,
+          roomW: Math.max(1, maxX - originX),
+          roomH: Math.max(1, maxY - originY),
+          zoomed: true,
+        };
+      }
+
+      function logNodeProjection(entry, x, y, px, py) {
+        if (!canvasMetrics) return;
+        const id = entry.node_id ?? entry.config?.id ?? entry.index + 1;
+        const key = [
+          id,
+          x.toFixed(3),
+          y.toFixed(3),
+          px.toFixed(1),
+          py.toFixed(1),
+          canvasMetrics.canvasWidth,
+          canvasMetrics.canvasHeight,
+          canvasMetrics.configRoomW,
+          canvasMetrics.configRoomH,
+        ].join('|');
+        if (nodeProjectionLogKeys.get(id) === key) return;
+        nodeProjectionLogKeys.set(id, key);
+        console.log(
+          'Node', id,
+          'pos metres:', x, y,
+          'pos pixels:', px, py,
+          'canvas size:', canvasMetrics.canvasWidth, canvasMetrics.canvasHeight,
+          'room config:', canvasMetrics.configRoomW, canvasMetrics.configRoomH,
+        );
       }
 
       function setStatus() {
@@ -375,10 +502,12 @@
           const active = isNodeActive(node);
           const rssi = node ? safeNumber(node.rssi ?? node.rssi_dbm ?? node.signal) : null;
           const filled = rssiSegments(rssi);
+          const outsideConfiguredRoom = nodeOutsideConfiguredRoom(entry);
 
           const card = document.createElement('article');
           card.className = 'card node-card';
-          if (!entry.configured) card.classList.add('is-unconfigured');
+          if (outsideConfiguredRoom) card.classList.add('is-aging');
+          else if (!entry.configured) card.classList.add('is-unconfigured');
           else if (!node) card.classList.add('is-stale');
 
           const row = document.createElement('div');
@@ -401,7 +530,10 @@
 
           const ageLine = document.createElement('span');
           ageLine.className = 'node-status';
-          if (!entry.configured && active) {
+          if (outsideConfiguredRoom) {
+            ageLine.textContent = `${nodeAlertName(entry)} — hors du plan configuré`;
+            ageLine.classList.add('is-orange');
+          } else if (!entry.configured && active) {
             ageLine.textContent = 'Position non configurée';
             ageLine.classList.add('is-green');
           } else if (!entry.configured) {
@@ -506,11 +638,22 @@
         ctx.closePath();
       }
 
-      function roomToScreen(x, y) {
+      function roomToScreen(x, y, options = {}) {
         if (!canvasMetrics) return { x: 0, y: 0 };
+        const px = canvasMetrics.roomX + ((x - canvasMetrics.originX) / canvasMetrics.roomW) * canvasMetrics.usableW;
+        const py = canvasMetrics.roomY + ((y - canvasMetrics.originY) / canvasMetrics.roomH) * canvasMetrics.usableH;
+        const outsideCanvas = px < 0 || px > canvasMetrics.width || py < 0 || py > canvasMetrics.height;
+        if (options.entry) logNodeProjection(options.entry, x, y, px, py);
+        if (!options.clamp || !outsideCanvas) {
+          return { x: px, y: py, rawX: px, rawY: py, outsideCanvas, clamped: false };
+        }
         return {
-          x: canvasMetrics.roomX + (x / canvasMetrics.roomW) * canvasMetrics.usableW,
-          y: canvasMetrics.roomY + (y / canvasMetrics.roomH) * canvasMetrics.usableH,
+          x: Math.max(0, Math.min(canvasMetrics.width, px)),
+          y: Math.max(0, Math.min(canvasMetrics.height, py)),
+          rawX: px,
+          rawY: py,
+          outsideCanvas,
+          clamped: true,
         };
       }
 
@@ -533,14 +676,17 @@
 
       function drawNodes(ctx) {
         allNodesForUi().forEach((entry) => {
-          if (!entry.configured) return;
-          const x = safeNumber(entry.config.x ?? entry.config.position?.x ?? entry.config.position_m?.[0]);
-          const y = safeNumber(entry.config.y ?? entry.config.position?.y ?? entry.config.position_m?.[1]);
-          if (x == null || y == null) return;
-          const hasLiveState = Boolean(entry.state);
-          const p = roomToScreen(x, y);
+          const position = nodePosition(entry) || defaultNodePosition(entry);
+          const x = position.x;
+          const y = position.y;
+          const active = isNodeActive(entry.state);
+          const outsideConfiguredRoom = isOutsideConfiguredRoom(x, y, canvasMetrics.configRoomW, canvasMetrics.configRoomH);
+          const p = roomToScreen(x, y, { clamp: true, entry });
+          const arrow = p.clamped
+            ? (p.rawY < 0 || p.rawY > canvasMetrics.height ? '↑' : '→')
+            : outOfBoundsArrow(x, y, canvasMetrics.configRoomW, canvasMetrics.configRoomH);
 
-          if (hasLiveState) {
+          if (active) {
             ctx.beginPath();
             ctx.fillStyle = 'rgba(59, 130, 246, 0.10)';
             ctx.arc(p.x, p.y, 80, 0, Math.PI * 2);
@@ -548,18 +694,18 @@
           }
 
           roundRect(ctx, p.x - 8, p.y - 8, 16, 16, 3);
-          ctx.fillStyle = hasLiveState ? '#3b82f6' : '#374151';
+          ctx.fillStyle = active ? '#3b82f6' : '#374151';
           ctx.fill();
-          ctx.strokeStyle = hasLiveState ? 'rgba(249, 250, 251, 0.42)' : 'rgba(107, 114, 128, 0.35)';
+          ctx.strokeStyle = active ? 'rgba(249, 250, 251, 0.42)' : 'rgba(107, 114, 128, 0.35)';
           ctx.stroke();
 
-          ctx.fillStyle = hasLiveState ? '#f9fafb' : '#9ca3af';
+          ctx.fillStyle = active ? '#f9fafb' : '#9ca3af';
           ctx.font = '600 12px system-ui, sans-serif';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'bottom';
-          ctx.fillText(`${nodeShortLabel(entry)}${hasLiveState ? '' : ' ✕'}`, p.x, p.y - 14);
+          ctx.fillText(`${nodeShortLabel(entry)}${active ? '' : ' ✕'}${outsideConfiguredRoom || p.clamped ? ` ${arrow}` : ''}`, p.x, p.y - 14);
 
-          if (hasLiveState && isFreshNode(entry.state)) {
+          if (active) {
             ctx.beginPath();
             ctx.fillStyle = '#10b981';
             ctx.arc(p.x, p.y - 8, 3, 0, Math.PI * 2);
@@ -632,7 +778,8 @@
         ctx.fillText(`${count} personne(s) détectée(s)`, 16, metrics.height - 16);
 
         ctx.textAlign = 'right';
-        ctx.fillText(`${metrics.roomW.toFixed(1)}m × ${metrics.roomH.toFixed(1)}m`, metrics.width - 16, metrics.height - 16);
+        const suffix = metrics.zoomedToFit ? ' · zoom-to-fit' : '';
+        ctx.fillText(`${metrics.configRoomW.toFixed(1)}m × ${metrics.configRoomH.toFixed(1)}m${suffix}`, metrics.width - 16, metrics.height - 16);
       }
 
       function syncHalos() {
@@ -680,16 +827,25 @@
         const margin = ROOM_CANVAS_MARGIN;
         const usableW = Math.max(1, width - margin * 2);
         const usableH = Math.max(1, height - margin * 2);
+        const nodes = allNodesForUi();
+        const fit = zoomToFitBounds(nodes, roomW, roomH);
         canvasMetrics = {
           width,
           height,
-          roomW,
-          roomH,
+          canvasWidth: canvas.width,
+          canvasHeight: canvas.height,
+          configRoomW: roomW,
+          configRoomH: roomH,
+          originX: fit.originX,
+          originY: fit.originY,
+          roomW: fit.roomW,
+          roomH: fit.roomH,
           usableW,
           usableH,
-          scale: Math.min(usableW / roomW, usableH / roomH),
+          scale: Math.min(usableW / fit.roomW, usableH / fit.roomH),
           roomX: margin,
           roomY: margin,
+          zoomedToFit: fit.zoomed,
         };
 
         ctx.clearRect(0, 0, width, height);
@@ -700,11 +856,13 @@
 
         ctx.strokeStyle = '#374151';
         ctx.lineWidth = 2;
+        const roomStart = roomToScreen(0, 0);
+        const roomEnd = roomToScreen(canvasMetrics.configRoomW, canvasMetrics.configRoomH);
         ctx.strokeRect(
-          canvasMetrics.roomX,
-          canvasMetrics.roomY,
-          canvasMetrics.usableW,
-          canvasMetrics.usableH,
+          Math.min(roomStart.x, roomEnd.x),
+          Math.min(roomStart.y, roomEnd.y),
+          Math.abs(roomEnd.x - roomStart.x),
+          Math.abs(roomEnd.y - roomStart.y),
         );
 
         drawNodes(ctx);

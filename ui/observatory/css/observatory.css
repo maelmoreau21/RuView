@@ -23,6 +23,10 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   background: var(--bg-deep);
   overflow: hidden;
@@ -463,6 +467,18 @@ body.hud-right-collapsed .panel-collapse--right {
   font-size: 13px;
   font-weight: 600;
   color: var(--blue-signal);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.presence-confidence-detail {
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
 }
 
 #attenuation-value {

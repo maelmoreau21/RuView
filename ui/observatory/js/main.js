@@ -2,8 +2,7 @@
  * RuvSense Console - Main Scene Orchestrator
  *
  * Room-based WiFi sensing visualization with:
- * - Pool of 4 human wireframe figures for live multi-person frames
- * - 7 pose types (standing, walking, lying, sitting, fallen, exercising, gesturing, crouching)
+ * - Anonymous presence markers for live multi-person frames
  * - Scenario-specific room props (chair, exercise mat, door, rubble wall, screen, desk)
  * - Dot-matrix mist body mass, particle trails, WiFi waves, signal field
  * - Reflective floor, settings dialog, and practical data HUD
@@ -13,8 +12,6 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import { NebulaBackground } from './nebula-background.js';
 import { PostProcessing } from './post-processing.js';
-import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
-import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION } from './hud-controller.js';
 import { initAlerts } from '../../alerts.js?v=module';
@@ -34,34 +31,11 @@ const C = {
 
 const MAX_SCENE_PERSONS = 8;
 const PERSON_DEDUPE_RADIUS_M = 0.65;
-const SLEEP_BED_CENTER = [3.5, 0.54, -3.5];
-const SLEEP_BED_YAW = 0;
-const SLEEP_BED_POSES = new Set(['lying', 'fallen']);
-const KNOWN_POSES = new Set([
-  'standing', 'walking', 'lying', 'sitting', 'fallen', 'falling',
-  'exercising', 'gesturing', 'crouching',
-]);
-const POSE_ALIASES = new Map([
-  ['stand', 'standing'],
-  ['upright', 'standing'],
-  ['still', 'standing'],
-  ['moving', 'walking'],
-  ['laying', 'lying'],
-  ['laying_down', 'lying'],
-  ['lying_down', 'lying'],
-  ['supine', 'lying'],
-  ['recumbent', 'lying'],
-  ['seated', 'sitting'],
-  ['sit', 'sitting'],
-  ['fall', 'fallen'],
-  ['down', 'fallen'],
-  ['collapsed', 'fallen'],
-  ['on_floor', 'fallen'],
-  ['fall_detected', 'fallen'],
-  ['falling_down', 'falling'],
-  ['crouched', 'crouching'],
-]);
 const ROOM_CONFIG_STORAGE_KEY = 'ruvsense:room-config';
+const NODE_ACTIVE_COLOR = 0x3b82f6;
+const NODE_INACTIVE_COLOR = 0x374151;
+const NODE_ACTIVE_WINDOW_MS = 5000;
+const NODE_CUBE_SIZE_M = 0.15;
 const DEFAULT_ROOM_CONFIG = {
   room_width_meters: 5.0,
   room_height_meters: 4.0,
@@ -148,17 +122,18 @@ class Observatory {
     this._lastEdgeVitals = null;
     this._currentScenario = null;
     this._obstacleSummary = null;
-    this._personMotionFilters = new Map();
+    this._personPositions = new Map();
     this._linkRaycaster = new THREE.Raycaster();
     this._connectionState = 'connecting';
     this._roomConfig = null;
     this._roomConfigSource = 'default';
-    this._roomConfigNodes = new Map();
+    this.nodeObjects = new Map();
+    this._nodeRangeObjects = new Map();
+    this._nodeRuntimeState = new Map();
     this._presenceSilhouettes = new Map();
     this._activeRoomNodeCount = 0;
     this._sceneStatusOverlay = null;
     this._unsubscribeWs = null;
-    this._figurePool = null;
     this._scenarioProps = null;
     this._nebula = null;
     this._mistPoints = null;
@@ -171,7 +146,6 @@ class Observatory {
     this._buildTopologyDevices();
     this._buildRoomConfigLayer();
     this._buildPresenceLayer();
-    this._poseSystem = new PoseSystem();
     this._buildWifiWaves();
 
     // Post-processing
@@ -673,140 +647,245 @@ class Observatory {
   }
 
   _rebuildRoomConfigScene(data) {
-    if (!this._roomConfig) return;
-    if (!data) {
-      if (this._roomConfigGroup) this._clearObjectGroup(this._roomConfigGroup);
-      this._roomConfigNodes.clear();
-      return;
-    }
-    this._ensureRoomConfigGroup();
-    this._clearObjectGroup(this._roomConfigGroup);
-    this._roomConfigNodes.clear();
-
-    const liveIds = new Set((data.nodes || []).map((node) => Number(node.node_id ?? node.id)).filter(Number.isFinite));
-    const nodeCount = Math.max(0, this._integerOrZero(data.node_count));
-    const visibleNodes = this._roomConfig.nodes.filter((node, index) => (
-      liveIds.has(Number(node.id)) || (liveIds.size === 0 && index < nodeCount)
-    ));
-    for (const node of visibleNodes) {
-      const entry = this._createRoomNodeIcon(node);
-      const [x, y, z] = this._roomToScenePosition(node.x, node.y, 0.08);
-      entry.group.position.set(x, y, z);
-      this._roomConfigGroup.add(entry.group);
-      this._roomConfigNodes.set(Number(node.id), entry);
-    }
+    this._syncNodeObjects(data);
   }
 
-  _createRoomNodeIcon(node) {
-    const group = new THREE.Group();
-    const bodyMat = new THREE.MeshStandardMaterial({
-      color: C.redAlert,
-      emissive: C.redAlert,
-      emissiveIntensity: 0.22,
-      roughness: 0.4,
-    });
-    const antennaMat = new THREE.MeshBasicMaterial({ color: 0xd8dee8, transparent: true, opacity: 0.74 });
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: C.redAlert,
+  _nodeIdOf(node) {
+    const id = Number(node?.node_id ?? node?.id);
+    return Number.isFinite(id) ? id : null;
+  }
+
+  _roomConfigNodeById(id) {
+    if (!this._roomConfig?.nodes) return null;
+    return this._roomConfig.nodes.find((node) => Number(node.id) === Number(id)) || null;
+  }
+
+  _defaultRoomPointForNode(id) {
+    const width = Number(this._roomConfig?.room_width_meters || this._roomSize.width || DEFAULT_ROOM_CONFIG.room_width_meters || 1);
+    const depth = Number(this._roomConfig?.room_height_meters || this._roomSize.depth || DEFAULT_ROOM_CONFIG.room_height_meters || 1);
+    const corners = [
+      [0, 0],
+      [width, 0],
+      [width, depth],
+      [0, depth],
+      [width / 2, depth],
+      [width / 2, 0],
+    ];
+    const slot = Math.max(0, Math.floor(Number(id || 1)) - 1);
+    const point = corners[slot % corners.length];
+    return { x: point[0], y: point[1] };
+  }
+
+  _scenePositionForNode(id, node = null) {
+    const cfg = this._roomConfigNodeById(id);
+    if (cfg) return this._roomToScenePosition(cfg.x, cfg.y, NODE_CUBE_SIZE_M / 2);
+    const explicit = this._positionOf(node);
+    if (explicit) return [explicit[0], Math.max(explicit[1], NODE_CUBE_SIZE_M / 2), explicit[2]];
+    const fallback = this._defaultRoomPointForNode(id);
+    return this._roomToScenePosition(fallback.x, fallback.y, NODE_CUBE_SIZE_M / 2);
+  }
+
+  _nodeRangeRadius(node = null) {
+    const direct = Number(node?.coverage?.radius_m ?? node?.coverage_radius_m ?? node?.range_m ?? node?.max_range_m);
+    if (Number.isFinite(direct) && direct > 0) return Math.max(0.45, direct);
+    const span = Math.max(
+      Number(this._roomConfig?.room_width_meters || 0),
+      Number(this._roomConfig?.room_height_meters || 0),
+      this._roomSize.width,
+      this._roomSize.depth,
+      2,
+    );
+    return Math.min(Math.max(span * 0.32, 0.75), 1.8);
+  }
+
+  _ensureNodeObject(id) {
+    this._ensureRoomConfigGroup();
+    const existing = this.nodeObjects.get(id);
+    if (existing) return existing;
+
+    const material = new THREE.MeshStandardMaterial({
+      color: NODE_INACTIVE_COLOR,
+      emissive: NODE_INACTIVE_COLOR,
+      emissiveIntensity: 0.18,
+      roughness: 0.45,
       transparent: true,
-      opacity: 0.55,
-      wireframe: true,
+      opacity: 0.86,
     });
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(NODE_CUBE_SIZE_M, NODE_CUBE_SIZE_M, NODE_CUBE_SIZE_M),
+      material,
+    );
+    mesh.name = `esp32-node-${id}`;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    this._roomConfigGroup.add(mesh);
 
-    const body = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.1, 0.18), bodyMat);
-    body.position.y = 0.08;
-    group.add(body);
-
-    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.3, 8), antennaMat);
-    antenna.position.y = 0.28;
-    group.add(antenna);
-
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.006, 6, 32), ringMat);
-    ring.rotation.x = Math.PI / 2;
-    ring.position.y = 0.08;
-    group.add(ring);
-
-    const label = this._createTextSprite(node.label || `Node ${node.id}`, {
-      width: 192,
+    const labelSprite = this._createTextSprite(`N${id}`, {
+      width: 128,
       height: 56,
-      font: '600 20px JetBrains Mono, Consolas, monospace',
+      font: '700 24px JetBrains Mono, Consolas, monospace',
       color: '#dce6ef',
       background: 'rgba(8, 16, 28, 0.64)',
     });
-    label.scale.set(0.72, 0.22, 1);
-    label.position.y = 0.62;
-    group.add(label);
+    labelSprite.name = `esp32-node-${id}-label`;
+    labelSprite.scale.set(0.46, 0.18, 1);
+    this._roomConfigGroup.add(labelSprite);
 
-    return { group, bodyMat, ringMat, label };
+    const rangeMat = new THREE.MeshBasicMaterial({
+      color: NODE_INACTIVE_COLOR,
+      transparent: true,
+      opacity: 0.08,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const range = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 0.012, 72), rangeMat);
+    range.name = `esp32-node-${id}-range`;
+    this._roomConfigGroup.add(range);
+    this._nodeRangeObjects.set(id, range);
+
+    const entry = { mesh, labelSprite };
+    this.nodeObjects.set(id, entry);
+    return entry;
+  }
+
+  _disposeNodeObject(id) {
+    const entry = this.nodeObjects.get(id);
+    const range = this._nodeRangeObjects.get(id);
+    for (const object of [entry?.mesh, entry?.labelSprite, range]) {
+      if (!object) continue;
+      this._roomConfigGroup?.remove(object);
+      object.geometry?.dispose?.();
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const mat of materials) {
+        mat?.map?.dispose?.();
+        mat?.dispose?.();
+      }
+    }
+    this.nodeObjects.delete(id);
+    this._nodeRangeObjects.delete(id);
+    this._nodeRuntimeState.delete(id);
+  }
+
+  _placeNodeObject(id, position, node = null) {
+    const entry = this._ensureNodeObject(id);
+    const radius = this._nodeRangeRadius(node);
+    const y = Math.max(Number(position?.[1]) || 0, NODE_CUBE_SIZE_M / 2);
+    entry.mesh.position.set(position[0], y, position[2]);
+    entry.labelSprite.position.set(position[0], y + 0.36, position[2]);
+    const range = this._nodeRangeObjects.get(id);
+    if (range) {
+      range.position.set(position[0], 0.006, position[2]);
+      range.scale.set(radius, 1, radius);
+    }
+    entry.mesh.visible = true;
+    entry.labelSprite.visible = true;
+    if (range) range.visible = true;
+  }
+
+  _nodeObjectPosition(id) {
+    const mesh = this.nodeObjects.get(Number(id))?.mesh;
+    if (!mesh) return null;
+    return [mesh.position.x, mesh.position.y, mesh.position.z];
+  }
+
+  _nodeIsLive(node) {
+    const status = String(node?.status || node?.health_status || (node?.active === false ? 'offline' : 'live')).toLowerCase();
+    return node?.active !== false && !['offline', 'stale', 'sync_only', 'no_nodes', 'connecting'].includes(status);
+  }
+
+  _markRuntimeNodesInactive() {
+    for (const state of this._nodeRuntimeState.values()) state.active = false;
+  }
+
+  _syncRuntimeNodes(data) {
+    if (!data) return;
+    const status = String(data.system_status || this._connectionState || '').toLowerCase();
+    if (['offline', 'no_nodes', 'connecting'].includes(status)) {
+      this._markRuntimeNodesInactive();
+      return;
+    }
+
+    const receivedAt = this._numberOrNull(data._receivedAt) ?? this._lastLiveAt ?? 0;
+    for (const node of data.nodes || []) {
+      const id = this._nodeIdOf(node);
+      if (id == null) continue;
+      const live = this._nodeIsLive(node);
+      const previous = this._nodeRuntimeState.get(id) || {};
+      this._nodeRuntimeState.set(id, {
+        ...previous,
+        node,
+        active: live,
+        lastSeenAt: live ? (receivedAt || performance.now()) : (previous.lastSeenAt || 0),
+      });
+    }
+  }
+
+  _nodeActiveFromRuntime(id) {
+    const state = this._nodeRuntimeState.get(id);
+    if (!state?.active || !state.lastSeenAt) return false;
+    return performance.now() - state.lastSeenAt < NODE_ACTIVE_WINDOW_MS;
+  }
+
+  _updateNodeVisual(id) {
+    const entry = this.nodeObjects.get(id);
+    if (!entry) return;
+    const active = this._nodeActiveFromRuntime(id);
+    const color = active ? NODE_ACTIVE_COLOR : NODE_INACTIVE_COLOR;
+    entry.mesh.material.color.setHex(color);
+    entry.mesh.material.emissive?.setHex(color);
+    entry.mesh.material.opacity = active ? 1 : 0.86;
+    this._updateTextSprite(entry.labelSprite, `N${id}`, active ? '#dbeafe' : '#cbd5e1');
+    const range = this._nodeRangeObjects.get(id);
+    if (range?.material) {
+      range.material.color.setHex(color);
+      range.material.opacity = active ? 0.16 : 0.08;
+    }
+  }
+
+  _syncNodesFromRoomConfig(desiredIds) {
+    for (const node of this._roomConfig?.nodes || []) {
+      const id = this._nodeIdOf(node);
+      if (id == null) continue;
+      desiredIds.add(id);
+      this._placeNodeObject(id, this._scenePositionForNode(id, node), node);
+    }
+  }
+
+  _syncNodeObjects(data) {
+    if (!this._roomConfig) return;
+    this._ensureRoomConfigGroup();
+    this._syncRuntimeNodes(data);
+
+    const desiredIds = new Set();
+    this._syncNodesFromRoomConfig(desiredIds);
+
+    for (const node of data?.nodes || []) {
+      const id = this._nodeIdOf(node);
+      if (id == null) continue;
+      desiredIds.add(id);
+      this._placeNodeObject(id, this._scenePositionForNode(id, node), node);
+    }
+
+    for (const id of this._nodeRuntimeState.keys()) desiredIds.add(id);
+    for (const id of desiredIds) {
+      const runtimeNode = this._nodeRuntimeState.get(id)?.node || null;
+      if (!this.nodeObjects.has(id)) this._placeNodeObject(id, this._scenePositionForNode(id, runtimeNode), runtimeNode);
+      this._updateNodeVisual(id);
+    }
+
+    for (const id of [...this.nodeObjects.keys()]) {
+      if (!desiredIds.has(id)) this._disposeNodeObject(id);
+    }
   }
 
   _syncRoomConfigNodes(data) {
-    if (!this._roomConfig) return;
-    if (!data) {
-      this._rebuildRoomConfigScene(null);
-      return;
-    }
-    if (!this._roomConfigNodes.size) this._rebuildRoomConfigScene(data);
-    if (!this._roomConfigNodes.size) return;
-    const systemStatus = String(data?.system_status || '').toLowerCase();
-    const fallbackActiveNodes = Array.isArray(data?.nodes)
-      ? data.nodes.filter((node) => node.active !== false).length
-      : 0;
-    const nodeCount = Math.max(0, this._integerOrZero(
-      data?.node_count ?? data?.count_evidence?.active_nodes ?? fallbackActiveNodes
-    ));
-    const activeIds = new Set();
-    for (const node of data?.nodes || []) {
-      const status = String(node.status || node.health_status || '').toLowerCase();
-      const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(status);
-      const id = Number(node.node_id ?? node.id);
-      if (active && Number.isFinite(id)) activeIds.add(id);
-    }
-
-    this._roomConfig.nodes.forEach((node, index) => {
-      const entry = this._roomConfigNodes.get(Number(node.id));
-      if (!entry) return;
-      const hasExplicitIds = activeIds.size > 0;
-      const active = systemStatus !== 'no_nodes' && (hasExplicitIds ? activeIds.has(Number(node.id)) : index < nodeCount);
-      const color = active ? C.greenGlow : C.redAlert;
-      entry.bodyMat.color.setHex(color);
-      entry.bodyMat.emissive.setHex(color);
-      entry.bodyMat.opacity = active ? 1 : 0.72;
-      entry.ringMat.color.setHex(color);
-      entry.ringMat.opacity = active ? 0.8 : 0.36;
-      entry.group.visible = true;
-    });
+    this._syncNodeObjects(data);
   }
 
   _presenceColor(confidence) {
     if (confidence < 0.4) return 0xff3040;
     if (confidence < 0.7) return 0xffb020;
     return 0x00d878;
-  }
-
-  _presenceVitalsStatus(person, br, hr) {
-    const statusText = [
-      person?.status,
-      person?.state,
-      person?.vital_status,
-      person?.alert_status,
-      person?.event_type,
-      person?.reason,
-    ].filter(Boolean).join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-    const critical =
-      /\b(apnea|apnee|apneic|respiratory_arrest|cardiac_arrest|heart_stop|asystole|arret_cardiaque|critical|critique)\b/.test(statusText)
-      || person?.apnea_detected === true
-      || person?.cardiac_arrest === true
-      || person?.heart_stopped === true
-      || (br != null && br <= 3)
-      || (hr != null && hr <= 5);
-    if (critical) return { level: 'critical', label: 'ALERTE', color: '#ff3040' };
-    const warning =
-      /\b(fall|fallen|falling|chute|anomaly|anomalie|warning)\b/.test(statusText)
-      || (br != null && (br < 8 || br > 28))
-      || (hr != null && (hr < 50 || hr > 130));
-    if (warning) return { level: 'warning', label: 'ALERTE', color: '#ffe4ad' };
-    return { level: 'normal', label: 'NORMAL', color: '#b7ffd4' };
   }
 
   _upsertPresenceSilhouette(id) {
@@ -823,28 +902,29 @@ class Observatory {
       metalness: 0.08,
     });
     const headMat = bodyMat.clone();
-    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 1.12, 20), bodyMat);
-    body.position.y = 0.7;
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 1.7, 24), bodyMat);
+    body.position.y = 0.85;
     body.castShadow = true;
     group.add(body);
 
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 24, 16), headMat);
-    head.position.y = 1.42;
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.15, 24, 16), headMat);
+    head.position.y = 1.85;
     head.castShadow = true;
     group.add(head);
 
     const label = this._createTextSprite('', {
-      width: 256,
+      width: 320,
       height: 92,
       font: '600 20px JetBrains Mono, Consolas, monospace',
+      lineHeight: 26,
       background: 'rgba(8, 16, 28, 0.76)',
     });
-    label.scale.set(0.95, 0.34, 1);
-    label.position.y = 1.92;
+    label.scale.set(1.08, 0.34, 1);
+    label.position.y = 2.18;
     group.add(label);
 
     this._presenceGroup.add(group);
-    entry = { group, bodyMat, headMat, label, lastLabel: '' };
+    entry = { group, bodyMat, headMat, label, lastLabel: '', hasPosition: false };
     this._presenceSilhouettes.set(id, entry);
     return entry;
   }
@@ -869,6 +949,11 @@ class Observatory {
   _updatePresenceSilhouettes(data, elapsed) {
     const persons = Array.isArray(data?.persons) ? data.persons : [];
     const activeIds = new Set();
+    const frameKey = String(this._sceneTimestampMs(data));
+    const evidence = data?.count_evidence && typeof data.count_evidence === 'object' ? data.count_evidence : {};
+    const activeNodeCount = this._integerOrZero(evidence.supporting_nodes ?? evidence.active_nodes ?? data?.node_count);
+    const localizationConfidence = activeNodeCount >= 4 ? 'élevée' : activeNodeCount === 3 ? 'moyenne' : 'faible';
+
     persons.forEach((person, index) => {
       if (person.is_present === false) return;
       const id = this._personIdentity(person, index);
@@ -876,30 +961,61 @@ class Observatory {
       const entry = this._upsertPresenceSilhouette(id);
       const position = this._parseVector3(person.position);
       if (!position) return;
+
       const confidence = Math.max(0, Math.min(1, Number(person.confidence) || 0));
       const motionEnergy = Math.max(0, Math.min(1, Number(person.motion_energy ?? person.motion_score / 100) || 0));
       const color = this._presenceColor(confidence);
-      const yOffset = Math.sin(elapsed * 3.2 + index * 0.7) * motionEnergy * 0.12;
+      let positionState = this._personPositions.get(id);
+      if (!positionState) {
+        positionState = {
+          history: [],
+          displayed: { x: position[0], y: position[2] },
+          target: { x: position[0], y: position[2] },
+          lastFrameKey: null,
+        };
+        this._personPositions.set(id, positionState);
+      }
 
-      entry.group.position.set(position[0], yOffset, position[2]);
+      if (positionState.lastFrameKey !== frameKey) {
+        positionState.history.push({ x: position[0], y: position[2] });
+        if (positionState.history.length > 5) positionState.history.shift();
+        positionState.lastFrameKey = frameKey;
+      }
+
+      let totalWeight = 0;
+      let sumX = 0;
+      let sumY = 0;
+      positionState.history.forEach((point, historyIndex) => {
+        const weight = historyIndex + 1;
+        sumX += point.x * weight;
+        sumY += point.y * weight;
+        totalWeight += weight;
+      });
+      positionState.displayed = totalWeight > 0
+        ? { x: sumX / totalWeight, y: sumY / totalWeight }
+        : { x: position[0], y: position[2] };
+      positionState.target = { ...positionState.displayed };
+
+      const yOffset = motionEnergy > 0.1 ? Math.sin(elapsed * 3.2 + index * 0.7) * 0.045 : 0;
+      const targetY = position[1] + yOffset;
+      if (!entry.hasPosition) {
+        entry.group.position.set(positionState.target.x, targetY, positionState.target.y);
+        entry.hasPosition = true;
+      } else {
+        entry.group.position.x += (positionState.target.x - entry.group.position.x) * 0.1;
+        entry.group.position.z += (positionState.target.y - entry.group.position.z) * 0.1;
+        entry.group.position.y = targetY;
+      }
+
       entry.bodyMat.color.setHex(color);
       entry.bodyMat.emissive.setHex(color);
       entry.headMat.color.setHex(color);
       entry.headMat.emissive.setHex(color);
 
-      const br = this._numberOrNull(person.breathing_bpm ?? person.vitals?.breathing_bpm ?? person.vital_signs?.breathing_rate_bpm);
-      const hr = this._numberOrNull(person.heart_rate_bpm ?? person.vitals?.heart_rate_bpm ?? person.vital_signs?.heart_rate_bpm);
-      const vitalsStatus = this._presenceVitalsStatus(person, br, hr);
-      const displayColor = vitalsStatus.level === 'critical' ? C.redAlert : color;
-      entry.bodyMat.color.setHex(displayColor);
-      entry.bodyMat.emissive.setHex(displayColor);
-      entry.headMat.color.setHex(displayColor);
-      entry.headMat.emissive.setHex(displayColor);
-      const label = `BR ${br == null ? '--' : br.toFixed(1)} BPM\nHR ${hr == null ? '--' : Math.round(hr)} BPM\n${vitalsStatus.label}`;
+      const confidencePercent = Math.round(confidence * 100);
+      const label = `P${index + 1} — ${confidencePercent}%\nConfiance localisation : ${localizationConfidence}`;
       if (entry.lastLabel !== label) {
-        this._updateTextSprite(entry.label, label, vitalsStatus.level === 'normal'
-          ? (confidence < 0.4 ? '#ffb3ba' : confidence < 0.7 ? '#ffe4ad' : '#b7ffd4')
-          : vitalsStatus.color);
+        this._updateTextSprite(entry.label, label, confidence < 0.4 ? '#ffb3ba' : confidence < 0.7 ? '#ffe4ad' : '#b7ffd4');
         entry.lastLabel = label;
       }
     });
@@ -907,8 +1023,10 @@ class Observatory {
     for (const [id, entry] of [...this._presenceSilhouettes.entries()]) {
       if (!activeIds.has(id)) this._removePresenceSilhouette(id, entry);
     }
+    for (const id of [...this._personPositions.keys()]) {
+      if (!activeIds.has(id)) this._personPositions.delete(id);
+    }
   }
-
   // ---- WiFi Waves ----
 
   _buildWifiWaves() {
@@ -1138,47 +1256,20 @@ class Observatory {
     return Number.isFinite(confidence) ? confidence : 0;
   }
 
-  _normalizePoseName(value) {
-    const raw = String(value ?? '').trim().toLowerCase();
-    if (!raw) return null;
-    const slug = raw.replace(/[\s-]+/g, '_');
-    return POSE_ALIASES.get(slug) || (KNOWN_POSES.has(slug) ? slug : null);
-  }
-
-  _framePose(frame) {
-    return this._normalizePoseName(frame?.posture) || this._normalizePoseName(frame?.pose);
-  }
-
-  _personPose(person, frame) {
-    return this._normalizePoseName(person?.pose)
-      || this._normalizePoseName(person?.posture)
-      || this._framePose(frame);
-  }
-
-  _fallProgress(person, frame) {
-    const progress = this._numberOrNull(
-      person?.fallProgress ?? person?.fall_progress ?? frame?.fallProgress ?? frame?.fall_progress,
-    );
-    return progress == null ? null : Math.max(0, Math.min(1, progress));
-  }
-
-  _shouldSnapToSleepBed(data, person) {
-    const scenario = String(data?.scenario || this._currentScenario || '').toLowerCase();
-    return scenario === 'sleep_monitoring' && SLEEP_BED_POSES.has(person?.pose);
-  }
-
-  _snapToSleepBed(data, person) {
-    if (!this._shouldSnapToSleepBed(data, person)) return person;
-    const position = SLEEP_BED_CENTER.slice();
-    return {
+  _presencePerson(person, index) {
+    const next = {
       ...person,
-      position,
-      ...(person.position_m ? { position_m: position.slice() } : {}),
-      position_source: 'observatory_layout',
-      facing: SLEEP_BED_YAW,
-      keypoints: undefined,
-      keypoints_m: undefined,
+      id: this._personIdentity(person, index),
     };
+    delete next.pose;
+    delete next.posture;
+    delete next.pose_source;
+    delete next.fallProgress;
+    delete next.fall_progress;
+    delete next.fall_detected;
+    delete next.keypoints;
+    delete next.keypoints_m;
+    return next;
   }
 
   _dedupePersons(persons, renderLimit) {
@@ -1218,107 +1309,6 @@ class Observatory {
     const seconds = this._numberOrNull(data?.timestamp);
     if (seconds != null) return seconds * 1000;
     return performance.now();
-  }
-
-  _translateKeypoints(keypoints, delta) {
-    if (!Array.isArray(keypoints)) return keypoints;
-    return keypoints.map((point) => {
-      if (Array.isArray(point) && point.length >= 3) {
-        const next = point.slice();
-        next[0] += delta[0];
-        next[1] += delta[1];
-        next[2] += delta[2];
-        return next;
-      }
-      if (point && typeof point === 'object') {
-        return {
-          ...point,
-          x: Number(point.x || 0) + delta[0],
-          y: Number(point.y || 0) + delta[1],
-          z: Number(point.z || 0) + delta[2],
-        };
-      }
-      return point;
-    });
-  }
-
-  _smoothPersonPosition(person, rawPosition, nowMs) {
-    const key = String(person.id);
-    const source = String(person?.position_source || person?.pose_source || '').toLowerCase();
-    if (['observatory_layout', 'count_evidence', 'presence_hold'].includes(source)) {
-      const previous = this._personMotionFilters.get(key);
-      if (previous && nowMs - previous.at <= 1800) {
-        previous.at = nowMs;
-        return previous.position.slice();
-      }
-      this._personMotionFilters.delete(key);
-      return rawPosition;
-    }
-    const confidence = this._personConfidence(person);
-    const previous = this._personMotionFilters.get(key);
-    if (!previous) {
-      this._personMotionFilters.set(key, { position: rawPosition.slice(), at: nowMs });
-      return rawPosition;
-    }
-    const dt = Math.min(0.25, Math.max(1 / 60, (nowMs - previous.at) / 1000 || 1 / 30));
-    const delta = [
-      rawPosition[0] - previous.position[0],
-      rawPosition[1] - previous.position[1],
-      rawPosition[2] - previous.position[2],
-    ];
-    const distance = Math.hypot(delta[0], delta[1], delta[2]);
-    const maxSpeedMps = confidence < 0.55 ? 1.1 : 2.4;
-    const maxStep = Math.max(0.12, maxSpeedMps * dt);
-    let gated = rawPosition;
-    if (distance > maxStep && distance > 0) {
-      const scale = maxStep / distance;
-      gated = [
-        previous.position[0] + delta[0] * scale,
-        previous.position[1] + delta[1] * scale,
-        previous.position[2] + delta[2] * scale,
-      ];
-    }
-    const speed = distance / Math.max(dt, 1 / 60);
-    const alpha = Math.min(0.58, Math.max(0.16, 0.18 + speed * 0.045));
-    const smoothed = [
-      previous.position[0] + (gated[0] - previous.position[0]) * alpha,
-      previous.position[1] + (gated[1] - previous.position[1]) * alpha,
-      previous.position[2] + (gated[2] - previous.position[2]) * alpha,
-    ];
-    this._personMotionFilters.set(key, { position: smoothed.slice(), at: nowMs });
-    return smoothed;
-  }
-
-  _smoothScenePersons(persons, data) {
-    const nowMs = this._sceneTimestampMs(data);
-    const seen = new Set();
-    const smoothed = persons.map((person, index) => {
-      const id = this._personIdentity(person, index);
-      seen.add(id);
-      const rawPosition = this._parseVector3(person.position);
-      if (!rawPosition) return person;
-      const nextPosition = this._smoothPersonPosition({ ...person, id }, rawPosition, nowMs);
-      const delta = [
-        nextPosition[0] - rawPosition[0],
-        nextPosition[1] - rawPosition[1],
-        nextPosition[2] - rawPosition[2],
-      ];
-      return {
-        ...person,
-        id,
-        position: nextPosition,
-        ...(person.position_m ? { position_m: nextPosition } : {}),
-        ...(person.keypoints_m ? { keypoints_m: this._translateKeypoints(person.keypoints_m, delta) } : {}),
-      };
-    });
-    this._prunePersonFilters(seen, nowMs);
-    return smoothed;
-  }
-
-  _prunePersonFilters(seen, nowMs) {
-    for (const [key, filter] of this._personMotionFilters) {
-      if (!seen.has(key) || nowMs - filter.at > 2500) this._personMotionFilters.delete(key);
-    }
   }
 
   _edgeVitalsFromFrame(frame) {
@@ -1361,8 +1351,9 @@ class Observatory {
       const normalized = this._normalizePresenceFrame(frame);
       if (!normalized) return;
       const status = normalized.system_status === 'no_nodes' ? 'no_nodes' : 'live';
+      normalized._receivedAt = performance.now();
       this._liveData = normalized;
-      this._lastLiveAt = performance.now();
+      this._lastLiveAt = normalized._receivedAt;
       this._setSceneStatus(status);
       this._hud.updateSourceBadge(status, this._ws);
       this._updateScenarioProps(normalized);
@@ -1375,8 +1366,9 @@ class Observatory {
       const normalized = this._normalizeSensingFrame(frame);
       if (!normalized) return;
       const status = String(normalized.system_status || '').toLowerCase() === 'no_nodes' ? 'no_nodes' : 'live';
+      normalized._receivedAt = performance.now();
       this._liveData = normalized;
-      this._lastLiveAt = performance.now();
+      this._lastLiveAt = normalized._receivedAt;
       this._setSceneStatus(status);
       this._hud.updateSourceBadge(status, this._ws);
       this._updateScenarioProps(normalized);
@@ -1393,41 +1385,11 @@ class Observatory {
     }
   }
 
-  _keypointObjects(source) {
-    if (!Array.isArray(source) || source.length < 17) return null;
-    const names = [
-      'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
-      'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
-      'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
-      'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
-    ];
-    const points = [];
-    for (let i = 0; i < 17; i++) {
-      const kp = source[i];
-      const x = Array.isArray(kp) ? Number(kp[0]) : Number(kp?.x);
-      const y = Array.isArray(kp) ? Number(kp[1]) : Number(kp?.y);
-      const z = Array.isArray(kp) ? Number(kp[2] ?? 0) : Number(kp?.z ?? 0);
-      const confidence = Array.isArray(kp) ? Number(kp[3] ?? 0.8) : Number(kp?.confidence ?? 0.8);
-      if (![x, y, z, confidence].every(Number.isFinite)) return null;
-      points.push({ name: names[i], x, y, z, confidence });
-    }
-    return points;
-  }
-
   _normalizeSensingFrame(rawFrame) {
     if (!rawFrame || typeof rawFrame !== 'object') return null;
     const frame = this._lastEdgeVitals ? this._mergeEdgeVitals(rawFrame, this._lastEdgeVitals) : { ...rawFrame };
     const rawPersons = Array.isArray(frame.persons) ? frame.persons : [];
-    let persons = rawPersons.slice(0, MAX_SCENE_PERSONS).map((person, index) => {
-      const pose = this._personPose(person, frame);
-      const fallProgress = this._fallProgress(person, frame);
-      return {
-        ...person,
-        id: this._personIdentity(person, index),
-        ...(pose ? { pose } : {}),
-        ...(fallProgress != null ? { fallProgress } : {}),
-      };
-    });
+    let persons = rawPersons.slice(0, MAX_SCENE_PERSONS).map((person, index) => this._presencePerson(person, index));
 
     let evidence = this._countEvidence({ ...frame, persons });
     const hasCountEvidence = Boolean(frame.count_evidence && typeof frame.count_evidence === 'object');
@@ -1435,7 +1397,6 @@ class Observatory {
       ? evidence.rendered_persons
       : Math.max(evidence.rendered_persons, persons.length);
     persons = this._dedupePersons(persons, renderLimit);
-    persons = this._smoothScenePersons(persons, frame);
     const renderedPersons = hasCountEvidence ? evidence.rendered_persons : (persons.length || evidence.rendered_persons);
     const countEvidence = {
       ...evidence,
@@ -1510,8 +1471,6 @@ class Observatory {
           position,
           position_m: position.slice(),
           position_source: 'observatory_layout',
-          pose_source: 'ws_pose',
-          pose: 'standing',
           vitals: {
             ...(br != null ? { breathing_bpm: br } : {}),
             ...(hr != null ? { heart_rate_bpm: hr } : {}),
@@ -1548,7 +1507,7 @@ class Observatory {
     return {
       type: 'sensing_update',
       msg_type: 'sensing_update',
-      source: 'ws_pose',
+      source: 'ws_presence',
       system_status: systemStatus,
       timestamp_ms: this._numberOrNull(rawFrame.timestamp_ms) ?? Date.now(),
       node_count: nodeCount,
@@ -1590,14 +1549,11 @@ class Observatory {
         || this._positionOf(person)
         || null;
       if (!position) return null;
-      const keypointsM = this._transformMetricKeypoints(person.keypoints_m);
-      const scenePerson = {
+      return this._presencePerson({
         ...person,
         position,
         ...(person.position_m ? { position_m: position } : {}),
-        ...(keypointsM ? { keypoints_m: keypointsM } : {}),
-      };
-      return this._snapToSleepBed(data, scenePerson);
+      }, index);
     }).filter(Boolean);
     let evidence = this._countEvidence({ ...data, persons });
     const hasCountEvidence = Boolean(data.count_evidence && typeof data.count_evidence === 'object');
@@ -1624,52 +1580,34 @@ class Observatory {
     };
   }
 
-  _transformMetricKeypoints(source) {
-    if (!Array.isArray(source) || source.length < 17) return null;
-    const points = [];
-    for (const kp of source.slice(0, 17)) {
-      const raw = this._parseVector3(kp);
-      if (!raw) return null;
-      points.push([
-        raw[0] - this._sensorOrigin[0],
-        raw[1],
-        raw[2] - this._sensorOrigin[2],
-      ]);
-    }
-    return points;
-  }
-
   _upsertDevice(key, kind, label, position, active) {
+    if (kind === 'node') return null;
     this._ensureTopologyGroups();
     let entry = this._deviceMeshes.get(key);
     if (!entry) {
       const group = new THREE.Group();
-      const color = kind === 'ap' ? C.blueSignal : C.greenGlow;
-      const bodyGeo = kind === 'ap'
-        ? new THREE.BoxGeometry(0.54, 0.16, 0.34)
-        : new THREE.CylinderGeometry(0.11, 0.11, 0.32, 16);
+      const color = C.blueSignal;
+      const bodyGeo = new THREE.BoxGeometry(0.54, 0.16, 0.34);
       const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
       const body = new THREE.Mesh(bodyGeo, mat);
       body.castShadow = true;
       group.add(body);
 
-      if (kind === 'ap') {
-        for (let i = -1; i <= 1; i++) {
-          const ant = new THREE.Mesh(
-            new THREE.CylinderGeometry(0.012, 0.012, 0.38, 8),
-            new THREE.MeshBasicMaterial({ color: 0x9fb6c8, transparent: true, opacity: 0.75 })
-          );
-          ant.position.set(i * 0.16, 0.28, 0);
-          ant.rotation.z = i * 0.18;
-          group.add(ant);
-        }
+      for (let i = -1; i <= 1; i++) {
+        const ant = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.012, 0.012, 0.38, 8),
+          new THREE.MeshBasicMaterial({ color: 0x9fb6c8, transparent: true, opacity: 0.75 })
+        );
+        ant.position.set(i * 0.16, 0.28, 0);
+        ant.rotation.z = i * 0.18;
+        group.add(ant);
       }
 
       const beacon = new THREE.Mesh(
-        new THREE.SphereGeometry(kind === 'ap' ? 0.055 : 0.045, 16, 12),
+        new THREE.SphereGeometry(0.055, 16, 12),
         new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1 })
       );
-      beacon.position.y = kind === 'ap' ? 0.2 : 0.23;
+      beacon.position.y = 0.2;
       group.add(beacon);
 
       this._topologyGroup.add(group);
@@ -1680,6 +1618,7 @@ class Observatory {
     entry.mat.opacity = active ? 0.9 : 0.28;
     entry.beacon.material.opacity = active ? 1 : 0.28;
     entry.group.visible = true;
+    return entry;
   }
 
   _upsertLink(key, from, to, active, collision = null) {
@@ -1904,9 +1843,10 @@ class Observatory {
       return;
     }
     const nodes = this._mergeNodes(liveData);
+    this._syncNodeObjects({ ...liveData, nodes });
     this._recomputeSceneFrame(env, nodes);
     this._frameCameraToSensors();
-    const nodeById = new Map(nodes.map(n => [Number(n.node_id), n]));
+    const nodeById = new Map(nodes.map(n => [Number(n.node_id ?? n.id), n]));
     const apById = new Map((env.access_points || []).map(ap => [ap.ap_id, ap]));
     const visibleDevices = new Set();
     const visibleLinks = new Set();
@@ -1927,17 +1867,13 @@ class Observatory {
     }
 
     for (const node of nodes) {
+      const id = this._nodeIdOf(node);
+      if (id == null) continue;
       const status = String(node.health_status || node.status || (node.active === false ? 'offline' : 'live')).toLowerCase();
       const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(status);
-      const position = this._positionOf(node);
+      const position = this._nodeObjectPosition(id) || this._scenePositionForNode(id, node);
       if (!position) continue;
-      const key = `node:${node.node_id}`;
-      visibleDevices.add(key);
-      this._upsertDevice(key, 'node', node.display_label || node.label || `C6-${node.node_id}`, position, active);
-      visibleCoverage.add(key);
-      const band = this._coverageBand(node, apById, env);
-      const coverageVisible = active || ['stale', 'sync_only'].includes(status);
-      this._upsertCoverage(key, position, active, coverageVisible, band, this._coverageRangeHint(node, position, apById, env));
+      const key = `node:${id}`;
       this._ensureWaveSource(key, position, active, 0.55);
     }
 
@@ -1949,7 +1885,7 @@ class Observatory {
       const active = node.active !== false && !['offline', 'stale', 'sync_only'].includes(nodeStatus);
       const key = link.link_id || `${link.ap_id}:c6-${link.node_id}`;
       const from = this._positionOf(ap);
-      const to = this._positionOf(node);
+      const to = this._nodeObjectPosition(Number(link.node_id)) || this._scenePositionForNode(Number(link.node_id), node);
       if (!from || !to) continue;
       visibleLinks.add(key);
       const collision = active ? this._detectLinkCollision(from, to, collisionTargets) : null;
@@ -2129,17 +2065,7 @@ class Observatory {
 
   _applyColors() {
     const wc = new THREE.Color(this.settings.wireColor);
-    const jc = new THREE.Color(this.settings.jointColor);
-    this._figurePool?.applyColors(wc, jc);
     if (this._mistPoints) this._mistPoints.material.uniforms.uColor.value.copy(wc);
-  }
-
-  _ensureFigurePool(data) {
-    if (!this._figurePool && Array.isArray(data?.persons) && data.persons.length) {
-      this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
-      this._applyColors();
-    }
-    return this._figurePool;
   }
 
   // ---- WebSocket live data ----
@@ -2163,7 +2089,7 @@ class Observatory {
     this._currentData = null;
     this._lastLiveAt = 0;
     this._currentScenario = null;
-    this._personMotionFilters.clear();
+    this._personPositions.clear();
     this._syncRoomConfigNodes(null);
     this._updatePresenceSilhouettes(null, 0);
     this._clearTopology();
@@ -2213,7 +2139,6 @@ class Observatory {
     // Updates
     this._nebula?.update(dt, elapsed);
     this._updateScenarioProps(data);
-    this._ensureFigurePool(data)?.update(data, elapsed);
     this._updateDotMatrixMist(data, elapsed);
     this._updateParticleTrail(data, dt, elapsed);
     this._syncTopology(data);
@@ -2268,12 +2193,10 @@ class Observatory {
     const pp = persons[0].position_m || persons[0].position;
     if (!pp) return;
     const px = pp[0], pz = pp[2];
-    const ms = persons[0].motion_score || 0;
-    const pose = persons[0].pose || 'standing';
-    const isLying = pose === 'lying' || pose === 'fallen';
-    const bodyH = isLying ? 0.4 : 1.7;
-    const bodyBaseY = isLying ? pp[1] + 0.05 : Math.max(0.05, pp[1]);
-    const spread = ms > 50 ? 0.6 : 0.4;
+    const motionEnergy = Math.max(0, Math.min(1, Number(persons[0].motion_energy ?? persons[0].motion_score / 100) || 0));
+    const bodyH = 1.7;
+    const bodyBaseY = Math.max(0.05, pp[1]);
+    const spread = motionEnergy > 0.1 ? 0.6 : 0.4;
 
     for (let i = 0; i < this._mistCount; i++) {
       const drift = Math.sin(elapsed * 0.5 + i * 0.1) * 0.003;
@@ -2281,12 +2204,7 @@ class Observatory {
       const layerT = (i % 20) / 20;
       const layerY = bodyBaseY + layerT * bodyH;
 
-      let bodyWidth;
-      if (isLying) {
-        bodyWidth = 0.25;
-      } else {
-        bodyWidth = layerT > 0.75 ? 0.15 : (layerT > 0.45 ? 0.25 : 0.18);
-      }
+      const bodyWidth = layerT > 0.75 ? 0.15 : (layerT > 0.45 ? 0.25 : 0.18);
       const r = bodyWidth * (0.5 + 0.5 * Math.sin(i * 1.7 + elapsed * 0.3)) * spread;
 
       const tx = px + Math.cos(angle + i * 0.3) * r + drift;
@@ -2424,7 +2342,7 @@ window.__ruvsenseObservatoryTestApi = {
   ingestFrame: (frame) => observatory._ingestSocketFrame(frame),
   normalizeFrame: (frame) => observatory._normalizeSensingFrame(frame),
   sceneFrameData: (frame) => observatory._sceneFrameData(observatory._normalizeSensingFrame(frame)),
-  resetSmoothing: () => observatory._personMotionFilters.clear(),
+  resetSmoothing: () => observatory._personPositions.clear(),
   setEnvironment: (env) => {
     observatory._environment = env;
     observatory._syncRoomGeometry(env);
@@ -2437,9 +2355,10 @@ window.__ruvsenseObservatoryTestApi = {
     radius_x: entry.group.scale.x,
     radius_z: entry.group.scale.z,
   })),
-  motionSnapshot: () => Array.from(observatory._personMotionFilters.entries()).map(([id, filter]) => ({
+  motionSnapshot: () => Array.from(observatory._personPositions.entries()).map(([id, filter]) => ({
     id,
-    position: filter.position.slice(),
-    at: filter.at,
+    history: filter.history.map((point) => ({ ...point })),
+    displayed: { ...filter.displayed },
+    target: { ...filter.target },
   })),
 };

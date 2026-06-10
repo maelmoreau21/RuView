@@ -155,6 +155,40 @@ function fmtPct(value) {
   return Number.isFinite(n) ? `${Math.round(n * 100)}%` : '--';
 }
 
+function confidencePercentValue(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) continue;
+    const normalized = n > 1 ? n / 100 : n;
+    return Math.round(clamp(normalized, 0, 1) * 100);
+  }
+  return null;
+}
+
+function fmtConfidence(value) {
+  return value == null ? '--' : `${value}%`;
+}
+
+function confidenceDots(value) {
+  if (value == null) return '○○○○○';
+  const filled = Math.max(0, Math.min(5, Math.round(value / 20)));
+  return `${'●'.repeat(filled)}${'○'.repeat(5 - filled)}`;
+}
+
+function approximatePersonLabel(value) {
+  const n = Math.max(0, Math.round(Number(value) || 0));
+  if (n <= 0) return '0';
+  return `~${n} ${n > 1 ? 'personnes' : 'personne'}`;
+}
+
+function activityLevelFromMotionEnergy(person) {
+  const value = activityValue(person);
+  if (value == null) return '--';
+  if (value < 10) return 'LOW';
+  if (value < 45) return 'MEDIUM';
+  return 'HIGH';
+}
+
 function fmtMeters(value) {
   const n = Number(value);
   return Number.isFinite(n) ? `${n.toFixed(n >= 10 ? 1 : 2)} m` : '--';
@@ -709,18 +743,6 @@ function renderCoverageLayers(stage, nodes) {
   setText('dead-zone-summary', weak ? `${weak} weak link(s)` : nodes.length ? 'dead zones none obvious' : 'dead zones --');
 }
 
-function normalizePoseName(value) {
-  const raw = String(value || '').toLowerCase();
-  if (!raw) return '';
-  if (raw.includes('lying') || raw.includes('supine') || raw.includes('prone')) return 'lying';
-  if (raw.includes('sit')) return 'sitting';
-  if (raw.includes('fall') || raw.includes('fallen')) return 'fallen';
-  if (raw.includes('walk') || raw.includes('motion')) return 'walking';
-  if (raw.includes('crouch')) return 'crouching';
-  if (raw.includes('stand')) return 'standing';
-  return raw;
-}
-
 function vectorPosition(value) {
   if (Array.isArray(value) && value.length >= 3) {
     return { x: Number(value[0]) || 0, y: Number(value[1]) || 0, z: Number(value[2]) || 0 };
@@ -900,7 +922,6 @@ function primaryPerson() {
       confidence: loc.confidence,
       position_m: [loc.x, 0, loc.y],
       position_source: 'rssi_localization',
-      pose: 'person',
     };
   }
   const count = Number(state.latest?.count_evidence?.rendered_persons ?? state.latest?.estimated_persons ?? 0);
@@ -909,7 +930,6 @@ function primaryPerson() {
       id: 'inferred',
       confidence: state.latest?.classification?.confidence ?? 0.35,
       position_source: 'count_evidence',
-      pose: state.latest?.posture || 'standing',
     };
   }
   return null;
@@ -924,12 +944,12 @@ function renderPersonEstimate(stage) {
   const rawPos = vectorPosition(person.position_m) || vectorPosition(person.position) || { x: 0, y: 0, z: 0 };
   const p = pointToStage(rawPos);
   const confidence = Number(person.confidence ?? state.latest?.classification?.confidence ?? 0.35);
-  const source = text(person.position_source || person.pose_source, 'estimated');
+  const source = text(person.position_source, 'estimated');
   const marker = create('div', `person-estimate ${source === 'count_evidence' || source === 'observatory_layout' ? 'is-uncertain' : ''}`);
   marker.style.left = `${p.left}%`;
   marker.style.top = `${p.top}%`;
   marker.title = `person ${source} confidence ${fmtPct(confidence)}`;
-  marker.append(create('i'), create('span', '', normalizePoseName(person.pose || person.posture || state.latest?.posture) || 'person'));
+  marker.append(create('i'), create('span', '', 'Zone'));
   const uncertainty = create('div', 'person-uncertainty');
   const radius = clamp((1 - (Number.isFinite(confidence) ? confidence : 0.35)) * 36 + 16, 18, 56);
   uncertainty.style.left = `${p.left}%`;
@@ -1249,7 +1269,7 @@ function drawCanvasFooter(ctx, width, height, geometry, persons) {
   ctx.fillText(`${scaleMeters} m`, scaleX + scaleWidth / 2, scaleY - 7);
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
-  ctx.fillText(`Personnes detectees: ${detected}`, 14, height - 12);
+  ctx.fillText(`Personnes detectees: ${approximatePersonLabel(detected)}`, 14, height - 12);
   ctx.textAlign = 'right';
   ctx.fillText(`${geometry.config.width.toFixed(1)} m x ${geometry.config.depth.toFixed(1)} m`, width - 14, height - 12);
   ctx.restore();
@@ -1689,7 +1709,6 @@ function detectedPersons() {
   const count = Math.max(base.length, reportedCount);
   return Array.from({ length: count }, (_, index) => base[index] || {
     id: `detected_${index + 1}`,
-    pose: index === 0 ? state.latest?.posture : undefined,
     confidence: state.latest?.classification?.confidence,
     position_source: 'count_evidence',
   });
@@ -1894,7 +1913,6 @@ function renderVitalsDashboard() {
   const persons = firstDefined(state.latest?.count_evidence?.rendered_persons, state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
   const loc = locationPerson();
   const person = primaryPerson();
-  const posture = normalizePoseName(firstDefined(person?.pose, person?.posture, state.latest?.posture, state.pose?.posture));
   const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, edgeVitals.breathing_rate_bpm, vitals.breathing_rate_bpm);
   const heart = firstDefined(latestVitals.heart_rate_bpm, edge.heartrate_bpm, edgeVitals.heartrate_bpm, vitals.heart_rate_bpm);
   const quality = firstDefined(latestVitals.signal_quality, edge.presence_score, edgeVitals.presence_score, vitals.signal_quality);
@@ -1902,12 +1920,12 @@ function renderVitalsDashboard() {
   const cards = $('#vitals-person-cards');
   const timestamp = Date.now();
 
-  setText('presence-state', presence ? 'prÃ©sence' : 'absent');
-  setText('person-count', String(Math.max(Number(persons || 0), people.length)));
+  setText('presence-state', presence ? 'presence' : 'absent');
+  setText('person-count', approximatePersonLabel(Math.max(Number(persons || 0), people.length)));
   setText('motion-level', text(motion, 'unknown'));
-  setText('location-vitals', loc ? `x ${loc.x.toFixed(2)} / y ${loc.y.toFixed(2)} / ${fmtPct(loc.confidence)}` : '--');
-  setText('posture-state', state.vitalsOptIn ? text(posture, '--') : 'masquee');
-  setText('breathing-rate', state.vitalsOptIn && breathing ? `${Number(breathing).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
+  setText('location-vitals', loc ? 'Zone approximative' : '--');
+  setText('posture-state', activityLevelFromMotionEnergy(person || people[0]));
+  setText('breathing-rate', breathing ? `${Number(breathing).toFixed(1)} rpm` : '--');
   setText('heart-rate', state.vitalsOptIn && heart ? `${Number(heart).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
   setText('signal-quality', fmtPct(quality));
   clear(cards);
@@ -1920,15 +1938,23 @@ function renderVitalsDashboard() {
     const id = personKey(item, index);
     const label = text(item.display_label || item.label || item.name || item.id || item.track_id, `Personne ${index + 1}`);
     const sources = personMetricSources(item, index);
-    const breathingValue = state.vitalsOptIn
-      ? firstMetric(['breathing_rate_bpm', 'breathing_bpm', 'breathing_rate', 'respiration_bpm', 'br'], sources)
-      : null;
+    const breathingValue = firstMetric(['breathing_rate_bpm', 'breathing_bpm', 'breathing_rate', 'respiration_bpm', 'br'], sources);
     const heartValue = state.vitalsOptIn
       ? firstMetric(['heart_rate_bpm', 'heartrate_bpm', 'hr_proxy_bpm', 'heart_rate', 'hr'], sources)
       : null;
     const activity = activityValue(item);
     const activityPct = activity == null ? 0 : activity;
     const status = breathingStatus(id, breathingValue, timestamp);
+    const presenceConfidence = confidencePercentValue(
+      item?.confidence,
+      item?.tracking_confidence,
+      item?.presence_confidence,
+      state.latest?.classification?.confidence,
+    );
+    const breathingConfidence = confidencePercentValue(
+      firstMetric(['breathing_confidence', 'respiration_confidence', 'signal_quality', 'confidence'], sources),
+      state.latest?.classification?.confidence,
+    );
 
     rememberBreathing(id, breathingValue, timestamp);
 
@@ -1939,6 +1965,20 @@ function renderVitalsDashboard() {
       create('span', `breathing-status ${status.className}`, status.label),
     );
 
+    const confidenceRows = create('div', 'person-confidence-lines');
+    const presenceRow = create('div', 'person-confidence-line');
+    presenceRow.append(
+      create('span', '', 'Présence'),
+      create('strong', '', `${fmtConfidence(presenceConfidence)} ${confidenceDots(presenceConfidence)}`),
+    );
+    const zoneRow = create('div', 'person-confidence-line');
+    zoneRow.append(create('span', '', 'Zone'), create('strong', '', 'approximative'));
+    const respirationRow = create('div', 'person-confidence-line');
+    respirationRow.append(
+      create('span', '', 'Respiration'),
+      create('strong', '', `${breathingValue == null ? '--' : Math.round(breathingValue)} rpm (confiance ${fmtConfidence(breathingConfidence)})`),
+    );
+    confidenceRows.append(presenceRow, zoneRow, respirationRow);
     const breathRow = create('div', 'breathing-readout');
     const breathValue = create('span', 'breathing-value', breathingValue == null ? '--' : breathingValue.toFixed(1));
     const breathUnit = create('span', 'breathing-unit', 'rpm');
@@ -1966,7 +2006,7 @@ function renderVitalsDashboard() {
       create('span', 'activity-percent', activity == null ? '--' : `${Math.round(activityPct)}`),
     );
 
-    card.append(head, breathRow, heartRow, activityRow);
+    card.append(head, confidenceRows, breathRow, heartRow, activityRow);
     cards?.append(card);
     drawMiniSparkline(sparkline, state.breathingHistory.get(id) || []);
   });
@@ -2001,30 +2041,6 @@ function publishSharedState(reason = 'update') {
 
 function renderVitals() {
   renderVitalsDashboard();
-  return;
-  const vitals = state.vitals?.vital_signs || state.vitals || {};
-  const edgeVitals = state.edgeVitals?.edge_vitals || {};
-  const latestVitals = state.latest?.vital_signs || {};
-  const edge = String(state.latest?.type || '').includes('vitals') ? state.latest : {};
-  const presence = firstDefined(state.latest?.classification?.presence, edge.presence, false);
-  const motion = firstDefined(state.latest?.classification?.motion_level, edge.motion ? 'motion' : undefined, 'unknown');
-  const persons = firstDefined(state.latest?.count_evidence?.rendered_persons, state.latest?.estimated_persons, edge.n_persons, edgeVitals.n_persons, 0);
-  const loc = locationPerson();
-  const person = primaryPerson();
-  const posture = normalizePoseName(firstDefined(person?.pose, person?.posture, state.latest?.posture, state.pose?.posture));
-  const breathing = firstDefined(latestVitals.breathing_rate_bpm, edge.breathing_rate_bpm, edgeVitals.breathing_rate_bpm, vitals.breathing_rate_bpm);
-  const heart = firstDefined(latestVitals.heart_rate_bpm, edge.heartrate_bpm, edgeVitals.heartrate_bpm, vitals.heart_rate_bpm);
-  const quality = firstDefined(latestVitals.signal_quality, edge.presence_score, edgeVitals.presence_score, vitals.signal_quality);
-
-  setText('presence-state', presence ? 'présence' : 'absent');
-  setText('person-count', String(persons || 0));
-  setText('motion-level', text(motion, 'unknown'));
-  setText('location-vitals', loc ? `x ${loc.x.toFixed(2)} / y ${loc.y.toFixed(2)} / ${fmtPct(loc.confidence)}` : '--');
-  setText('posture-state', state.vitalsOptIn ? text(posture, '--') : 'masquee');
-  setText('breathing-rate', state.vitalsOptIn && breathing ? `${Number(breathing).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
-  setText('heart-rate', state.vitalsOptIn && heart ? `${Number(heart).toFixed(1)} bpm` : state.vitalsOptIn ? '--' : 'masquee');
-  setText('signal-quality', fmtPct(quality));
-  setText('vitals-status', state.vitalsOptIn ? breathing || heart || presence ? 'live' : 'attente' : 'opt-in off');
 }
 
 function recordCalibrationEvent(message, level = 'info') {

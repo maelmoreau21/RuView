@@ -83,6 +83,40 @@ function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
+function confidencePercent(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) continue;
+    const normalized = n > 1 ? n / 100 : n;
+    return Math.round(Math.max(0, Math.min(1, normalized)) * 100);
+  }
+  return null;
+}
+
+function confidenceText(percent) {
+  return percent == null ? '--' : `${percent}%`;
+}
+
+function confidenceDots(percent) {
+  if (percent == null) return '○○○○○';
+  const filled = Math.max(0, Math.min(5, Math.round(percent / 20)));
+  return `${'●'.repeat(filled)}${'○'.repeat(5 - filled)}`;
+}
+
+function approximatePersonCount(count) {
+  const n = Math.max(0, Math.round(Number(count) || 0));
+  if (n <= 0) return '0';
+  return `~${n} ${n > 1 ? 'personnes' : 'personne'}`;
+}
+
+function firstFinite(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 // ---- HudController class ----
 
 export class HudController {
@@ -279,7 +313,7 @@ export class HudController {
   }
 
   setObjectDetection(enabled) {
-    this._obs.settings.obstacles = Boolean(enabled);
+    this._obs.settings.obstacles = false;
     this._syncObjectDetectionToggles();
     this._obs._refreshObstacleMode();
     this.updateObstacleAttenuation();
@@ -287,10 +321,13 @@ export class HudController {
   }
 
   _syncObjectDetectionToggles() {
-    const enabled = Boolean(this._obs.settings.obstacles);
+    this._obs.settings.obstacles = false;
     for (const id of ['opt-obstacles', 'object-detection-toggle']) {
       const toggle = document.getElementById(id);
-      if (toggle) toggle.checked = enabled;
+      if (toggle) {
+        toggle.checked = false;
+        toggle.disabled = true;
+      }
     }
   }
 
@@ -316,7 +353,7 @@ export class HudController {
     const roomEl = document.getElementById('opt-room');
     if (roomEl) { roomEl.checked = obs.settings.room; obs._roomWire.visible = obs.settings.room; }
     const obstaclesEl = document.getElementById('opt-obstacles');
-    if (obstaclesEl) { this._syncObjectDetectionToggles(); obs._refreshObstacleMode(); }
+    if (obstaclesEl) { obs.settings.obstacles = false; this._syncObjectDetectionToggles(); obs._refreshObstacleMode(); }
     document.getElementById('opt-wire-color').value = obs.settings.wireColor;
     document.getElementById('opt-joint-color').value = obs.settings.jointColor;
     obs._applyPostSettings();
@@ -369,7 +406,10 @@ export class HudController {
       this._setText('var-value', '--');
       this._setText('motion-value', '--');
       this._setText('attenuation-value', '--');
-      this._updatePersonDots(0, { label: '0', title: 'Aucune trame WebSocket live' });
+      this._setText('zone-confidence-value', 'Zone : approximative');
+      this._setText('presence-confidence-value', 'Présence : -- ○○○○○');
+      this._setText('respiration-confidence-value', 'Respiration : -- rpm (confiance --)');
+      this._updatePersonDots(0, { label: approximatePersonCount(0), title: 'Aucune trame WebSocket live' });
       const presEl = document.getElementById('presence-indicator');
       const presLabel = document.getElementById('presence-label');
       if (presEl) {
@@ -382,6 +422,9 @@ export class HudController {
     const vs = data.vital_signs || {};
     const feat = data.features || {};
     const cls = data.classification || {};
+    const primaryPerson = Array.isArray(data.persons)
+      ? data.persons.find(person => person?.is_present !== false)
+      : null;
 
     const targetHr = vs.heart_rate_bpm || 0;
     const targetBr = vs.breathing_rate_bpm || 0;
@@ -418,6 +461,31 @@ export class HudController {
     this._setText('var-value', (feat.variance || 0).toFixed(2));
     this._setText('motion-value', (feat.motion_band_power || 0).toFixed(3));
     this.updateObstacleAttenuation();
+    const presencePercent = confidencePercent(
+      primaryPerson?.confidence,
+      primaryPerson?.presence_confidence,
+      primaryPerson?.tracking_confidence,
+      cls.confidence,
+    );
+    const breathingValue = firstFinite(
+      primaryPerson?.breathing_bpm,
+      primaryPerson?.vitals?.breathing_bpm,
+      primaryPerson?.vital_signs?.breathing_rate_bpm,
+      vs.breathing_rate_bpm,
+    );
+    const breathingPercent = confidencePercent(
+      primaryPerson?.breathing_confidence,
+      primaryPerson?.respiration_confidence,
+      vs.breathing_confidence,
+      vs.signal_quality,
+      cls.confidence,
+    );
+    this._setText('zone-confidence-value', 'Zone : approximative');
+    this._setText('presence-confidence-value', `Présence : ${confidenceText(presencePercent)} ${confidenceDots(presencePercent)}`);
+    this._setText(
+      'respiration-confidence-value',
+      `Respiration : ${breathingValue == null ? '--' : Math.round(breathingValue)} rpm (confiance ${confidenceText(breathingPercent)})`
+    );
 
     // Mini person-count dots. Prefer the conservative rendered count when the
     // backend provides anti-duplicate evidence.
@@ -429,10 +497,10 @@ export class HudController {
     const ambiguous = Boolean(evidence?.ambiguous || rawCount > personCount);
     this._updatePersonDots(personCount, {
       ambiguous,
-      label: ambiguous && rawCount > personCount ? `${personCount} / raw ${rawCount}` : String(personCount),
+      label: approximatePersonCount(personCount),
       title: ambiguous
-        ? `Ambiguous multipath: raw ${rawCount}, rendered ${personCount}`
-        : `Rendered persons: ${personCount}`,
+        ? 'Comptage approximatif, multipath possible'
+        : 'Comptage approximatif',
     });
 
     const presEl = document.getElementById('presence-indicator');
@@ -446,20 +514,14 @@ export class HudController {
     }
 
     const fallEl = document.getElementById('fall-alert');
-    if (fallEl) fallEl.style.display = cls.fall_detected ? 'block' : 'none';
+    if (fallEl) fallEl.style.display = 'none';
 
     this._updateFleetFromData(data);
     this._refreshOperationalData();
   }
 
   updateObstacleAttenuation() {
-    const attenuation = this._obs.obstacleAttenuation?.();
-    this._setText(
-      'attenuation-value',
-      attenuation
-        ? `Atténuation : ${attenuation.obstacleName}${attenuation.count > 1 ? ` +${attenuation.count - 1}` : ''}`
-        : '--'
-    );
+    this._setText('attenuation-value', '--');
   }
 
   // ============================================================
