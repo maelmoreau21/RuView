@@ -9,6 +9,8 @@
 !ui/**
 !docker/
 !docker/**
+!config/
+!config/**
 !.dockerignore
 
 **/target/
