@@ -93,7 +93,6 @@ export class DashboardTab {
     const statusMsg  = el.querySelector('.status-message');
     const config = {
       'live':              { text: 'ESP32',     status: 'healthy', msg: 'Real hardware connected' },
-      'server-simulated':  { text: 'DEV SIM', status: 'warning', msg: 'Explicit simulation mode enabled' },
       'reconnecting':      { text: 'RECONNECTING', status: 'degraded', msg: 'Attempting to connect...' },
       'offline':           { text: 'OFFLINE',   status: 'unhealthy', msg: 'Waiting for real hardware data' },
     };

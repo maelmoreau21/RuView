@@ -225,9 +225,8 @@ export class SensingTab {
       const dataSource = sensingService.dataSource;
       const bannerConfig = {
         'live':              { text: 'LIVE \u2014 ESP32 HARDWARE',           cls: 'sensing-source-live' },
-        'server-simulated':  { text: 'DEV SIMULATION \u2014 EXPLICIT MODE', cls: 'sensing-source-server-sim' },
         'reconnecting':      { text: 'RECONNECTING...',                    cls: 'sensing-source-reconnecting' },
-        'offline':           { text: 'OFFLINE \u2014 WAITING FOR HARDWARE', cls: 'sensing-source-simulated' },
+        'offline':           { text: 'HORS LIGNE',                         cls: 'sensing-source-offline' },
       };
       const cfg = bannerConfig[dataSource] || bannerConfig.reconnecting;
       banner.textContent = cfg.text;
@@ -270,8 +269,7 @@ export class SensingTab {
     // Details
     this._setText('valDomFreq', (f.dominant_freq_hz || 0).toFixed(3) + ' Hz');
     this._setText('valChangePoints', String(f.change_points || 0));
-    const srcLabel = (data.source === 'simulated' || data.source === 'simulate') ? 'dev-sim' : data.source || 'live';
-    this._setText('valSampleRate', srcLabel);
+    this._setText('valSampleRate', data.source || 'live');
 
     // Sparkline
     this._drawSparkline();

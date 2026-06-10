@@ -1,5 +1,11 @@
 (function () {
-  const API_BASE = 'http://localhost:3000/api/v1/';
+  const fallbackBase = 'http://localhost:3000';
+  const origin = window.location.protocol === 'file:' ? fallbackBase : window.location.origin;
+  window.RUVSENSE_CONFIG = {
+    ...(window.RUVSENSE_CONFIG || {}),
+    api_base: (window.RUVSENSE_CONFIG?.api_base || origin || fallbackBase).replace(/\/$/, ''),
+  };
+  const API_BASE = `${window.RUVSENSE_CONFIG.api_base}/api/v1/`;
 
   function isFileMode() {
     return window.location.protocol === 'file:';

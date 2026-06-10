@@ -9,14 +9,11 @@ import { colors, spacing } from '@/theme';
 import type { ConnectionStatus, SensingFrame } from '@/types/sensing';
 import { LiveHUD } from './LiveHUD';
 
-type LiveMode = 'LIVE' | 'DEV' | 'RSSI' | 'OFFLINE';
+type LiveMode = 'LIVE' | 'RSSI' | 'OFFLINE';
 
 const getMode = (
   status: ConnectionStatus,
-  isSimulated: boolean,
-  frame: SensingFrame | null,
 ): LiveMode => {
-  if (isSimulated || frame?.source === 'simulated') return 'DEV';
   if (status === 'connected') return 'LIVE';
   if (status === 'disconnected') return 'OFFLINE';
   return 'RSSI';
@@ -78,7 +75,7 @@ const NativeLiveViewer = ({ frame, onReady, onFps, onError }: ViewerProps) => {
 };
 
 export const LiveScreen = () => {
-  const { lastFrame, connectionStatus, isSimulated } = usePoseStream();
+  const { lastFrame, connectionStatus } = usePoseStream();
   const [ready, setReady] = useState(false);
   const [fps, setFps] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -91,7 +88,7 @@ export const LiveScreen = () => {
 
   const rssi = lastFrame?.features?.mean_rssi;
   const personCount = lastFrame?.classification?.presence ? 1 : 0;
-  const mode = getMode(connectionStatus, isSimulated, lastFrame);
+  const mode = getMode(connectionStatus);
 
   if (error) {
     return (

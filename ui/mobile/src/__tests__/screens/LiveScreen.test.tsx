@@ -4,9 +4,8 @@ import { ThemeProvider } from '@/theme/ThemeContext';
 
 jest.mock('@/hooks/usePoseStream', () => ({
   usePoseStream: () => ({
-    connectionStatus: 'simulated' as const,
+    connectionStatus: 'disconnected' as const,
     lastFrame: null,
-    isSimulated: true,
   }),
 }));
 

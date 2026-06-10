@@ -475,7 +475,7 @@ export class PoseSystem {
     return base;
   }
 
-  // Point: extended index finger simulation with arm sway
+  // Point: extended index finger gesture with arm sway
 
   _gesturePoint(base, px, pz, gt, intensity) {
     const point = intensity;

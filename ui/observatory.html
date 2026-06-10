@@ -115,7 +115,7 @@
     <div class="observatory-ws-status" aria-live="polite">
       <span id="observatory-header-dot" class="observatory-status-dot" aria-hidden="true"></span>
       <span class="observatory-ws-label">WebSocket</span>
-      <span id="observatory-header-ws-label">OFFLINE</span>
+      <span id="observatory-header-ws-label">HORS LIGNE</span>
     </div>
     <div class="observatory-person-count" aria-live="polite">
       <span class="observatory-person-label">Personnes détectées</span>
@@ -142,7 +142,7 @@
     <div id="status-bar">
       <div id="data-source-badge">
         <span class="dot dot--offline"></span>
-        <span id="data-source-label">OFFLINE</span>
+        <span id="data-source-label">HORS LIGNE</span>
       </div>
       <div id="global-health-badge" class="global-health-badge global-health-badge--normal">NORMAL</div>
       <div id="fps-counter" style="display:none">60 FPS</div>
@@ -431,7 +431,7 @@
         </label>
         <div class="setting-row readonly-row">
           <span>Live stream</span>
-          <span id="live-stream-url">BroadcastChannel ruvsense</span>
+          <span id="live-stream-url">WebSocket /ws/pose</span>
         </div>
         <button id="btn-reset-camera" class="settings-btn">Reset Camera</button>
         <button id="btn-reset-settings" class="settings-btn">Reset to Defaults</button>
@@ -462,6 +462,10 @@
     </div>
   </div>
 
+  <script src="state.js"></script>
+  <script src="api.js"></script>
+  <script src="websocket.js"></script>
+
   <!-- Three.js r160 + addons from CDN -->
   <script type="importmap">
   {
@@ -487,7 +491,7 @@
         const connected = sourceDot?.classList.contains('dot--live') || sourceLabel?.textContent === 'LIVE';
 
         headerDot?.classList.toggle('is-online', Boolean(connected));
-        if (headerStatus) headerStatus.textContent = connected ? 'LIVE' : (sourceLabel?.textContent || 'OFFLINE');
+        if (headerStatus) headerStatus.textContent = connected ? 'LIVE' : (sourceLabel?.textContent || 'HORS LIGNE');
         if (headerPersonCount) headerPersonCount.textContent = personsValue?.textContent?.trim() || '0';
       }
 

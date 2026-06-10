@@ -429,7 +429,7 @@ export class PoseDecoder {
     }
     energy = Math.sqrt(energy);
 
-    // Simulated per-joint refinement magnitude (what WOULD be applied)
+    // Per-joint refinement magnitude (what WOULD be applied)
     const scale = bodyH * 0.015;
     let totalRefinement = 0;
     let maxDimVal = 0;

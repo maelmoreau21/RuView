@@ -17,15 +17,9 @@ describe('ConnectionBanner', () => {
     expect(screen.getByText('DISCONNECTED')).toBeTruthy();
   });
 
-  it('renders DEV SIMULATION text when simulated', () => {
-    renderWithTheme(<ConnectionBanner status="simulated" />);
-    expect(screen.getByText('DEV SIMULATION')).toBeTruthy();
-  });
-
   it('renders without crashing for each status', () => {
-    const statuses: Array<'connected' | 'simulated' | 'disconnected'> = [
+    const statuses: Array<'connected' | 'disconnected'> = [
       'connected',
-      'simulated',
       'disconnected',
     ];
     for (const status of statuses) {

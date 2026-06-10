@@ -4,9 +4,8 @@ import { ThemeProvider } from '@/theme/ThemeContext';
 
 jest.mock('@/hooks/usePoseStream', () => ({
   usePoseStream: () => ({
-    connectionStatus: 'simulated' as const,
+    connectionStatus: 'disconnected' as const,
     lastFrame: null,
-    isSimulated: true,
   }),
 }));
 
@@ -73,34 +72,6 @@ describe('MATScreen', () => {
         <MATScreen />
       </ThemeProvider>,
     );
-    // Simulated status maps to an explicit dev-simulation banner.
-    expect(getByText('DEV SIMULATION')).toBeTruthy();
-  });
-
-  it('shows simulation warning overlay when simulated and not acknowledged', () => {
-    // Reset store to ensure overlay is shown
-    const { useMatStore } = require('@/stores/matStore');
-    useMatStore.setState({ dataSource: 'simulated', simulationAcknowledged: false });
-
-    const { MATScreen } = require('@/screens/MATScreen');
-    const { getByText } = render(
-      <ThemeProvider>
-        <MATScreen />
-      </ThemeProvider>,
-    );
-    expect(getByText('I UNDERSTAND')).toBeTruthy();
-  });
-
-  it('hides overlay after acknowledgment', () => {
-    const { useMatStore } = require('@/stores/matStore');
-    useMatStore.setState({ dataSource: 'simulated', simulationAcknowledged: true });
-
-    const { MATScreen } = require('@/screens/MATScreen');
-    const { queryByText } = render(
-      <ThemeProvider>
-        <MATScreen />
-      </ThemeProvider>,
-    );
-    expect(queryByText('I UNDERSTAND')).toBeNull();
+    expect(getByText('DISCONNECTED')).toBeTruthy();
   });
 });

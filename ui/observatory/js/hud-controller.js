@@ -347,7 +347,7 @@ export class HudController {
     } else if (status === 'degraded') {
       dot.className = 'dot dot--degraded'; label.textContent = 'DEGRADED';
     } else {
-      dot.className = 'dot dot--offline'; label.textContent = 'OFFLINE';
+      dot.className = 'dot dot--offline'; label.textContent = 'HORS LIGNE';
     }
   }
 
@@ -357,6 +357,28 @@ export class HudController {
 
   updateHUD(data) {
     if (!data) return;
+    const status = String(data.system_status || data.source || '').toLowerCase();
+    if (status === 'offline') {
+      this._setText('hr-value', '--');
+      this._setText('br-value', '--');
+      this._setText('conf-value', '--');
+      this._setWidth('hr-bar', 0);
+      this._setWidth('br-bar', 0);
+      this._setWidth('conf-bar', 0);
+      this._setText('rssi-value', '-- dBm');
+      this._setText('var-value', '--');
+      this._setText('motion-value', '--');
+      this._setText('attenuation-value', '--');
+      this._updatePersonDots(0, { label: '0', title: 'Aucune trame WebSocket live' });
+      const presEl = document.getElementById('presence-indicator');
+      const presLabel = document.getElementById('presence-label');
+      if (presEl) {
+        presEl.className = 'presence-state presence--absent';
+        if (presLabel) presLabel.textContent = 'ABSENT';
+      }
+      this._renderFleetPanel({ source: '--', active_nodes: 0, min_nodes: 1, ready: false, nodes: [] });
+      return;
+    }
     const vs = data.vital_signs || {};
     const feat = data.features || {};
     const cls = data.classification || {};

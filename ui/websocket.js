@@ -1,11 +1,12 @@
 (function () {
-  const WS_URL = 'ws://localhost:3000/ws/pose';
   const RECONNECT_MS = 3000;
+  const DEFAULT_API_BASE = 'http://localhost:3000';
   let socket = null;
+  let socketUrl = null;
   let reconnectTimer = null;
-  let probePending = false;
   let stopped = false;
   let configChannel = null;
+  const updateCallbacks = new Set();
 
   function ensureState() {
     if (!window.RS) {
@@ -25,35 +26,17 @@
     return window.RS;
   }
 
-  function dispatchUpdate() {
+  function dispatchUpdate(message = null) {
+    const state = ensureState();
+    updateCallbacks.forEach((callback) => {
+      try {
+        callback(message, state);
+      } catch (error) {
+        console.error('[RuvSenseWS] update callback failed', error);
+      }
+    });
     if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
-      window.dispatchEvent(new window.CustomEvent('rs:update'));
-    }
-  }
-
-  function isFileMode() {
-    return window.location.protocol === 'file:';
-  }
-
-  function probeUrl() {
-    return WS_URL.replace(/^ws:/, 'http:').replace(/\/ws\/pose$/, '/api/v1/version');
-  }
-
-  async function probeBackend() {
-    if (typeof fetch !== 'function' || typeof AbortController === 'undefined') return true;
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 1200);
-    try {
-      await fetch(probeUrl(), {
-        cache: 'no-store',
-        mode: 'no-cors',
-        signal: controller.signal,
-      });
-      return true;
-    } catch {
-      return false;
-    } finally {
-      window.clearTimeout(timeout);
+      window.dispatchEvent(new window.CustomEvent('rs:update', { detail: { message, state } }));
     }
   }
 
@@ -62,72 +45,47 @@
     return Number.isFinite(n) ? n : null;
   }
 
-  function normalizeNodeKey(value) {
-    return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  function normalizeApiBase(apiBase) {
+    const candidate = apiBase || window.RUVSENSE_CONFIG?.api_base || DEFAULT_API_BASE;
+    try {
+      const url = new URL(candidate, DEFAULT_API_BASE);
+      url.pathname = url.pathname.replace(/\/api\/v1\/?$/, '').replace(/\/$/, '');
+      return `${url.protocol}//${url.host}${url.pathname === '/' ? '' : url.pathname}`;
+    } catch {
+      return DEFAULT_API_BASE;
+    }
   }
 
-  function normalizeTimestamp(value) {
-    if (value === undefined || value === null || value === '') return Date.now();
-    if (typeof value === 'number') {
-      if (value > 100000000000) return value;
-      if (value > 1000000000) return value * 1000;
-      return Date.now() - value;
-    }
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : Date.now();
+  function wsUrlFromApiBase(apiBase) {
+    const base = normalizeApiBase(apiBase);
+    if (base.startsWith('ws://') || base.startsWith('wss://')) return `${base.replace(/\/$/, '')}/ws/pose`;
+    const url = new URL(base);
+    const protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${url.host}/ws/pose`;
   }
 
-  function normalizeNode(raw, fallbackId) {
-    if (!raw || typeof raw !== 'object') return null;
-    const id = raw.node_id ?? raw.id ?? raw.name ?? raw.label ?? fallbackId;
-    const lastSeen = raw.last_seen ?? raw.lastSeen ?? raw.last_frame_at ?? raw.age_ms;
-    return {
-      id,
-      node_id: raw.node_id ?? id,
-      label: raw.label || raw.name || `Node ${id}`,
-      rssi: safeNumber(raw.rssi ?? raw.rssi_dbm ?? raw.signal),
-      last_seen: normalizeTimestamp(lastSeen),
-      active: raw.active !== false && raw.status !== 'inactive' && raw.status !== 'offline',
-      x: raw.x ?? raw.position?.x ?? raw.position_m?.[0],
-      y: raw.y ?? raw.position?.y ?? raw.position_m?.[1],
-    };
-  }
-
-  function updateNodes(message) {
-    const state = ensureState();
-    if (message.system_status === 'no_nodes') {
-      state.nodes = {};
-      return;
-    }
-
-    const rawNodes = message.nodes ?? message.node_status ?? message.nodeStatus;
-    if (Array.isArray(rawNodes)) {
-      const next = {};
-      rawNodes.forEach((raw, index) => {
-        const node = normalizeNode(raw, index + 1);
-        if (!node) return;
-        next[normalizeNodeKey(node.id || node.node_id || index + 1)] = node;
-      });
-      state.nodes = next;
-      return;
-    }
-
+  function normalizeNodeList(message) {
+    if (Array.isArray(message.nodes)) return message.nodes;
+    const rawNodes = message.node_status ?? message.nodeStatus;
+    if (Array.isArray(rawNodes)) return rawNodes;
     if (rawNodes && typeof rawNodes === 'object') {
-      const next = {};
-      Object.entries(rawNodes).forEach(([key, raw]) => {
-        const node = normalizeNode(raw, key);
-        if (!node) return;
-        next[normalizeNodeKey(key)] = node;
-        next[normalizeNodeKey(node.id)] = node;
-      });
-      state.nodes = next;
-      return;
+      return Object.entries(rawNodes).map(([key, node]) => ({
+        ...(node && typeof node === 'object' ? node : {}),
+        id: node?.id ?? node?.node_id ?? key,
+        node_id: node?.node_id ?? node?.id ?? key,
+      }));
     }
-
     if (message.node_id || message.rssi || message.rssi_dbm) {
-      const node = normalizeNode(message, message.node_id || message.id || 'node');
-      if (node) state.nodes[normalizeNodeKey(node.id || node.node_id)] = node;
+      return [message];
     }
+    return [];
+  }
+
+  function normalizeNodeMessage(message) {
+    return {
+      ...message,
+      nodes: normalizeNodeList(message),
+    };
   }
 
   function normalizePerson(raw, index) {
@@ -138,6 +96,7 @@
     const breathing = safeNumber(raw.breathing_bpm ?? raw.breathing_rate_bpm ?? raw.respiration_bpm ?? raw.vitals?.breathing_bpm);
     const motion = safeNumber(raw.motion_energy ?? raw.activity ?? raw.motion);
     return {
+      ...raw,
       id: raw.id ?? raw.person_id ?? raw.track_id ?? index + 1,
       x,
       y,
@@ -150,8 +109,9 @@
   function updatePersons(message) {
     const state = ensureState();
     const rawPersons = message.persons ?? message.people ?? message.detections ?? message.poses;
-    if (!Array.isArray(rawPersons)) return;
-    state.persons = rawPersons.map(normalizePerson).filter(Boolean);
+    state.persons = Array.isArray(rawPersons)
+      ? rawPersons.map(normalizePerson).filter(Boolean)
+      : [];
     state.persons.forEach((person) => {
       if (person.breathing_bpm === null || person.breathing_bpm === undefined) return;
       const id = String(person.id);
@@ -207,6 +167,16 @@
     });
   }
 
+  function markOffline() {
+    const state = ensureState();
+    state.connected = false;
+    state.persons = [];
+    Object.keys(state.nodes).forEach((id) => {
+      state.nodes[id].active = false;
+    });
+    dispatchUpdate(null);
+  }
+
   function handleMessage(event) {
     let message = null;
     try {
@@ -216,73 +186,77 @@
     }
     if (!message || typeof message !== 'object') return;
 
-    ensureState().connected = true;
-    updateNodes(message);
-    updatePersons(message);
-    updateSystem(message);
-    updateAlerts(message);
-    dispatchUpdate();
+    const normalized = normalizeNodeMessage(message);
+    const state = ensureState();
+    state.connected = true;
+    if (typeof state.updateNodeStatus === 'function') {
+      state.updateNodeStatus(normalized);
+    }
+    updatePersons(normalized);
+    updateSystem(normalized);
+    updateAlerts(normalized);
+    dispatchUpdate(normalized);
   }
 
   function scheduleReconnect() {
-    if (stopped || reconnectTimer || isFileMode()) return;
+    if (stopped || reconnectTimer || !socketUrl) return;
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null;
-      connect();
+      connect(window.RUVSENSE_CONFIG?.api_base);
     }, RECONNECT_MS);
   }
 
-  function connect() {
-    if (stopped || isFileMode() || socket) {
-      dispatchUpdate();
-      return;
-    }
-    ensureState();
-
-    if (probePending) return;
-    probePending = true;
-    void probeBackend().then((reachable) => {
-      probePending = false;
-      if (stopped || socket) return;
-      if (!reachable) {
-        ensureState().connected = false;
-        dispatchUpdate();
-        scheduleReconnect();
-        return;
-      }
-      openSocket();
-    });
-  }
-
-  function openSocket() {
+  function openSocket(url) {
     try {
-      socket = new WebSocket(WS_URL);
+      socket = new WebSocket(url);
     } catch {
       socket = null;
-      ensureState().connected = false;
-      dispatchUpdate();
+      markOffline();
       scheduleReconnect();
       return;
     }
 
     socket.addEventListener('open', () => {
       ensureState().connected = true;
-      dispatchUpdate();
+      dispatchUpdate(null);
     });
 
     socket.addEventListener('message', handleMessage);
 
     socket.addEventListener('close', () => {
       socket = null;
-      ensureState().connected = false;
-      dispatchUpdate();
+      markOffline();
       scheduleReconnect();
     });
 
     socket.addEventListener('error', () => {
-      ensureState().connected = false;
-      dispatchUpdate();
+      markOffline();
     });
+  }
+
+  function connect(apiBase) {
+    stopped = false;
+    const url = wsUrlFromApiBase(apiBase);
+    window.RUVSENSE_CONFIG = {
+      ...(window.RUVSENSE_CONFIG || {}),
+      api_base: normalizeApiBase(apiBase),
+    };
+
+    if (socket && socketUrl === url) {
+      dispatchUpdate(null);
+      return;
+    }
+
+    if (reconnectTimer) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (socket) {
+      socket.close();
+      socket = null;
+    }
+    socketUrl = url;
+    openSocket(url);
   }
 
   function disconnect() {
@@ -291,8 +265,14 @@
     reconnectTimer = null;
     if (socket) socket.close();
     socket = null;
-    ensureState().connected = false;
-    dispatchUpdate();
+    markOffline();
+  }
+
+  function onUpdate(callback) {
+    if (typeof callback !== 'function') return () => {};
+    updateCallbacks.add(callback);
+    callback(null, ensureState());
+    return () => updateCallbacks.delete(callback);
   }
 
   async function reloadRoomConfig() {
@@ -305,7 +285,7 @@
       const state = ensureState();
       state.room_config = config || state.room_config;
       if (config) state.room_config_source = 'file';
-      dispatchUpdate();
+      dispatchUpdate(null);
     }
   }
 
@@ -313,16 +293,17 @@
     if (typeof window.BroadcastChannel !== 'function' || configChannel) return;
     configChannel = new window.BroadcastChannel('ruvsense-config');
     configChannel.addEventListener('message', (event) => {
-      if (event.data?.type !== 'config_updated') return;
+      if (event.data?.type !== 'config_updated' && event.data?.type !== 'settings_updated') return;
       void reloadRoomConfig();
     });
   }
 
-  window.RSWebSocket = {
+  window.RuvSenseWS = {
     connect,
     disconnect,
+    onUpdate,
   };
+  window.RSWebSocket = window.RuvSenseWS;
 
   bindConfigChannel();
-  connect();
 })();

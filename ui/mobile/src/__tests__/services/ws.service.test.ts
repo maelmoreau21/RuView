@@ -100,7 +100,7 @@ describe('WsService', () => {
   });
 
   describe('connection loss', () => {
-    it('reports disconnected instead of simulated when the socket closes unexpectedly', () => {
+    it('reports disconnected when the socket closes unexpectedly', () => {
       const OrigWebSocket = globalThis.WebSocket;
       let socket: any = null;
 
@@ -145,7 +145,7 @@ describe('WsService', () => {
       ws.disconnect();
     });
 
-    it('does not emit simulated frames when disconnected', () => {
+    it('does not emit frames when disconnected', () => {
       const ws = createWsService();
       const listener = jest.fn();
       ws.subscribe(listener);

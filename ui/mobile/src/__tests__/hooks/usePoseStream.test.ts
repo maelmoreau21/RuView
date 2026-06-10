@@ -34,7 +34,6 @@ describe('usePoseStream', () => {
     const state = usePoseStore.getState();
     expect(state).toHaveProperty('connectionStatus');
     expect(state).toHaveProperty('lastFrame');
-    expect(state).toHaveProperty('isSimulated');
   });
 
   it('wsService.subscribe is callable', () => {

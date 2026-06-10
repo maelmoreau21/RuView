@@ -288,7 +288,7 @@
         if (nodeState.active === false) return false;
         const seenAt = lastSeenMs(nodeState);
         if (seenAt == null) return Boolean(nodeState.active);
-        return Date.now() - seenAt < 30000;
+        return Date.now() - seenAt <= 10000;
       }
 
       function lastSeenMs(nodeState) {
@@ -316,9 +316,7 @@
         const seenAt = lastSeenMs(nodeState);
         if (seenAt == null) return 'is-red';
         const age = Date.now() - seenAt;
-        if (age < 5000) return 'is-green';
-        if (age < 30000) return 'is-orange';
-        return 'is-red';
+        return nodeState?.active === true && age <= 10000 ? 'is-green' : 'is-red';
       }
 
       function rssiSegments(rssi) {
@@ -341,15 +339,9 @@
         return numeric ? `N${numeric}` : String(id || `N${entry.index + 1}`);
       }
 
-      function isFreshNode(nodeState) {
-        const seenAt = lastSeenMs(nodeState);
-        return seenAt != null && Date.now() - seenAt < 5000;
-      }
-
       function nodeIndicatorClass(entry, nodeState) {
-        if (!entry.configured) return 'is-orange';
         if (!nodeState) return 'is-red';
-        return freshnessClass(nodeState);
+        return isNodeActive(nodeState) ? 'is-green' : freshnessClass(nodeState);
       }
 
       function setStatus() {
@@ -363,7 +355,6 @@
         const activeNames = allNodesForUi()
           .filter((entry) => isNodeActive(entry.state))
           .map(displayNodeName);
-        const nodeLabel = activeNames.length === 1 ? 'nœud actif' : 'nœuds actifs';
         els['active-node-summary'].textContent = activeNames.length ? activeNames.join(', ') : '--';
       }
 
@@ -410,14 +401,18 @@
 
           const ageLine = document.createElement('span');
           ageLine.className = 'node-status';
-          if (!entry.configured) {
+          if (!entry.configured && active) {
             ageLine.textContent = 'Position non configurée';
-            ageLine.classList.add('is-orange');
+            ageLine.classList.add('is-green');
+          } else if (!entry.configured) {
+            ageLine.textContent = 'HORS LIGNE';
+            ageLine.classList.add('is-red');
           } else if (!node) {
-            ageLine.textContent = 'Non connecté';
+            ageLine.textContent = 'HORS LIGNE';
             ageLine.classList.add('is-red');
           } else {
-            ageLine.textContent = active ? ageLabel(node) : 'inactif';
+            ageLine.textContent = active ? ageLabel(node) : 'HORS LIGNE';
+            ageLine.classList.add(active ? 'is-green' : 'is-red');
           }
 
           details.append(rssiLine, ageLine);
@@ -436,9 +431,6 @@
       }
 
       function modeValue() {
-        const features = window.RS.features || {};
-        const explicitMode = features.mode || features.runtime_mode || window.RS.mode;
-        if (String(explicitMode).toLowerCase().includes('sim')) return 'SIMULATION';
         if (window.RS.connected) return 'LIVE';
         return '--';
       }
@@ -451,7 +443,6 @@
         els['system-mode'].textContent = mode;
         els['system-mode'].className = 'mode-badge';
         if (mode === 'LIVE') els['system-mode'].classList.add('is-live');
-        else if (mode === 'SIMULATION') els['system-mode'].classList.add('is-simulation');
         else els['system-mode'].classList.add('is-empty');
       }
 
@@ -1025,12 +1016,14 @@
       }
 
       function bindEvents() {
-        window.addEventListener('rs:update', () => {
+        const scheduleRender = () => {
           const now = performance.now();
           if (now - lastRenderAt < 80) return;
           lastRenderAt = now;
           renderAll();
-        });
+        };
+        window.RuvSenseWS?.onUpdate(scheduleRender);
+        window.addEventListener('rs:update', scheduleRender);
         window.addEventListener('resize', drawRoom);
         if (window.ResizeObserver && els['room-canvas']) {
           roomResizeObserver = new ResizeObserver(() => {
@@ -1088,6 +1081,7 @@
         bindEvents();
         renderAll();
         loadInitialData();
+        window.RuvSenseWS?.connect(window.RUVSENSE_CONFIG?.api_base);
         animationLoop();
       }
 

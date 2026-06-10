@@ -1,7 +1,7 @@
 import { StyleSheet, View } from 'react-native';
 import { ThemedText } from './ThemedText';
 
-type ConnectionState = 'connected' | 'simulated' | 'disconnected';
+type ConnectionState = 'connected' | 'disconnected';
 
 type ConnectionBannerProps = {
   status: ConnectionState;
@@ -23,11 +23,10 @@ const resolveState = (status: ConnectionState) => {
       textColor: '#FFE3E7',
     };
   }
-
   return {
-    label: 'DEV SIMULATION',
-    backgroundColor: '#9A5F0C',
-    textColor: '#FFF3E1',
+    label: 'DISCONNECTED',
+    backgroundColor: '#8A1E2A',
+    textColor: '#FFE3E7',
   };
 };
 

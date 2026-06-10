@@ -56,8 +56,6 @@ const PLACEMENT_FIT_PADDING = 1.25;
 const CALIBRATION_MIN_FRAMES_FALLBACK = 12000;
 const AUTO_PLACEMENT_STABLE_REFRESHES = 2;
 const ACTION_SPINNER_MS = 3000;
-const SHARED_CHANNEL_NAME = 'ruvsense';
-const SHARED_STATE_STORAGE_KEY = 'ruvsense:shared-state';
 const ROOM_CONFIG_PATH = '/ui/room-config.json';
 const DEFAULT_CANVAS_ROOM_WIDTH_M = 5.0;
 const DEFAULT_CANVAS_ROOM_DEPTH_M = 4.0;
@@ -75,10 +73,6 @@ const BREATHING_TREND_MS = 10 * 60 * 1000;
 const APNEA_ZERO_MS = 15 * 1000;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-const sharedStateChannel = typeof BroadcastChannel !== 'undefined'
-  ? new BroadcastChannel(SHARED_CHANNEL_NAME)
-  : null;
-
 initAlerts({ source: 'console' });
 
 function text(value, fallback = '--') {
@@ -1446,13 +1440,10 @@ function versionText() {
 }
 
 function systemModeInfo() {
-  const sourceMode = state.fleet?.source_mode;
-  const rawSource = text(sourceMode?.raw ?? state.fleet?.source ?? state.topology?.source, '');
-  const simulated = Boolean(sourceMode?.simulated)
-    || ['simulate', 'simulated'].includes(String(rawSource).toLowerCase());
-  return simulated
-    ? { label: 'SIMULATION', className: 'is-simulation' }
-    : { label: 'MODE LIVE', className: 'is-live' };
+  const online = Boolean(state.latest || state.fleet?.active_nodes > 0);
+  return online
+    ? { label: 'MODE LIVE', className: 'is-live' }
+    : { label: 'HORS LIGNE', className: 'is-empty' };
 }
 
 function renderSystemPanel() {
@@ -2006,17 +1997,6 @@ function appStateSnapshot(reason = 'update') {
 function publishSharedState(reason = 'update') {
   const snapshot = appStateSnapshot(reason);
   processAlertState(snapshot);
-  try {
-    localStorage.setItem(SHARED_STATE_STORAGE_KEY, JSON.stringify(snapshot));
-  } catch {}
-  try {
-    sharedStateChannel?.postMessage({
-      type: 'state',
-      source: 'console',
-      state: snapshot,
-      updatedAt: snapshot.updatedAt,
-    });
-  } catch {}
 }
 
 function renderVitals() {
@@ -2741,103 +2721,6 @@ function bindActions() {
     input?.addEventListener('change', updatePositionFromInputs);
   }
 }
-
-function fixtureTopology(count = 3) {
-  const nodes = Array.from({ length: count }, (_, index) => {
-    const angle = (index / Math.max(1, count)) * Math.PI * 2;
-    return {
-      node_id: index + 1,
-      label: `ESP32-C6 ${index + 1}`,
-      rssi_dbm: -42 - (index % 24),
-      frame_rate_hz: 9 + (index % 5),
-      last_seen_ms: 40 + index,
-      sync_status: index % 3 === 0 ? 'valid' : 'no_sync',
-      coverage: {
-        score: index % 4 === 3 ? 0.32 : 0.78 - (index % 3) * 0.13,
-        quality: index % 4 === 3 ? 'weak' : 'usable',
-        radius_m: 8 + index,
-        reasons: index % 4 === 3 ? ['low_rssi'] : [],
-      },
-      position: {
-        x: Math.cos(angle) * 2.0,
-        y: 1.1,
-        z: Math.sin(angle) * 1.8,
-        source: index % 5 === 0 ? 'configured' : 'estimated',
-        confidence: index % 5 === 0 ? 0.9 : 0.42,
-      },
-    };
-  });
-  const aps = count === 0 ? [] : [
-    { bssid: '02:11:22:33:44:01', ssid: 'mesh-east', channel: 6, band: '2.4GHz', rssi_dbm: -39, last_seen_ms: 80, status: 'visible', position: { x: -2.1, y: 2.0, z: -1.7, source: 'estimated', confidence: 0.3 } },
-    { bssid: '02:11:22:33:44:02', ssid: 'mesh-west', channel: 11, band: '2.4GHz', rssi_dbm: -48, last_seen_ms: 90, status: 'visible', position: { x: 2.1, y: 2.0, z: 1.7, source: 'estimated', confidence: 0.3 } },
-  ];
-  return {
-    product: 'RuvSense Edge',
-    service: 'ruvsense-master',
-    source: 'esp32',
-    room: { name: 'fixture', dimensions_m: [5.2, 2.6, 4.8] },
-    readiness: {
-      ready: count >= 1,
-      active_nodes: count,
-      min_nodes: 1,
-      fusion_mode: count === 0 ? 'offline' : count === 1 ? 'single_node' : count === 2 ? 'partial_multistatic' : 'multistatic',
-    },
-    wifi_scan: { interface: 'fixture', interval_secs: 10, available: true },
-    access_points: aps,
-    nodes,
-    links: nodes.flatMap((node, index) => aps.length ? [{
-      link_id: `${aps[index % aps.length].bssid}:node-${node.node_id}`,
-      ap_bssid: aps[index % aps.length].bssid,
-      node_id: node.node_id,
-      source: index % 5 === 0 ? 'configured' : 'estimated',
-      confidence: index % 5 === 0 ? 0.86 : 0.35,
-      distance_m: 8 + index,
-      coverage: {
-        score: node.coverage.score,
-        quality: node.coverage.quality,
-        radius_m: node.coverage.radius_m,
-        reasons: node.coverage.reasons,
-      },
-    }] : []),
-  };
-}
-
-window.__ruvsenseRenderFixture = (count = 3) => {
-  state.topology = fixtureTopology(Number(count) || 0);
-  state.latest = count > 0 ? {
-    type: 'sensing_update',
-    source: 'esp32',
-    classification: { presence: true, motion_level: count > 1 ? 'walking' : 'present_still', confidence: 0.78 },
-    estimated_persons: 1,
-    count_evidence: { rendered_persons: 1, stable_persons: 1 },
-    posture: 'standing',
-    persons: [{ id: 'fixture-person', pose: count > 1 ? 'standing' : 'sitting', position_m: [0.3, 0.0, 0.4], confidence: 0.72, position_source: 'multistatic' }],
-    vital_signs: { breathing_rate_bpm: 13.8, heart_rate_bpm: 72.4, signal_quality: 0.74 },
-  } : null;
-  state.location = count > 0 ? {
-    persons: [{ x: 0.3, y: 0.4, confidence: count >= 3 ? 1.0 : count === 2 ? 0.5 : 0.0 }],
-    node_count: count,
-    timestamp_ms: Date.now(),
-    nodes: (state.topology?.nodes || []).map((node) => ({ node_id: node.node_id, x: node.position.x, y: node.position.z })),
-  } : null;
-  state.pose = count > 0 ? {
-    posture: 'standing',
-    persons: [{ id: 'fixture-person', pose: count > 1 ? 'standing' : 'sitting', position_m: [0.3, 0.0, 0.4], confidence: 0.72, position_source: 'multistatic' }],
-  } : null;
-  state.calibration = {
-    status: 'not_started',
-    enabled: false,
-    frame_count: 0,
-    min_frames: CALIBRATION_MIN_FRAMES_FALLBACK,
-    active_nodes: count,
-    min_nodes: 1,
-    dedup_factor: 3,
-    auto_mode: { enabled: false, guard_state: 'blocked', recommended_action: 'enable_auto_or_start_manual', blockers: [] },
-  };
-  renderAll();
-  publishSharedState('fixture');
-  return state.topology;
-};
 
 window.__ruvsenseConsoleTestApi = {
   state,

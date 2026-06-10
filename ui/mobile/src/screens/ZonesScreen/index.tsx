@@ -21,7 +21,7 @@ const getLastUpdateSeconds = (timestamp?: number): string => {
   return `${secs.toFixed(1)}s`;
 };
 
-const resolveBannerState = (status: ConnectionStatus): 'connected' | 'simulated' | 'disconnected' => {
+const resolveBannerState = (status: ConnectionStatus): 'connected' | 'disconnected' => {
   if (status === 'connecting') {
     return 'disconnected';
   }

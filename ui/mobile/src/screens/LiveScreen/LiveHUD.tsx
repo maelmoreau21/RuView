@@ -8,7 +8,7 @@ import { formatConfidence, formatRssi } from '@/utils/formatters';
 import { colors, spacing } from '@/theme';
 import type { ConnectionStatus } from '@/types/sensing';
 
-type LiveMode = 'LIVE' | 'DEV' | 'RSSI' | 'OFFLINE';
+type LiveMode = 'LIVE' | 'RSSI' | 'OFFLINE';
 
 type LiveHUDProps = {
   rssi?: number;
@@ -21,14 +21,12 @@ type LiveHUDProps = {
 
 const statusTextMap: Record<ConnectionStatus, string> = {
   connected: 'Connected',
-  simulated: 'Dev simulation',
   connecting: 'Connecting',
   disconnected: 'Disconnected',
 };
 
-const statusDotStatusMap: Record<ConnectionStatus, 'connected' | 'simulated' | 'disconnected' | 'connecting'> = {
+const statusDotStatusMap: Record<ConnectionStatus, 'connected' | 'disconnected' | 'connecting'> = {
   connected: 'connected',
-  simulated: 'simulated',
   connecting: 'connecting',
   disconnected: 'disconnected',
 };

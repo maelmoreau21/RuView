@@ -13,8 +13,6 @@ Production web UI for RuvSense Edge. The main entry point is `index.html`: one s
 
 The production UI does not generate synthetic sensing frames. If the master, WebSocket, or hardware is unavailable, screens show `offline`, `reconnecting`, or `degraded` states and keep waiting for real data.
 
-Explicit server-side simulation is reserved for dev/test runs started with `RUVSENSE_ENABLE_SIMULATION=1`; Docker Pi production leaves it disabled.
-
 ## APIs Used
 
 - `GET /health/live`

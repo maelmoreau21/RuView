@@ -17,7 +17,7 @@ import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION } from './hud-controller.js';
-import { initAlerts, processAlertState } from '../../alerts.js?v=module';
+import { initAlerts } from '../../alerts.js?v=module';
 
 // ---- Palette ----
 const C = {
@@ -62,8 +62,6 @@ const POSE_ALIASES = new Map([
   ['crouched', 'crouching'],
 ]);
 const ROOM_CONFIG_STORAGE_KEY = 'ruvsense:room-config';
-const SHARED_CHANNEL_NAME = 'ruvsense';
-const SHARED_STATE_STORAGE_KEY = 'ruvsense:shared-state';
 const DEFAULT_ROOM_CONFIG = {
   room_width_meters: 5.0,
   room_height_meters: 4.0,
@@ -159,23 +157,22 @@ class Observatory {
     this._presenceSilhouettes = new Map();
     this._activeRoomNodeCount = 0;
     this._sceneStatusOverlay = null;
-    this._sharedStateChannel = null;
-    this._lastSharedState = null;
+    this._unsubscribeWs = null;
+    this._figurePool = null;
+    this._scenarioProps = null;
+    this._nebula = null;
+    this._mistPoints = null;
+    this._trail = null;
+    this._fieldPoints = null;
 
     // Build scene
     this._setupLighting();
-    this._nebula = new NebulaBackground(this._scene);
     this._buildRoom();
-    this._scenarioProps = new ScenarioProps(this._scene);
     this._buildTopologyDevices();
     this._buildRoomConfigLayer();
     this._buildPresenceLayer();
     this._poseSystem = new PoseSystem();
-    this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
-    this._buildDotMatrixMist();
-    this._buildParticleTrail();
     this._buildWifiWaves();
-    this._buildSignalField();
 
     // Post-processing
     this._postProcessing = new PostProcessing(this._renderer, this._scene, this._camera);
@@ -201,7 +198,7 @@ class Observatory {
     this._ws = null;
     this._liveData = null;
     this._fetchEnvironment();
-    this._initSharedStateChannel();
+    this._connectLiveUpdates();
 
     // Input
     this._initKeyboard();
@@ -359,28 +356,46 @@ class Observatory {
   // ---- Topology devices ----
 
   _buildTopologyDevices() {
-    this._topologyGroup = new THREE.Group();
-    this._linkGroup = new THREE.Group();
-    this._impactGroup = new THREE.Group();
-    this._coverageGroup = new THREE.Group();
+    this._topologyGroup = null;
+    this._linkGroup = null;
+    this._impactGroup = null;
+    this._coverageGroup = null;
     this._deviceMeshes = new Map();
     this._linkMeshes = new Map();
     this._impactMarkers = new Map();
     this._coverageMeshes = new Map();
     this._wifiWaves = [];
+  }
+
+  _buildRoomConfigLayer() {
+    this._roomConfigGroup = null;
+  }
+
+  _buildPresenceLayer() {
+    this._presenceGroup = null;
+  }
+
+  _ensureTopologyGroups() {
+    if (this._topologyGroup) return;
+    this._topologyGroup = new THREE.Group();
+    this._linkGroup = new THREE.Group();
+    this._impactGroup = new THREE.Group();
+    this._coverageGroup = new THREE.Group();
     this._scene.add(this._coverageGroup);
     this._scene.add(this._linkGroup);
     this._scene.add(this._impactGroup);
     this._scene.add(this._topologyGroup);
   }
 
-  _buildRoomConfigLayer() {
+  _ensureRoomConfigGroup() {
+    if (this._roomConfigGroup) return;
     this._roomConfigGroup = new THREE.Group();
     this._roomConfigGroup.name = 'room-config-layer';
     this._scene.add(this._roomConfigGroup);
   }
 
-  _buildPresenceLayer() {
+  _ensurePresenceGroup() {
+    if (this._presenceGroup) return;
     this._presenceGroup = new THREE.Group();
     this._presenceGroup.name = 'presence-update-silhouettes';
     this._scene.add(this._presenceGroup);
@@ -513,7 +528,7 @@ class Observatory {
         room: { dimensions_m: [config.room_width_meters, ROOM_VISUAL_HEIGHT_M, config.room_height_meters] },
       });
     }
-    this._rebuildRoomConfigScene();
+    this._rebuildRoomConfigScene(null);
     this._populateRoomConfigPanel();
     this._syncRoomConfigNodes(this._currentData || this._liveData || null);
   }
@@ -657,48 +672,23 @@ class Observatory {
     texture.needsUpdate = true;
   }
 
-  _rebuildRoomConfigScene() {
-    if (!this._roomConfigGroup || !this._roomConfig) return;
+  _rebuildRoomConfigScene(data) {
+    if (!this._roomConfig) return;
+    if (!data) {
+      if (this._roomConfigGroup) this._clearObjectGroup(this._roomConfigGroup);
+      this._roomConfigNodes.clear();
+      return;
+    }
+    this._ensureRoomConfigGroup();
     this._clearObjectGroup(this._roomConfigGroup);
     this._roomConfigNodes.clear();
 
-    const width = this._roomConfig.room_width_meters;
-    const depth = this._roomConfig.room_height_meters;
-    const vertices = [];
-    const xDivisions = Math.max(1, Math.ceil(width));
-    const zDivisions = Math.max(1, Math.ceil(depth));
-
-    for (let i = 0; i <= xDivisions; i++) {
-      const x = -width / 2 + (width * i) / xDivisions;
-      vertices.push(x, 0.035, -depth / 2, x, 0.035, depth / 2);
-    }
-    for (let i = 0; i <= zDivisions; i++) {
-      const z = -depth / 2 + (depth * i) / zDivisions;
-      vertices.push(-width / 2, 0.035, z, width / 2, 0.035, z);
-    }
-
-    const gridGeo = new THREE.BufferGeometry();
-    gridGeo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-    const grid = new THREE.LineSegments(
-      gridGeo,
-      new THREE.LineBasicMaterial({ color: 0x9aa4ad, transparent: true, opacity: 0.24 })
-    );
-    this._roomConfigGroup.add(grid);
-
-    const borderPoints = [
-      new THREE.Vector3(-width / 2, 0.05, -depth / 2),
-      new THREE.Vector3(width / 2, 0.05, -depth / 2),
-      new THREE.Vector3(width / 2, 0.05, depth / 2),
-      new THREE.Vector3(-width / 2, 0.05, depth / 2),
-      new THREE.Vector3(-width / 2, 0.05, -depth / 2),
-    ];
-    const border = new THREE.Line(
-      new THREE.BufferGeometry().setFromPoints(borderPoints),
-      new THREE.LineBasicMaterial({ color: 0xb8c0c8, transparent: true, opacity: 0.55 })
-    );
-    this._roomConfigGroup.add(border);
-
-    for (const node of this._roomConfig.nodes) {
+    const liveIds = new Set((data.nodes || []).map((node) => Number(node.node_id ?? node.id)).filter(Number.isFinite));
+    const nodeCount = Math.max(0, this._integerOrZero(data.node_count));
+    const visibleNodes = this._roomConfig.nodes.filter((node, index) => (
+      liveIds.has(Number(node.id)) || (liveIds.size === 0 && index < nodeCount)
+    ));
+    for (const node of visibleNodes) {
       const entry = this._createRoomNodeIcon(node);
       const [x, y, z] = this._roomToScenePosition(node.x, node.y, 0.08);
       entry.group.position.set(x, y, z);
@@ -751,7 +741,13 @@ class Observatory {
   }
 
   _syncRoomConfigNodes(data) {
-    if (!this._roomConfig || !this._roomConfigNodes.size) return;
+    if (!this._roomConfig) return;
+    if (!data) {
+      this._rebuildRoomConfigScene(null);
+      return;
+    }
+    if (!this._roomConfigNodes.size) this._rebuildRoomConfigScene(data);
+    if (!this._roomConfigNodes.size) return;
     const systemStatus = String(data?.system_status || '').toLowerCase();
     const fallbackActiveNodes = Array.isArray(data?.nodes)
       ? data.nodes.filter((node) => node.active !== false).length
@@ -816,6 +812,7 @@ class Observatory {
   _upsertPresenceSilhouette(id) {
     let entry = this._presenceSilhouettes.get(id);
     if (entry) return entry;
+    this._ensurePresenceGroup();
 
     const group = new THREE.Group();
     const bodyMat = new THREE.MeshStandardMaterial({
@@ -853,7 +850,7 @@ class Observatory {
   }
 
   _removePresenceSilhouette(id, entry) {
-    this._presenceGroup.remove(entry.group);
+    this._presenceGroup?.remove(entry.group);
     entry.group.traverse((obj) => {
       obj.geometry?.dispose?.();
       if (Array.isArray(obj.material)) {
@@ -877,7 +874,8 @@ class Observatory {
       const id = this._personIdentity(person, index);
       activeIds.add(id);
       const entry = this._upsertPresenceSilhouette(id);
-      const position = this._parseVector3(person.position) || this._fallbackPersonPosition(index, persons.length);
+      const position = this._parseVector3(person.position);
+      if (!position) return;
       const confidence = Math.max(0, Math.min(1, Number(person.confidence) || 0));
       const motionEnergy = Math.max(0, Math.min(1, Number(person.motion_energy ?? person.motion_score / 100) || 0));
       const color = this._presenceColor(confidence);
@@ -918,6 +916,7 @@ class Observatory {
   }
 
   _ensureWaveSource(id, position, active, scale = 1) {
+    this._ensureTopologyGroups();
     let waves = this._wifiWaves.find(w => w.id === id);
     if (!waves) {
       waves = { id, active, shells: [] };
@@ -953,13 +952,11 @@ class Observatory {
         this._recomputeSceneFrame(env, env.nodes || []);
         this._frameCameraToSensors(true);
         this._setEnvironmentNotice(false);
-        this._syncTopology(this._currentData);
       })
       .catch(() => {
         this._environment = null;
         this._setEnvironmentNotice(true);
         this._clearTopology();
-        this._syncTopology(this._currentData);
       });
   }
 
@@ -1341,6 +1338,8 @@ class Observatory {
 
   _updateScenarioProps(data) {
     this._currentScenario = data?.scenario || this._currentScenario || null;
+    if (!this._currentScenario && !this._scenarioProps) return;
+    if (!this._scenarioProps) this._scenarioProps = new ScenarioProps(this._scene);
     this._scenarioProps.update(data, this._currentScenario);
   }
 
@@ -1415,34 +1414,6 @@ class Observatory {
     return points;
   }
 
-  _fallbackPersonPosition(index, total) {
-    const count = Math.max(1, total);
-    const spacing = Math.min(Math.max(this._sensorBounds.width * 0.18, 0.65), 1.25);
-    const half = (count - 1) / 2;
-    const zJitter = count > 1 ? ((index % 2) - 0.5) * Math.min(this._sensorBounds.depth * 0.12, 0.7) : 0;
-    return [(index - half) * spacing, 0, zJitter];
-  }
-
-  _inferredPersonsFromCount(frame, evidence, startIndex = 0) {
-    const rendered = Math.min(MAX_SCENE_PERSONS, this._integerOrZero(evidence?.rendered_persons));
-    if (rendered <= startIndex) return [];
-    const reason = String(evidence?.reason || '').toLowerCase();
-    const confidence = this._numberOrNull(frame?.classification?.confidence)
-      ?? (reason === 'presence_hold' ? 0.35 : 0.5);
-    return Array.from({ length: rendered - startIndex }, (_, offset) => {
-      const index = startIndex + offset;
-      return {
-        id: reason === 'presence_hold' ? `held_${index + 1}` : `inferred_${index + 1}`,
-        confidence,
-        position: this._fallbackPersonPosition(index, rendered),
-        position_source: 'observatory_layout',
-        pose_source: reason === 'presence_hold' ? 'presence_hold' : 'count_evidence',
-        pose: 'standing',
-        detection_state: reason === 'presence_hold' ? 'held' : 'inferred',
-      };
-    });
-  }
-
   _normalizeSensingFrame(rawFrame) {
     if (!rawFrame || typeof rawFrame !== 'object') return null;
     const frame = this._lastEdgeVitals ? this._mergeEdgeVitals(rawFrame, this._lastEdgeVitals) : { ...rawFrame };
@@ -1458,29 +1429,7 @@ class Observatory {
       };
     });
 
-    if (!persons.length) {
-      const keypoints = this._keypointObjects(frame.pose_keypoints);
-      if (keypoints) {
-        const confidence = this._numberOrNull(frame.classification?.confidence) ?? 0.5;
-        const pose = this._framePose(frame);
-        persons.push({
-          id: 'pose_1',
-          confidence,
-          keypoints,
-          position: this._fallbackPersonPosition(0, 1),
-          position_source: 'observatory_layout',
-          pose_source: 'pose_keypoints',
-          ...(pose ? { pose } : {}),
-        });
-      }
-    }
-
     let evidence = this._countEvidence({ ...frame, persons });
-    const inferredPersons = this._inferredPersonsFromCount(frame, evidence, persons.length);
-    if (inferredPersons.length) {
-      persons = persons.concat(inferredPersons);
-      evidence = this._countEvidence({ ...frame, persons });
-    }
     const hasCountEvidence = Boolean(frame.count_evidence && typeof frame.count_evidence === 'object');
     const renderLimit = hasCountEvidence
       ? evidence.rendered_persons
@@ -1507,11 +1456,30 @@ class Observatory {
       ...frame,
       type: 'sensing_update',
       msg_type: frame.msg_type || 'sensing_update',
+      nodes: this._nodesFromWsFrame(frame, persons),
       persons,
       estimated_persons: renderedPersons,
       count_evidence: countEvidence,
       classification,
     };
+  }
+
+  _nodesFromWsFrame(frame, persons = []) {
+    if (Array.isArray(frame?.nodes) && frame.nodes.length) return frame.nodes;
+    const nodeCount = this._integerOrZero(frame?.node_count);
+    if (!nodeCount || !Array.isArray(persons) || !persons.length) return [];
+    return (this._roomConfig?.nodes || DEFAULT_ROOM_CONFIG.nodes).slice(0, nodeCount).map((node) => {
+      const position = this._roomToScenePosition(node.x, node.y, 0.08);
+      return {
+        id: node.id,
+        node_id: node.id,
+        label: node.label || `Node ${node.id}`,
+        active: true,
+        status: 'live',
+        position,
+        position_m: position.slice(),
+      };
+    });
   }
 
   _normalizePresenceFrame(rawFrame) {
@@ -1620,7 +1588,8 @@ class Observatory {
         : null;
       const position = layoutPosition
         || this._positionOf(person)
-        || this._fallbackPersonPosition(index, inputPersons.length);
+        || null;
+      if (!position) return null;
       const keypointsM = this._transformMetricKeypoints(person.keypoints_m);
       const scenePerson = {
         ...person,
@@ -1631,11 +1600,6 @@ class Observatory {
       return this._snapToSleepBed(data, scenePerson);
     }).filter(Boolean);
     let evidence = this._countEvidence({ ...data, persons });
-    const inferredPersons = this._inferredPersonsFromCount(data, evidence, persons.length);
-    if (inferredPersons.length) {
-      persons = persons.concat(inferredPersons);
-      evidence = this._countEvidence({ ...data, persons });
-    }
     const hasCountEvidence = Boolean(data.count_evidence && typeof data.count_evidence === 'object');
     const renderLimit = hasCountEvidence
       ? evidence.rendered_persons
@@ -1676,6 +1640,7 @@ class Observatory {
   }
 
   _upsertDevice(key, kind, label, position, active) {
+    this._ensureTopologyGroups();
     let entry = this._deviceMeshes.get(key);
     if (!entry) {
       const group = new THREE.Group();
@@ -1718,6 +1683,7 @@ class Observatory {
   }
 
   _upsertLink(key, from, to, active, collision = null) {
+    this._ensureTopologyGroups();
     let line = this._linkMeshes.get(key);
     if (!line) {
       const geo = new THREE.BufferGeometry();
@@ -1793,6 +1759,7 @@ class Observatory {
   }
 
   _upsertImpactMarker(key, collision, active) {
+    this._ensureTopologyGroups();
     let entry = this._impactMarkers.get(key);
     if (!active || !collision) {
       if (entry) entry.group.visible = false;
@@ -1885,6 +1852,7 @@ class Observatory {
   }
 
   _upsertCoverage(key, position, active, visible, band, rangeHintM = null) {
+    this._ensureTopologyGroups();
     let entry = this._coverageMeshes.get(key);
     const radius = this._coverageRadiusForBand(band, rangeHintM);
     const heightScale = Math.min(0.45, Math.max(0.22, this._roomSize.height / Math.max(radius * 5, 1)));
@@ -1931,7 +1899,7 @@ class Observatory {
 
   _syncTopology(liveData) {
     const env = this._environment;
-    if (!env) {
+    if (!env || !liveData || !Array.isArray(liveData.nodes) || !liveData.nodes.length) {
       this._clearTopology();
       return;
     }
@@ -2162,317 +2130,46 @@ class Observatory {
   _applyColors() {
     const wc = new THREE.Color(this.settings.wireColor);
     const jc = new THREE.Color(this.settings.jointColor);
-    this._figurePool.applyColors(wc, jc);
-    this._mistPoints.material.uniforms.uColor.value.copy(wc);
+    this._figurePool?.applyColors(wc, jc);
+    if (this._mistPoints) this._mistPoints.material.uniforms.uColor.value.copy(wc);
+  }
+
+  _ensureFigurePool(data) {
+    if (!this._figurePool && Array.isArray(data?.persons) && data.persons.length) {
+      this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
+      this._applyColors();
+    }
+    return this._figurePool;
   }
 
   // ---- WebSocket live data ----
 
-  _initSharedStateChannel() {
-    this._setSceneStatus('connecting', 'En attente de la console 2D...');
-    this._hud.updateSourceBadge('connecting', null);
-    this._loadStoredSharedState();
-
-    if (typeof BroadcastChannel === 'undefined') return;
-    this._sharedStateChannel = new BroadcastChannel(SHARED_CHANNEL_NAME);
-    this._sharedStateChannel.addEventListener('message', (event) => {
-      const message = event.data || {};
-      if (message.type === 'state' && message.state) {
-        this._ingestSharedState(message.state);
-      }
-    });
-  }
-
-  _loadStoredSharedState() {
-    try {
-      const raw = localStorage.getItem(SHARED_STATE_STORAGE_KEY);
-      if (raw) this._ingestSharedState(JSON.parse(raw));
-    } catch {}
-  }
-
-  _environmentFromSharedState(shared) {
-    const topology = shared?.topology;
-    if (!topology || typeof topology !== 'object') return null;
-
-    const accessPoints = (topology.access_points || []).map((ap, index) => {
-      const apId = String(ap.ap_id || ap.bssid || ap.id || `ap-${index + 1}`);
-      return {
-        ...ap,
-        ap_id: apId,
-        label: ap.label || ap.ssid || ap.bssid || apId,
-        position_m: ap.position_m || ap.position,
-        active: ap.active !== false && ap.status !== 'offline',
-      };
-    });
-    const apIdByBssid = new Map(accessPoints.map((ap) => [String(ap.bssid || ap.ap_id).toLowerCase(), ap.ap_id]));
-    const nodes = this._nodesFromSharedState(shared);
-
-    const links = (topology.links || []).map((link, index) => {
-      const apId = link.ap_id
-        || apIdByBssid.get(String(link.ap_bssid || link.bssid || '').toLowerCase())
-        || link.ap_bssid
-        || link.bssid
-        || accessPoints[0]?.ap_id
-        || `ap-${index + 1}`;
-      return {
-        ...link,
-        ap_id: String(apId),
-        node_id: Number(link.node_id ?? link.node ?? nodes[index % Math.max(1, nodes.length)]?.node_id ?? index + 1),
-        link_id: link.link_id || `${apId}:node-${link.node_id ?? index + 1}`,
-      };
-    });
-
-    return {
-      ...topology,
-      room: topology.room || { dimensions_m: [5.2, 2.6, 4.8] },
-      access_points: accessPoints,
-      nodes,
-      links,
-    };
-  }
-
-  _nodesFromSharedState(shared) {
-    const topologyNodes = Array.isArray(shared?.topology?.nodes) ? shared.topology.nodes : [];
-    const latestNodes = Array.isArray(shared?.latest?.nodes) ? shared.latest.nodes : [];
-    const nodesById = new Map();
-    for (const node of [...topologyNodes, ...latestNodes]) {
-      const nodeId = Number(node?.node_id ?? node?.id);
-      if (!Number.isFinite(nodeId)) continue;
-      const status = String(node.health_status || node.status || '').toLowerCase();
-      const previous = nodesById.get(nodeId) || {};
-      nodesById.set(nodeId, {
-        ...previous,
-        ...node,
-        node_id: nodeId,
-        id: nodeId,
-        label: node.display_label || node.label || previous.label || `C6-${nodeId}`,
-        position_m: node.position_m || node.position || previous.position_m || previous.position,
-        active: node.active !== false && !['offline', 'stale', 'sync_only'].includes(status),
-      });
-    }
-    return [...nodesById.values()];
-  }
-
-  _primaryVitalsFromSharedState(shared) {
-    const latestVitals = shared?.latest?.vital_signs || {};
-    const restVitals = shared?.vitals?.vital_signs || shared?.vitals || {};
-    const edgeVitals = shared?.edgeVitals?.edge_vitals || shared?.edgeVitals || {};
-    const heart = this._numberOrNull(
-      latestVitals.heart_rate_bpm ?? latestVitals.heartrate_bpm
-      ?? edgeVitals.heart_rate_bpm ?? edgeVitals.heartrate_bpm
-      ?? restVitals.heart_rate_bpm ?? restVitals.heartrate_bpm,
-    );
-    const breathing = this._numberOrNull(
-      latestVitals.breathing_rate_bpm ?? latestVitals.breathing_bpm
-      ?? edgeVitals.breathing_rate_bpm ?? edgeVitals.breathing_bpm
-      ?? restVitals.breathing_rate_bpm ?? restVitals.breathing_bpm,
-    );
-    const quality = this._numberOrNull(
-      latestVitals.signal_quality ?? latestVitals.presence_score
-      ?? edgeVitals.signal_quality ?? edgeVitals.presence_score
-      ?? restVitals.signal_quality ?? restVitals.presence_score,
-    );
-    if (heart == null && breathing == null && quality == null) return null;
-    return {
-      ...(heart != null ? { heart_rate_bpm: heart } : {}),
-      ...(breathing != null ? { breathing_rate_bpm: breathing } : {}),
-      ...(quality != null ? { signal_quality: quality } : {}),
-    };
-  }
-
-  _personsFromSharedState(shared) {
-    const latestPersons = Array.isArray(shared?.latest?.persons) ? shared.latest.persons : [];
-    const posePersons = Array.isArray(shared?.pose?.persons) ? shared.pose.persons : [];
-    const locationPersons = Array.isArray(shared?.location?.persons) ? shared.location.persons : [];
-    if (latestPersons.length) return latestPersons;
-    if (posePersons.length) return posePersons;
-
-    return locationPersons.map((person, index) => {
-      const x = this._numberOrNull(person.x) ?? this._numberOrNull(person.position?.x) ?? 0;
-      const z = this._numberOrNull(person.y) ?? this._numberOrNull(person.z) ?? this._numberOrNull(person.position?.z) ?? 0;
-      const confidence = this._numberOrNull(person.confidence) ?? 0.35;
-      return {
-        id: person.id || `location_${index + 1}`,
-        confidence,
-        position: [x, 0, z],
-        position_m: [x, 0, z],
-        position_source: 'shared_location',
-        pose: 'standing',
-      };
-    });
-  }
-
-  _frameFromSharedState(shared) {
-    if (!shared || typeof shared !== 'object') return null;
-    const latest = shared.latest && typeof shared.latest === 'object' ? { ...shared.latest } : {};
-    const nodes = this._nodesFromSharedState(shared);
-    const persons = this._personsFromSharedState(shared);
-    const vitalSigns = this._primaryVitalsFromSharedState(shared) || latest.vital_signs || null;
-    const activeNodes = nodes.filter((node) => node.active !== false).length;
-    const classification = {
-      ...(latest.classification || {}),
-      presence: latest.classification?.presence ?? persons.length > 0,
-      motion_level: latest.classification?.motion_level || (persons.length ? 'present' : 'absent'),
-      confidence: latest.classification?.confidence ?? persons[0]?.confidence ?? 0,
-    };
-
-    return {
-      ...latest,
-      type: 'sensing_update',
-      msg_type: 'sensing_update',
-      source: latest.source || 'shared_state',
-      system_status: latest.system_status || (activeNodes > 0 ? 'live' : 'no_nodes'),
-      timestamp_ms: latest.timestamp_ms || shared.updatedAt || Date.now(),
-      node_count: latest.node_count ?? activeNodes,
-      nodes: Array.isArray(latest.nodes) && latest.nodes.length ? latest.nodes : nodes,
-      persons,
-      estimated_persons: latest.estimated_persons ?? persons.length,
-      count_evidence: {
-        ...(latest.count_evidence || {}),
-        rendered_persons: latest.count_evidence?.rendered_persons ?? persons.length,
-        stable_persons: latest.count_evidence?.stable_persons ?? persons.length,
-        raw_estimated_persons: latest.count_evidence?.raw_estimated_persons ?? persons.length,
-        active_nodes: latest.count_evidence?.active_nodes ?? activeNodes,
-        supporting_nodes: latest.count_evidence?.supporting_nodes ?? activeNodes,
-      },
-      classification,
-      vital_signs: vitalSigns,
-    };
-  }
-
-  _ingestSharedState(shared) {
-    this._lastSharedState = shared;
-    processAlertState(shared);
-
-    const env = this._environmentFromSharedState(shared);
-    if (env) {
-      this._environment = env;
-      this._syncRoomGeometry(env);
-      this._setEnvironmentNotice(false);
-    }
-
-    const frame = this._frameFromSharedState(shared);
-    const normalized = this._normalizeSensingFrame(frame);
-    if (!normalized) return;
-
-    const status = String(normalized.system_status || '').toLowerCase() === 'no_nodes' ? 'no_nodes' : 'live';
-    this._liveData = normalized;
-    this._lastLiveAt = performance.now();
-    this._setSceneStatus(status, status === 'no_nodes' ? 'Aucun noeud ESP32 connecte' : '');
-    this._hud.updateSourceBadge(status, null);
-    this._updateScenarioProps(normalized);
-    this._syncTopology(normalized);
-    this._syncRoomConfigNodes(normalized);
-  }
-
-  _poseWsCandidates() {
-    const host = window.location.hostname || 'localhost';
-    const candidates = [];
-    if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      candidates.push(`${proto}//${window.location.host}/ws/pose`);
-    }
-    candidates.push(`ws://${host}:3000/ws/pose`);
-    return [...new Set(candidates)];
-  }
-
-  _autoDetectLegacyLive() {
-    // Probe sensing server health on same origin, then common ports
-    const host = window.location.hostname || 'localhost';
-    const candidates = [
-      window.location.origin,                   // same origin (e.g. :3000)
-      `http://${host}:3000`,                     // Rust server port
-      `http://${host}:3000`,                     // default HTTP port
-    ];
-    // Deduplicate
-    const unique = [...new Set(candidates)];
-
-    const tryNext = (i) => {
-      if (i >= unique.length) {
-        console.log('[Observatory] No sensing server detected; staying offline');
-        this._hud.updateSourceBadge('offline', null);
-        this._scheduleReconnect();
+  _connectLiveUpdates() {
+    this._setSceneStatus('offline', 'HORS LIGNE');
+    this._hud.updateSourceBadge('offline', null);
+    if (!window.RuvSenseWS) return;
+    this._unsubscribeWs = window.RuvSenseWS.onUpdate((message, state) => {
+      if (!state?.connected) {
+        this._goOffline();
         return;
       }
-      const base = unique[i];
-      fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })
-        .then(r => r.ok ? r.json() : Promise.reject())
-        .then(data => {
-          if (data && data.status === 'ok') {
-            const wsProto = base.startsWith('https') ? 'wss:' : 'ws:';
-            const urlObj = new URL(base);
-            const wsUrl = `${wsProto}//${urlObj.host}/ws/pose`;
-            console.log('[Observatory] Sensing server detected at', base, '→', wsUrl);
-            this.settings.dataSource = 'ws';
-            this.settings.wsUrl = wsUrl;
-            this._connectWS(wsUrl);
-          } else {
-            tryNext(i + 1);
-          }
-        })
-        .catch(() => tryNext(i + 1));
-    };
-    tryNext(0);
+      if (message) this._ingestSocketFrame(message);
+    });
+    window.RuvSenseWS.connect(window.RUVSENSE_CONFIG?.api_base);
   }
 
-  _autoDetectLive() {
-    const candidates = this._poseWsCandidates();
-    const url = candidates[this._wsCandidateIndex % candidates.length];
-    this._wsCandidateIndex += 1;
-    this.settings.dataSource = 'ws';
-    this.settings.wsUrl = url;
-    this._setSceneStatus('connecting', 'En attente du serveur...');
-    this._hud.updateSourceBadge('connecting', null);
-    this._connectWS(url);
-  }
-
-  _connectWS(url) {
-    this._disconnectWS();
-    try {
-      this._ws = new WebSocket(url);
-      this._ws.onopen = () => {
-        console.log('[Observatory] WebSocket connected:', url);
-        this._setSceneStatus('connecting', 'En attente du serveur...');
-        this._hud.updateSourceBadge('connecting', this._ws);
-      };
-      this._ws.onmessage = (evt) => {
-        try {
-          this._ingestSocketFrame(JSON.parse(evt.data));
-        } catch {}
-      };
-      this._ws.onclose = () => {
-        console.log('[Observatory] WebSocket closed; retrying pose stream');
-        this._ws = null;
-        this._setSceneStatus('connecting', 'En attente du serveur...');
-        this._hud.updateSourceBadge('connecting', null);
-        this._scheduleReconnect();
-      };
-      this._ws.onerror = () => {};
-    } catch {
-      this._setSceneStatus('connecting', 'En attente du serveur...');
-      this._hud.updateSourceBadge('connecting', null);
-      this._scheduleReconnect();
-    }
-  }
-
-  _scheduleReconnect() {
-    if (this._wsReconnectTimer) return;
-    this._wsReconnectTimer = window.setTimeout(() => {
-      this._wsReconnectTimer = null;
-      this._autoDetectLive();
-    }, 3000);
-  }
-
-  _disconnectWS() {
-    if (this._ws) {
-      this._ws.onclose = null;
-      this._ws.close();
-      this._ws = null;
-    }
+  _goOffline() {
     this._liveData = null;
+    this._currentData = null;
+    this._lastLiveAt = 0;
+    this._currentScenario = null;
     this._personMotionFilters.clear();
     this._syncRoomConfigNodes(null);
     this._updatePresenceSilhouettes(null, 0);
+    this._clearTopology();
+    this._scenarioProps?.update({ scenario: null, classification: {} }, null);
+    this._setSceneStatus('offline', 'HORS LIGNE');
+    this._hud.updateSourceBadge('offline', null);
   }
 
   _emptyLiveFrame() {
@@ -2481,7 +2178,7 @@ class Observatory {
       source: this._connectionState || 'connecting',
       system_status: this._connectionState || 'connecting',
       node_count: 0,
-      nodes: this._mergeNodes(null),
+      nodes: [],
       persons: [],
       estimated_persons: 0,
       features: {
@@ -2514,9 +2211,9 @@ class Observatory {
     const data = this._sceneFrameData(this._currentData);
 
     // Updates
-    this._nebula.update(dt, elapsed);
+    this._nebula?.update(dt, elapsed);
     this._updateScenarioProps(data);
-    this._figurePool.update(data, elapsed);
+    this._ensureFigurePool(data)?.update(data, elapsed);
     this._updateDotMatrixMist(data, elapsed);
     this._updateParticleTrail(data, dt, elapsed);
     this._syncTopology(data);
@@ -2553,6 +2250,8 @@ class Observatory {
   _updateDotMatrixMist(data, elapsed) {
     const persons = data?.persons || [];
     const isPresent = data?.classification?.presence || false;
+    if (!this._mistPoints && (!isPresent || persons.length === 0)) return;
+    if (!this._mistPoints) this._buildDotMatrixMist();
     const holdAlpha = this._isPresenceHold(data) ? 0.45 : 1.0;
     const pos = this._mistPoints.geometry.attributes.position;
     const alpha = this._mistPoints.geometry.attributes.alpha;
@@ -2608,6 +2307,8 @@ class Observatory {
     if (this.settings.trail <= 0) return;
     const persons = data?.persons || [];
     const isPresent = data?.classification?.presence || false;
+    if (!this._trail && (!isPresent || persons.length === 0)) return;
+    if (!this._trail) this._buildParticleTrail();
     const pos = this._trail.geometry.attributes.position;
     const ages = this._trail.geometry.attributes.age;
 
@@ -2660,6 +2361,7 @@ class Observatory {
   _updateSignalField(data) {
     const field = data?.signal_field?.values;
     if (!field) return;
+    if (!this._fieldPoints) this._buildSignalField();
     const count = Math.min(field.length, 400);
     for (let i = 0; i < count; i++) {
       const v = field[i] || 0;
@@ -2703,7 +2405,7 @@ class Observatory {
     else if (this._fpsValue > 55 && nl < 2) nl++;
     if (nl !== this._qualityLevel) {
       this._qualityLevel = nl;
-      this._nebula.setQuality(nl);
+      this._nebula?.setQuality(nl);
       this._postProcessing.setQuality(nl);
     }
   }

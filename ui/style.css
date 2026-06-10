@@ -631,11 +631,6 @@ button {
   color: var(--accent);
 }
 
-.system-mode-badge.is-simulation {
-  background: rgba(245, 158, 11, 0.16);
-  color: var(--alert-orange);
-}
-
 .left-action-row {
   display: grid;
   gap: 8px;
