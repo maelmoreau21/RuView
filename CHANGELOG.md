@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Désactivation des déclenchements automatiques des workflows de test sur GitHub.** Les workflows CI/CD de tests (comme `ci.yml`, `firmware-ci.yml`, `ruview-swarm-ci.yml`, `security-scan.yml`, etc.) ont été configurés pour ne s'exécuter que manuellement via `workflow_dispatch` afin d'éviter le lancement automatique de tests à chaque push/pull-request sur GitHub.
+
 ### Fixed
 - **RuvSense Edge UDP/serial stability sprint.** ESP32 CSI ingest now uses a per-node adaptive jitter buffer that re-sequences short out-of-order gaps, interpolates only small missing CSI gaps from adjacent live frames, skips large gaps, and exposes drop/reorder counters without letting interpolated frames affect live quorum or calibration baselines. `wifi-densepose-hardware` also gains a feature-gated serial reconnect supervisor with exponential backoff, reopen-on-read-error behavior, zero-read disconnect detection, and fake port/factory tests.
 - **Person count no longer leaks up to 10 in heuristic mode — addresses #894.** `field_bridge::occupancy_or_fallback` returned the eigenvalue-based `FieldModel::estimate_occupancy` count **unbounded** (its internal ceiling is 10), while the sibling estimators on the same single-link data — the perturbation-energy fallback right below it and `score_to_person_count` — both cap at 3 ("1-3 for single ESP32"). On noisy / under-calibrated CSI the eigenvalue count inflated, producing the "10 persons reported when 1 present" symptom (seen when `--model` fails to load and the server runs on heuristics). Bounded the eigenvalue path to the shared `MAX_SINGLE_LINK_OCCUPANCY` (3) so every estimator on one link agrees; genuine higher counts come from the multistatic fusion path, not a single-link covariance estimate.

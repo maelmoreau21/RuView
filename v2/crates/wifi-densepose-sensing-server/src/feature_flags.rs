@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+use wifi_densepose_sensing_server::alerts::AlertThresholds;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FeatureFlags {
@@ -10,6 +11,8 @@ pub(crate) struct FeatureFlags {
     pub stable: StableFeatures,
     #[serde(default)]
     pub beta: BetaFeatures,
+    #[serde(default)]
+    pub alert_thresholds: AlertThresholds,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +86,7 @@ impl Default for FeatureFlags {
         Self {
             stable: StableFeatures::default(),
             beta: BetaFeatures::default(),
+            alert_thresholds: AlertThresholds::default(),
         }
     }
 }
@@ -145,6 +149,7 @@ impl FeatureFlags {
         serde_json::json!({
             "stable": self.stable_map(),
             "beta": self.beta_map(),
+            "alert_thresholds": &self.alert_thresholds,
         })
     }
 

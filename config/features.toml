@@ -13,3 +13,10 @@ cardiac_arrest_detection = false
 precise_heart_rate = false
 precise_person_counting = false
 densepose_3d = false
+
+[alert_thresholds]
+apnea_trigger_seconds = 15
+apnea_min_confidence = 0.30
+no_motion_trigger_seconds = 120
+presence_score_threshold = 0.70
+motion_energy_threshold = 0.02

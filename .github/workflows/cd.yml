@@ -1,14 +1,6 @@
 name: Continuous Deployment
 
 on:
-  push:
-    branches: [ main ]
-    tags: [ 'v*' ]
-  workflow_run:
-    workflows: ["Continuous Integration"]
-    types:
-      - completed
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       environment:

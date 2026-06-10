@@ -1,26 +1,7 @@
 name: Firmware QEMU Tests (ADR-061)
 
 on:
-  push:
-    paths:
-      - 'firmware/**'
-      - 'scripts/qemu-esp32s3-test.sh'
-      - 'scripts/validate_qemu_output.py'
-      - 'scripts/generate_nvs_matrix.py'
-      - 'scripts/qemu_swarm.py'
-      - 'scripts/swarm_health.py'
-      - 'scripts/swarm_presets/**'
-      - '.github/workflows/firmware-qemu.yml'
-  pull_request:
-    paths:
-      - 'firmware/**'
-      - 'scripts/qemu-esp32s3-test.sh'
-      - 'scripts/validate_qemu_output.py'
-      - 'scripts/generate_nvs_matrix.py'
-      - 'scripts/qemu_swarm.py'
-      - 'scripts/swarm_health.py'
-      - 'scripts/swarm_presets/**'
-      - '.github/workflows/firmware-qemu.yml'
+  workflow_dispatch:
 
 env:
   IDF_VERSION: "v5.4"

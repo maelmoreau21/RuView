@@ -83,6 +83,7 @@ sha2      = "0.10"
 thiserror = "1"
 ndarray = { workspace = true }
 num-complex = { workspace = true }
+rustfft = { workspace = true }
 
 # ADR-115 §3.8 — MQTT publisher (HA-DISCO).
 # Gated behind the `mqtt` feature so the default binary stays small for users

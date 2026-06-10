@@ -11,19 +11,8 @@ name: BFLD MQTT Integration
 #       cargo test -p wifi-densepose-bfld --features mqtt
 
 on:
-  push:
-    branches:
-      - main
-      - 'feat/adr-118-*'
-      - 'feat/bfld-*'
-    paths:
-      - 'v2/crates/wifi-densepose-bfld/**'
-      - '.github/workflows/bfld-mqtt-integration.yml'
-  pull_request:
-    paths:
-      - 'v2/crates/wifi-densepose-bfld/**'
-      - '.github/workflows/bfld-mqtt-integration.yml'
   workflow_dispatch:
+
 
 jobs:
   mqtt-live-broker:

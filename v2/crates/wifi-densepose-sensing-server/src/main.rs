@@ -22,6 +22,7 @@ mod tracker_bridge;
 pub mod types;
 mod udp_jitter;
 mod vital_signs;
+mod vitals;
 
 // Training pipeline modules (exposed via lib.rs)
 use wifi_densepose_sensing_server::{dataset, embedding, graph_transformer, trainer};
@@ -59,10 +60,12 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, error, info, warn};
 
+use wifi_densepose_sensing_server::alerts::{AlertManager, AlertSample};
 use rvf_container::{RvfBuilder, RvfContainerInfo, RvfReader, VitalSignConfig};
 use rvf_pipeline::ProgressiveLoader;
 use feature_flags::{BetaFeature, FeatureFlags};
 use vital_signs::{VitalSignDetector, VitalSigns};
+use vitals::{breathing_min_confidence, BreathingExtractor, BreathingResult};
 
 // ADR-022 Phase 3: Multi-BSSID pipeline integration
 use wifi_densepose_wifiscan::parse_netsh_output as parse_netsh_bssid_output;
@@ -550,6 +553,8 @@ struct NodeState {
     br_buffer: VecDeque<f64>,
     rssi_history: VecDeque<f64>,
     vital_detector: VitalSignDetector,
+    breathing_extractor: BreathingExtractor,
+    latest_breathing: BreathingResult,
     latest_vitals: VitalSigns,
     pub(crate) last_frame_time: Option<std::time::Instant>,
     last_csi_time: Option<std::time::Instant>,
@@ -797,6 +802,8 @@ impl NodeState {
             br_buffer: VecDeque::with_capacity(8),
             rssi_history: VecDeque::new(),
             vital_detector: VitalSignDetector::new(10.0),
+            breathing_extractor: BreathingExtractor::new(20.0),
+            latest_breathing: BreathingResult::insufficient_data(),
             latest_vitals: VitalSigns::default(),
             last_frame_time: None,
             last_csi_time: None,
@@ -1079,6 +1086,107 @@ fn active_node_count(s: &AppStateInner, now: std::time::Instant) -> usize {
         .values()
         .filter(|ns| is_node_active(ns, now))
         .count()
+}
+
+const BREATHING_FUSION_INTERVAL: Duration = Duration::from_secs(5);
+
+fn median_phase_sample(phases: &[f64]) -> Option<f32> {
+    let mut finite: Vec<f32> = phases
+        .iter()
+        .copied()
+        .filter(|phase| phase.is_finite())
+        .map(|phase| phase as f32)
+        .collect();
+    if finite.is_empty() {
+        return None;
+    }
+
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = finite.len() / 2;
+    if finite.len() % 2 == 0 {
+        Some((finite[mid - 1] + finite[mid]) * 0.5)
+    } else {
+        Some(finite[mid])
+    }
+}
+
+fn update_node_breathing_from_phase(
+    ns: &mut NodeState,
+    frame: &Esp32Frame,
+    is_live_frame: bool,
+) -> BreathingResult {
+    ns.breathing_extractor.sample_rate_hz = (ns.csi_fps_ema as f32).clamp(1.0, 100.0);
+    if is_live_frame {
+        if let Some(phase) = median_phase_sample(&frame.phases) {
+            ns.breathing_extractor.push_sample(phase);
+        }
+    }
+    let result = ns.breathing_extractor.extract_breathing();
+    ns.latest_breathing = result;
+    result
+}
+
+fn apply_breathing_to_vitals(vitals: &mut VitalSigns, result: BreathingResult) {
+    vitals.breathing_rate_bpm = result.breathing_bpm.map(f64::from);
+    vitals.breathing_confidence = f64::from(result.confidence).clamp(0.0, 1.0);
+}
+
+fn maybe_update_fused_breathing(s: &mut AppStateInner, now: std::time::Instant) {
+    if s.last_breathing_fusion_at
+        .is_some_and(|last| now.saturating_duration_since(last) < BREATHING_FUSION_INTERVAL)
+    {
+        return;
+    }
+
+    s.last_breathing_fusion_at = Some(now);
+    let result = fuse_breathing_from_active_nodes(&s.node_states, now);
+    apply_breathing_to_vitals(&mut s.latest_vitals, result);
+}
+
+fn fuse_breathing_from_active_nodes(
+    nodes: &HashMap<u8, NodeState>,
+    now: std::time::Instant,
+) -> BreathingResult {
+    let min_conf = breathing_min_confidence();
+    let mut weighted: Vec<(f32, f32)> = nodes
+        .values()
+        .filter(|node| is_node_active(node, now))
+        .filter_map(|node| {
+            let result = node.latest_breathing;
+            let bpm = result.breathing_bpm?;
+            let confidence = result.confidence;
+            (bpm.is_finite() && confidence.is_finite() && confidence >= min_conf)
+                .then_some((bpm, confidence))
+        })
+        .collect();
+
+    if weighted.is_empty() {
+        return BreathingResult::insufficient_data();
+    }
+
+    weighted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total_weight = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
+    if total_weight <= f32::EPSILON {
+        return BreathingResult::insufficient_data();
+    }
+
+    let midpoint = total_weight * 0.5;
+    let mut cumulative = 0.0_f32;
+    let mut fused_bpm = weighted[weighted.len() / 2].0;
+    for (bpm, weight) in &weighted {
+        cumulative += *weight;
+        if cumulative >= midpoint {
+            fused_bpm = *bpm;
+            break;
+        }
+    }
+
+    let confidence = (total_weight / weighted.len() as f32).clamp(0.0, 1.0);
+    BreathingResult {
+        breathing_bpm: (confidence >= min_conf).then_some(fused_bpm),
+        confidence,
+        method: BreathingResult::METHOD,
+    }
 }
 
 const LOCATION_RECENT_WINDOW: Duration = Duration::from_secs(2);
@@ -2754,6 +2862,7 @@ struct AppStateInner {
     tick: u64,
     source: String,
     feature_flags: FeatureFlags,
+    alert_manager: AlertManager,
     /// Instant of the last ESP32 UDP frame received (for offline detection).
     last_esp32_frame: Option<std::time::Instant>,
     tx: broadcast::Sender<String>,
@@ -2768,6 +2877,8 @@ struct AppStateInner {
     vital_detector: VitalSignDetector,
     /// Most recent vital sign reading for the REST endpoint.
     latest_vitals: VitalSigns,
+    /// Last time CSI phase breathing was fused across active nodes.
+    last_breathing_fusion_at: Option<std::time::Instant>,
     /// RVF container info if a model was loaded via `--load-rvf`.
     rvf_info: Option<RvfContainerInfo>,
     /// Path to save RVF container on shutdown (set via `--save-rvf`).
@@ -2968,6 +3079,67 @@ impl AppStateInner {
 const FRAME_HISTORY_CAPACITY: usize = 100;
 
 type SharedState = Arc<RwLock<AppStateInner>>;
+
+fn publish_sensing_update(s: &mut AppStateInner, update: SensingUpdate) {
+    let sample = alert_sample_from_update(&update);
+    let alerts = s.alert_manager.evaluate(&sample);
+
+    if let Ok(json) = serde_json::to_string(&update) {
+        let _ = s.tx.send(json);
+    }
+    for alert in alerts {
+        if let Ok(json) = serde_json::to_string(&alert) {
+            let _ = s.tx.send(json);
+        }
+    }
+    s.latest_update = Some(update);
+}
+
+fn alert_sample_from_update(update: &SensingUpdate) -> AlertSample {
+    let presence_score = if update.classification.presence {
+        update.classification.confidence
+    } else {
+        0.0
+    };
+    AlertSample {
+        person_id: alert_person_id(update),
+        breathing_bpm: update
+            .vital_signs
+            .as_ref()
+            .and_then(|vitals| vitals.breathing_rate_bpm),
+        breathing_confidence: update
+            .vital_signs
+            .as_ref()
+            .map_or(0.0, |vitals| vitals.breathing_confidence),
+        presence_score,
+        motion_energy: update.features.motion_band_power,
+        timestamp_ms: update_timestamp_ms(update),
+    }
+}
+
+fn update_timestamp_ms(update: &SensingUpdate) -> u64 {
+    if update.timestamp.is_finite() && update.timestamp > 0.0 {
+        (update.timestamp * 1000.0).round() as u64
+    } else {
+        chrono::Utc::now().timestamp_millis().max(0) as u64
+    }
+}
+
+fn alert_person_id(update: &SensingUpdate) -> u32 {
+    update
+        .persons
+        .as_ref()
+        .and_then(|persons| persons.first())
+        .map(|person| person.id)
+        .or_else(|| {
+            update
+                .state
+                .as_ref()
+                .and_then(|state| state.persons.first())
+                .map(|person| person.id)
+        })
+        .unwrap_or(1)
+}
 
 // ── ESP32 Edge Vitals Packet (ADR-039, magic 0xC511_0002) ────────────────────
 
@@ -4429,10 +4601,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
 
         finalize_persons_for_update(&mut s, &mut update);
 
-        if let Ok(json) = serde_json::to_string(&update) {
-            let _ = s.tx.send(json);
-        }
-        s.latest_update = Some(update);
+        publish_sensing_update(&mut s, update);
 
         debug!(
             "Multi-BSSID tick #{tick}: {obs_count} BSSIDs, quality={:.2}, verdict={:?}",
@@ -4582,10 +4751,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
 
     finalize_persons_for_update(&mut s, &mut update);
 
-    if let Ok(json) = serde_json::to_string(&update) {
-        let _ = s.tx.send(json);
-    }
-    s.latest_update = Some(update);
+    publish_sensing_update(&mut s, update);
 }
 
 /// Probe if Windows WiFi is connected
@@ -4813,13 +4979,7 @@ fn presence_persons(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_jso
         return Vec::new();
     }
 
-    let breathing_bpm = update
-        .vital_signs
-        .as_ref()
-        .and_then(|vitals| vitals.breathing_rate_bpm)
-        .or(s.latest_vitals.breathing_rate_bpm)
-        .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.breathing_rate_bpm))
-        .unwrap_or(0.0);
+    let (breathing_bpm, breathing_confidence) = breathing_for_presence(s, update);
     let include_heart_rate = s.feature_flags.beta_enabled(BetaFeature::PreciseHeartRate);
     let heart_rate_bpm = include_heart_rate
         .then(|| {
@@ -4844,6 +5004,7 @@ fn presence_persons(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_jso
                     person.position_m[2],
                     person.confidence,
                     breathing_bpm,
+                    breathing_confidence,
                     heart_rate_bpm,
                     true,
                     motion_energy,
@@ -4863,6 +5024,7 @@ fn presence_persons(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_jso
                     position[2],
                     person.confidence,
                     breathing_bpm,
+                    breathing_confidence,
                     heart_rate_bpm,
                     true,
                     motion_energy,
@@ -4884,6 +5046,7 @@ fn presence_persons(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_jso
                 location.y as f64,
                 location.confidence as f64,
                 breathing_bpm,
+                breathing_confidence,
                 heart_rate_bpm,
                 true,
                 motion_energy,
@@ -4892,12 +5055,43 @@ fn presence_persons(s: &AppStateInner, now: std::time::Instant) -> Vec<serde_jso
         .unwrap_or_default()
 }
 
+fn breathing_for_presence(s: &AppStateInner, update: &SensingUpdate) -> (Option<f64>, f64) {
+    let threshold = f64::from(breathing_min_confidence());
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(vitals) = update.vital_signs.as_ref() {
+        candidates.push((
+            vitals.breathing_rate_bpm,
+            vitals.breathing_confidence,
+        ));
+    }
+    candidates.push((
+        s.latest_vitals.breathing_rate_bpm,
+        s.latest_vitals.breathing_confidence,
+    ));
+    if let Some(edge) = s.edge_vitals.as_ref() {
+        candidates.push((
+            (edge.breathing_rate_bpm > 0.0).then_some(edge.breathing_rate_bpm),
+            if edge.presence { 0.7 } else { 0.0 },
+        ));
+    }
+
+    for (bpm, confidence) in candidates {
+        let confidence = clamp_unit(confidence);
+        if bpm.is_some() || confidence > 0.0 {
+            return (bpm.filter(|_| confidence >= threshold), confidence);
+        }
+    }
+
+    (None, 0.0)
+}
+
 fn presence_person_json(
     id: u32,
     x: f64,
     y: f64,
     confidence: f64,
-    breathing_bpm: f64,
+    breathing_bpm: Option<f64>,
+    breathing_confidence: f64,
     heart_rate_bpm: Option<f64>,
     is_present: bool,
     motion_energy: f64,
@@ -4907,7 +5101,9 @@ fn presence_person_json(
         "x": finite_or_zero(x),
         "y": finite_or_zero(y),
         "confidence": clamp_unit(confidence),
-        "breathing_bpm": finite_or_zero(breathing_bpm),
+        "breathing_bpm": breathing_bpm.map(finite_or_zero),
+        "breathing_confidence": clamp_unit(breathing_confidence),
+        "breathing_method": BreathingResult::METHOD,
         "is_present": is_present,
         "motion_energy": clamp_unit(motion_energy),
     });
@@ -4979,9 +5175,11 @@ fn node_vitals_json(
         .map(|last| now.saturating_duration_since(last).as_millis() as u64);
     let edge = node.edge_vitals.as_ref();
     let breathing_rate_bpm = edge
-        .map(|vitals| vitals.breathing_rate_bpm)
-        .or(node.latest_vitals.breathing_rate_bpm)
-        .unwrap_or(0.0);
+        .and_then(|vitals| (vitals.breathing_rate_bpm > 0.0).then_some(vitals.breathing_rate_bpm))
+        .or_else(|| node.latest_breathing.breathing_bpm.map(f64::from));
+    let breathing_confidence = edge
+        .map(|vitals| if vitals.presence { 0.7 } else { 0.0 })
+        .unwrap_or_else(|| f64::from(node.latest_breathing.confidence));
     let heart_rate_bpm = include_heart_rate.then(|| {
         edge.map(|vitals| vitals.heartrate_bpm)
             .or(node.latest_vitals.heart_rate_bpm)
@@ -5006,9 +5204,10 @@ fn node_vitals_json(
         "fall_detected": edge.map(|vitals| vitals.fall_detected).unwrap_or(false),
         "motion": edge.map(|vitals| vitals.motion).unwrap_or_else(|| node.smoothed_motion > 0.03),
         "motion_energy": normalize_motion_energy(motion_energy),
-        "breathing_rate_bpm": finite_or_zero(breathing_rate_bpm),
-        "breathing_bpm": finite_or_zero(breathing_rate_bpm),
-        "breathing_confidence": clamp_unit(node.latest_vitals.breathing_confidence),
+        "breathing_rate_bpm": breathing_rate_bpm.map(finite_or_zero),
+        "breathing_bpm": breathing_rate_bpm.map(finite_or_zero),
+        "breathing_confidence": clamp_unit(breathing_confidence),
+        "breathing_method": if edge.is_some() { "edge_vitals" } else { node.latest_breathing.method },
         "signal_quality": clamp_unit(node.latest_vitals.signal_quality),
         "rssi_dbm": node.rssi_history.back().copied(),
         "n_persons": edge.map(|vitals| vitals.n_persons).unwrap_or(node.prev_person_count as u8),
@@ -5286,6 +5485,44 @@ async fn latest(State(state): State<SharedState>) -> Json<serde_json::Value> {
     match &s.latest_update {
         Some(update) => Json(serde_json::to_value(update).unwrap_or_default()),
         None => Json(serde_json::json!({"status": "no data yet"})),
+    }
+}
+
+async fn alerts_active(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    Json(serde_json::to_value(s.alert_manager.active_response()).unwrap_or_else(|_| {
+        serde_json::json!({
+            "alerts": [],
+            "critical_count": 0,
+            "warning_count": 0,
+        })
+    }))
+}
+
+async fn alerts_ack(
+    State(state): State<SharedState>,
+    Path(alert_id): Path<String>,
+) -> Response {
+    let mut s = state.write().await;
+    if s.alert_manager.acknowledge(&alert_id) {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "alert_id": alert_id,
+                "acknowledged": true,
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "not_found",
+                "alert_id": alert_id,
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -8238,8 +8475,10 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
     let (br_len, br_cap, hb_len, hb_cap) = s.vital_detector.buffer_status();
     let timestamp_ms = unix_timestamp_ms();
     let now = std::time::Instant::now();
+    let breathing_threshold = f64::from(breathing_min_confidence());
     let breathing_bpm = vs
         .breathing_rate_bpm
+        .filter(|_| vs.breathing_confidence >= breathing_threshold)
         .or_else(|| s.edge_vitals.as_ref().map(|vitals| vitals.breathing_rate_bpm));
     let motion_energy = s
         .latest_update
@@ -8310,6 +8549,7 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
         "breathing_bpm": breathing_bpm,
         "breathing_rate_bpm": breathing_bpm,
         "breathing_confidence": vs.breathing_confidence,
+        "breathing_method": BreathingResult::METHOD,
         "motion_energy": normalize_motion_energy(motion_energy),
         "presence_score": clamp_unit(presence_score),
         "fall_suspected": fall_suspected,
@@ -10402,10 +10642,7 @@ async fn udp_receiver_task(
 
                     finalize_persons_for_update(&mut s, &mut update);
 
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = s.tx.send(json);
-                    }
-                    s.latest_update = Some(update);
+                    publish_sensing_update(&mut s, update);
                     s.edge_vitals = Some(vitals);
                     continue;
                 }
@@ -10663,10 +10900,13 @@ async fn udp_receiver_task(
                         ns.rssi_history.pop_front();
                     }
 
+                    let breathing_result =
+                        update_node_breathing_from_phase(ns, &frame, is_live_frame);
                     let raw_vitals = ns
                         .vital_detector
                         .process_frame(&frame.amplitudes, &frame.phases);
-                    let vitals = smooth_vitals_node(ns, &raw_vitals);
+                    let mut vitals = smooth_vitals_node(ns, &raw_vitals);
+                    apply_breathing_to_vitals(&mut vitals, breathing_result);
                     ns.latest_vitals = vitals.clone();
                     ns.update_tensor_compression(&frame.amplitudes, &frame.phases);
 
@@ -10775,6 +11015,8 @@ async fn udp_receiver_task(
                         }
                     }
                     maybe_drive_auto_calibration(&mut s, now);
+                    maybe_update_fused_breathing(&mut s, now);
+                    let update_vitals = s.latest_vitals.clone();
 
                     // Build nodes array with all active nodes.
                     let environment = s.environment.clone();
@@ -10820,7 +11062,7 @@ async fn udp_receiver_task(
                             fused_features.variance.min(1.0),
                             &sub_variances,
                         ),
-                        vital_signs: Some(vitals),
+                        vital_signs: Some(update_vitals),
                         enhanced_motion: None,
                         enhanced_breathing: None,
                         posture: None,
@@ -10847,10 +11089,7 @@ async fn udp_receiver_task(
 
                     finalize_persons_for_update(&mut s, &mut update);
 
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = s.tx.send(json);
-                    }
-                    s.latest_update = Some(update);
+                    publish_sensing_update(&mut s, update);
 
                     // Evict stale nodes every 100 ticks to prevent memory leak.
                     if tick % 100 == 0 {
@@ -10996,10 +11235,12 @@ async fn handle_delivered_esp32_frame(
         ns.rssi_history.pop_front();
     }
 
+    let breathing_result = update_node_breathing_from_phase(ns, &frame, is_live_frame);
     let raw_vitals = ns
         .vital_detector
         .process_frame(&frame.amplitudes, &frame.phases);
-    let vitals = smooth_vitals_node(ns, &raw_vitals);
+    let mut vitals = smooth_vitals_node(ns, &raw_vitals);
+    apply_breathing_to_vitals(&mut vitals, breathing_result);
     ns.latest_vitals = vitals.clone();
     ns.update_tensor_compression(&frame.amplitudes, &frame.phases);
 
@@ -11076,6 +11317,8 @@ async fn handle_delivered_esp32_frame(
         }
     }
     maybe_drive_auto_calibration(&mut s, now);
+    maybe_update_fused_breathing(&mut s, now);
+    let update_vitals = s.latest_vitals.clone();
 
     let environment = s.environment.clone();
     let active_nodes: Vec<NodeInfo> = s
@@ -11119,7 +11362,7 @@ async fn handle_delivered_esp32_frame(
             fused_features.variance.min(1.0),
             &sub_variances,
         ),
-        vital_signs: Some(vitals),
+        vital_signs: Some(update_vitals),
         enhanced_motion: None,
         enhanced_breathing: None,
         posture: None,
@@ -11141,10 +11384,7 @@ async fn handle_delivered_esp32_frame(
 
     finalize_persons_for_update(&mut s, &mut update);
 
-    if let Ok(json) = serde_json::to_string(&update) {
-        let _ = s.tx.send(json);
-    }
-    s.latest_update = Some(update);
+    publish_sensing_update(&mut s, update);
 
     if tick % 100 == 0 {
         let stale = Duration::from_secs(60);
@@ -11312,10 +11552,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         if update.classification.presence {
             s.total_detections += 1;
         }
-        if let Ok(json) = serde_json::to_string(&update) {
-            let _ = s.tx.send(json);
-        }
-        s.latest_update = Some(update);
+        publish_sensing_update(&mut s, update);
     }
 }
 
@@ -12396,6 +12633,7 @@ async fn main() {
         frame_history: VecDeque::new(),
         tick: 0,
         source: source.into(),
+        alert_manager: AlertManager::new(feature_flags.alert_thresholds.clone()),
         feature_flags,
         last_esp32_frame: None,
         tx,
@@ -12405,6 +12643,7 @@ async fn main() {
         start_time: std::time::Instant::now(),
         vital_detector: VitalSignDetector::new(vital_sample_rate),
         latest_vitals: VitalSigns::default(),
+        last_breathing_fusion_at: None,
         rvf_info,
         save_rvf_path: args.save_rvf.clone(),
         progressive_loader,
@@ -12638,6 +12877,8 @@ async fn main() {
         .route("/api/v1/metrics", get(health_metrics))
         // Sensing endpoints
         .route("/api/v1/sensing/latest", get(latest))
+        .route("/api/v1/alerts/active", get(alerts_active))
+        .route("/api/v1/alerts/{alert_id}/ack", post(alerts_ack))
         .route("/api/v1/fleet", get(fleet_endpoint))
         .route("/api/v1/topology", get(topology_endpoint))
         .route(

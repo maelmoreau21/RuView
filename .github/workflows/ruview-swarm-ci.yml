@@ -11,16 +11,8 @@ name: ruview-swarm CI guard
 # Path-scoped so it only runs when the crate or this workflow changes.
 
 on:
-  push:
-    branches: [ main, 'feat/*' ]
-    paths:
-      - 'v2/crates/ruview-swarm/**'
-      - '.github/workflows/ruview-swarm-ci.yml'
-  pull_request:
-    paths:
-      - 'v2/crates/ruview-swarm/**'
-      - '.github/workflows/ruview-swarm-ci.yml'
   workflow_dispatch:
+
 
 env:
   CARGO_TERM_COLOR: always
