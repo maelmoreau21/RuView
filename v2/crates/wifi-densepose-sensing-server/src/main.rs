@@ -1198,21 +1198,8 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn localization_node_positions(env: &EnvironmentConfig) -> Vec<NodePosition> {
-    let mut positions: Vec<NodePosition> = env
-        .nodes
-        .iter()
-        .map(|node| NodePosition {
-            node_id: node.node_id,
-            x: node.position_m[0] as f32,
-            y: node.position_m[2] as f32,
-        })
-        .collect();
-    if positions.is_empty() {
-        positions = localization::node_positions_from_env();
-    }
-    positions.sort_by_key(|position| position.node_id);
-    positions
+fn localization_node_positions(room_config: &localization::SharedRoomConfig) -> Vec<NodePosition> {
+    localization::node_positions_from_room_config_state(room_config)
 }
 
 fn recent_location_rssi(s: &AppStateInner, now: std::time::Instant) -> Vec<(u8, f32)> {
@@ -1237,7 +1224,7 @@ fn localization_snapshot(
     now: std::time::Instant,
     timestamp_ms: u64,
 ) -> (Option<PersonLocation>, usize, Vec<NodePosition>) {
-    let positions = localization_node_positions(&s.environment);
+    let positions = localization_node_positions(&s.localization_room_config);
     let readings = recent_location_rssi(s, now);
     let node_count = localization::locatable_node_count(&readings, &positions);
     let location =
@@ -1713,7 +1700,7 @@ fn position_json(position: [f64; 3], source: &str, confidence: f64) -> serde_jso
     })
 }
 
-fn room_floor_diagonal_m(room: &RoomConfig) -> f64 {
+fn room_floor_diagonal_m(room: &EnvironmentRoomConfig) -> f64 {
     let width = room.dimensions_m[0].max(1.0);
     let depth = room.dimensions_m[2].max(1.0);
     (width.powi(2) + depth.powi(2)).sqrt().max(1.0)
@@ -1810,7 +1797,7 @@ fn matching_config_ap<'a>(
 fn estimated_ring_position(
     index: usize,
     total: usize,
-    room: &RoomConfig,
+    room: &EnvironmentRoomConfig,
     y: f64,
     phase: f64,
 ) -> [f64; 3] {
@@ -2192,9 +2179,10 @@ const DEFAULT_ENABLED_MODULES: &[&str] = &[
 
 const MODULE_CONFIG_VERSION: u8 = 1;
 const ROOM_CONFIG_FILENAME: &str = "room-config.json";
+const UI_ROOM_CONFIG_VERSION: u32 = 2;
 const ROOM_DIMENSION_MIN_METERS: f64 = 1.0;
 const ROOM_DIMENSION_MAX_METERS: f64 = 30.0;
-const ROOM_CONFIG_MAX_NODES: usize = 6;
+const ROOM_CONFIG_MAX_NODES: usize = 100;
 const DEFAULT_ROOM_VERTICAL_METERS: f64 = 2.6;
 const DEFAULT_ROOM_NODE_HEIGHT_METERS: f64 = 1.0;
 const APNEA_SECONDS_MIN: u64 = 10;
@@ -2260,22 +2248,77 @@ fn default_enabled_modules() -> Vec<String> {
     DEFAULT_ENABLED_MODULES.iter().map(|id| (*id).to_string()).collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct UiRoomNodeConfig {
-    id: u8,
-    x: f64,
-    y: f64,
+struct Point2D {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RoomShape {
+    shape: String,
+    boundary: Vec<Point2D>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct NodeConfig {
+    id: u32,
+    x: f32,
+    y: f32,
     active: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct UiRoomConfig {
-    room_width_meters: f64,
-    room_height_meters: f64,
-    nodes: Vec<UiRoomNodeConfig>,
+struct RoomConfig {
+    version: u32,
+    room: RoomShape,
+    nodes: Vec<NodeConfig>,
 }
+
+#[derive(Debug, Clone)]
+struct RoomValidationError {
+    field: &'static str,
+    reason: String,
+}
+
+impl RoomValidationError {
+    fn new(field: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyUiRoomNodeConfig {
+    id: u32,
+    x: f32,
+    y: f32,
+    #[serde(default = "default_legacy_active_node")]
+    active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyUiRoomConfig {
+    room_width_meters: f32,
+    room_height_meters: f32,
+    #[serde(default)]
+    nodes: Vec<LegacyUiRoomNodeConfig>,
+}
+
+fn default_legacy_active_node() -> bool {
+    true
+}
+
+type UiRoomPointConfig = Point2D;
+type UiRoomShapeConfig = RoomShape;
+type UiRoomNodeConfig = NodeConfig;
+type UiRoomConfig = RoomConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2288,7 +2331,7 @@ struct AlertConfigUpdate {
 /// Physical room profile used by the 3D console and calibration UI.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RoomConfig {
+pub(crate) struct EnvironmentRoomConfig {
     pub name: String,
     pub dimensions_m: [f64; 3],
     pub coordinate_system: String,
@@ -2351,7 +2394,7 @@ pub(crate) struct EnvironmentObstacleConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnvironmentConfig {
-    pub room: RoomConfig,
+    pub room: EnvironmentRoomConfig,
     pub access_points: Vec<AccessPointConfig>,
     pub nodes: Vec<EnvironmentNodeConfig>,
     pub links: Vec<EnvironmentLinkConfig>,
@@ -2373,7 +2416,7 @@ struct AccessPointObservation {
 impl Default for EnvironmentConfig {
     fn default() -> Self {
         Self {
-            room: RoomConfig {
+            room: EnvironmentRoomConfig {
                 name: "primary".to_string(),
                 dimensions_m: [5.2, 2.6, 4.8],
                 coordinate_system: "x_right_y_up_z_depth".to_string(),
@@ -3062,6 +3105,8 @@ struct AppStateInner {
     pub(crate) runtime_config_path: std::path::PathBuf,
     /// Persisted room/AP/node topology consumed by the RuvSense Console.
     pub(crate) environment: EnvironmentConfig,
+    /// Live localization room layout loaded from and synchronized with `room-config.json`.
+    pub(crate) localization_room_config: localization::SharedRoomConfig,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -9116,39 +9161,177 @@ fn validate_dimension_meters(name: &str, value: f64) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_ui_room_config(config: &UiRoomConfig) -> Result<(), String> {
-    validate_dimension_meters("room_width_meters", config.room_width_meters)?;
-    validate_dimension_meters("room_height_meters", config.room_height_meters)?;
+fn ui_room_config_from_legacy(legacy: LegacyUiRoomConfig) -> UiRoomConfig {
+    UiRoomConfig {
+        version: UI_ROOM_CONFIG_VERSION,
+        room: UiRoomShapeConfig {
+            shape: "polygon".to_string(),
+            boundary: vec![
+                UiRoomPointConfig { x: 0.0, y: 0.0 },
+                UiRoomPointConfig {
+                    x: legacy.room_width_meters,
+                    y: 0.0,
+                },
+                UiRoomPointConfig {
+                    x: legacy.room_width_meters,
+                    y: legacy.room_height_meters,
+                },
+                UiRoomPointConfig {
+                    x: 0.0,
+                    y: legacy.room_height_meters,
+                },
+            ],
+        },
+        nodes: legacy
+            .nodes
+            .into_iter()
+            .map(|node| UiRoomNodeConfig {
+                id: node.id,
+                x: node.x,
+                y: node.y,
+                active: node.active,
+            })
+            .collect(),
+    }
+}
+
+fn ui_room_config_from_json(value: serde_json::Value) -> Result<UiRoomConfig, String> {
+    match serde_json::from_value::<UiRoomConfig>(value.clone()) {
+        Ok(config) => {
+            validate_ui_room_config(&config).map_err(|e| format!("{}: {}", e.field, e.reason))?;
+            Ok(config)
+        }
+        Err(v2_error) => {
+            let legacy = serde_json::from_value::<LegacyUiRoomConfig>(value)
+                .map_err(|legacy_error| format!("invalid room config: {v2_error}; legacy parse failed: {legacy_error}"))?;
+            let config = ui_room_config_from_legacy(legacy);
+            validate_ui_room_config(&config).map_err(|e| format!("{}: {}", e.field, e.reason))?;
+            Ok(config)
+        }
+    }
+}
+
+fn load_ui_room_config_file(ui_path: &StdPath) -> Result<UiRoomConfig, String> {
+    let path = ui_path.join(ROOM_CONFIG_FILENAME);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    let migrated =
+        value.get("room_width_meters").is_some() || value.get("room_height_meters").is_some();
+    let config = ui_room_config_from_json(value)?;
+    if migrated {
+        save_ui_room_config_file(ui_path, &config)?;
+        info!(
+            "Migrated legacy {} to room-config schema v{}",
+            path.display(),
+            UI_ROOM_CONFIG_VERSION
+        );
+    }
+    Ok(config)
+}
+
+fn ui_room_bounds(config: &UiRoomConfig) -> (f64, f64, f64, f64) {
+    let min_x = config
+        .room
+        .boundary
+        .iter()
+        .map(|point| f64::from(point.x))
+        .fold(f64::INFINITY, f64::min);
+    let max_x = config
+        .room
+        .boundary
+        .iter()
+        .map(|point| f64::from(point.x))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = config
+        .room
+        .boundary
+        .iter()
+        .map(|point| f64::from(point.y))
+        .fold(f64::INFINITY, f64::min);
+    let max_y = config
+        .room
+        .boundary
+        .iter()
+        .map(|point| f64::from(point.y))
+        .fold(f64::NEG_INFINITY, f64::max);
+    (min_x, max_x, min_y, max_y)
+}
+
+fn validate_ui_room_config(config: &UiRoomConfig) -> Result<(), RoomValidationError> {
+    if config.version != UI_ROOM_CONFIG_VERSION {
+        return Err(RoomValidationError::new(
+            "version",
+            format!("version must be {UI_ROOM_CONFIG_VERSION}, got {}", config.version),
+        ));
+    }
+    if config.room.shape != "polygon" {
+        return Err(RoomValidationError::new(
+            "room.shape",
+            "room.shape must be \"polygon\"",
+        ));
+    }
+    if config.room.boundary.len() < 3 {
+        return Err(RoomValidationError::new(
+            "boundary",
+            "boundary must include at least 3 points",
+        ));
+    }
+    for (index, point) in config.room.boundary.iter().enumerate() {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return Err(RoomValidationError::new(
+                "boundary",
+                format!("boundary[{index}] x/y must be finite"),
+            ));
+        }
+    }
+    let (min_x, max_x, min_y, max_y) = ui_room_bounds(config);
+    validate_dimension_meters("room boundary width", max_x - min_x)
+        .map_err(|reason| RoomValidationError::new("boundary", reason))?;
+    validate_dimension_meters("room boundary height", max_y - min_y)
+        .map_err(|reason| RoomValidationError::new("boundary", reason))?;
+
     if config.nodes.is_empty() {
-        return Err("nodes must include at least one node".to_string());
+        return Err(RoomValidationError::new(
+            "nodes",
+            "nodes must include at least one node",
+        ));
     }
     if config.nodes.len() > ROOM_CONFIG_MAX_NODES {
-        return Err(format!(
-            "nodes must contain at most {ROOM_CONFIG_MAX_NODES} entries"
+        return Err(RoomValidationError::new(
+            "nodes",
+            format!("nodes must contain at most {ROOM_CONFIG_MAX_NODES} entries"),
         ));
     }
 
     let mut seen = HashSet::new();
     for node in &config.nodes {
-        if !(1..=ROOM_CONFIG_MAX_NODES as u8).contains(&node.id) {
-            return Err(format!(
-                "node id {} must be in [1, {}]",
-                node.id, ROOM_CONFIG_MAX_NODES
+        if !(1..=ROOM_CONFIG_MAX_NODES as u32).contains(&node.id) {
+            return Err(RoomValidationError::new(
+                "nodes",
+                format!(
+                    "node id {} must be in [1, {}]",
+                    node.id, ROOM_CONFIG_MAX_NODES
+                ),
             ));
         }
         if !seen.insert(node.id) {
-            return Err(format!("duplicate node id {}", node.id));
-        }
-        if !node.x.is_finite() || !(0.0..=config.room_width_meters).contains(&node.x) {
-            return Err(format!(
-                "node {} x must be finite and inside the room width",
-                node.id
+            return Err(RoomValidationError::new(
+                "nodes",
+                format!("duplicate node id {}", node.id),
             ));
         }
-        if !node.y.is_finite() || !(0.0..=config.room_height_meters).contains(&node.y) {
-            return Err(format!(
-                "node {} y must be finite and inside the room height",
-                node.id
+        if !node.x.is_finite() {
+            return Err(RoomValidationError::new(
+                "nodes",
+                format!("node {} x must be finite", node.id),
+            ));
+        }
+        if !node.y.is_finite() {
+            return Err(RoomValidationError::new(
+                "nodes",
+                format!("node {} y must be finite", node.id),
             ));
         }
     }
@@ -9171,10 +9354,11 @@ fn environment_from_ui_room_config(
     let mut environment = existing.clone();
     let vertical_m = room_vertical_meters(existing);
     let node_height_m = DEFAULT_ROOM_NODE_HEIGHT_METERS.min(vertical_m);
+    let (min_x, max_x, min_y, max_y) = ui_room_bounds(config);
     environment.room.dimensions_m = [
-        config.room_width_meters,
+        max_x - min_x,
         vertical_m,
-        config.room_height_meters,
+        max_y - min_y,
     ];
 
     let active_total = config.nodes.iter().filter(|node| node.active).count().max(1) as u8;
@@ -9185,20 +9369,24 @@ fn environment_from_ui_room_config(
         .filter(|node| node.active)
         .enumerate()
         .map(|(index, node)| {
-            active_ids.insert(node.id);
-            let previous = existing.nodes.iter().find(|existing| existing.node_id == node.id);
+            let node_id = node.id as u8;
+            active_ids.insert(node_id);
+            let previous = existing
+                .nodes
+                .iter()
+                .find(|existing| existing.node_id == node_id);
             EnvironmentNodeConfig {
-                node_id: node.id,
+                node_id,
                 label: previous
                     .map(|existing| existing.label.clone())
-                    .unwrap_or_else(|| format!("ESP32-C6 #{}", node.id)),
+                    .unwrap_or_else(|| format!("ESP32-C6 #{}", node_id)),
                 kind: previous
                     .map(|existing| existing.kind.clone())
                     .unwrap_or_else(|| "esp32_c6".to_string()),
                 zone: previous
                     .map(|existing| existing.zone.clone())
                     .unwrap_or_else(|| "primary".to_string()),
-                position_m: [node.x, node_height_m, node.y],
+                position_m: [f64::from(node.x), node_height_m, f64::from(node.y)],
                 tdm_slot: previous
                     .map(|existing| existing.tdm_slot)
                     .unwrap_or(index as u8),
@@ -9218,8 +9406,67 @@ fn environment_from_ui_room_config(
     environment
 }
 
+fn localization_room_config_from_ui(config: &UiRoomConfig) -> localization::RoomConfig {
+    localization::RoomConfig {
+        version: config.version,
+        room: localization::RoomShape {
+            shape: config.room.shape.clone(),
+            boundary: config
+                .room
+                .boundary
+                .iter()
+                .map(|point| localization::Point2D {
+                    x: point.x,
+                    y: point.y,
+                })
+                .collect(),
+        },
+        nodes: config
+            .nodes
+            .iter()
+            .map(|node| localization::NodeConfig {
+                id: node.id,
+                x: node.x,
+                y: node.y,
+                active: node.active,
+            })
+            .collect(),
+    }
+}
+
+fn load_initial_localization_room_config(path: &StdPath) -> localization::RoomConfig {
+    let Some(ui_path) = path.parent() else {
+        warn!("Localization room config path has no parent; localization will wait for /api/v1/config/room");
+        return localization::RoomConfig::default();
+    };
+    if !path.exists() {
+        warn!(
+            "Localization room config {} not found; localization will wait for /api/v1/config/room",
+            path.display()
+        );
+        return localization::RoomConfig::default();
+    }
+
+    match load_ui_room_config_file(ui_path) {
+        Ok(config) => {
+            let localization_config = localization_room_config_from_ui(&config);
+            let positions = localization::node_positions_from_room_config(&localization_config);
+            info!(
+                "Loaded localization room config from {} with {} active node positions",
+                path.display(),
+                positions.len()
+            );
+            localization_config
+        }
+        Err(message) => {
+            warn!("{message}; localization will wait for /api/v1/config/room");
+            localization::RoomConfig::default()
+        }
+    }
+}
+
 fn save_ui_room_config_file(ui_path: &StdPath, config: &UiRoomConfig) -> Result<(), String> {
-    validate_ui_room_config(config)?;
+    validate_ui_room_config(config).map_err(|e| format!("{}: {}", e.field, e.reason))?;
     let path = ui_path.join(ROOM_CONFIG_FILENAME);
     let text = serde_json::to_string_pretty(config)
         .map_err(|e| format!("failed to serialize room config: {e}"))?;
@@ -12848,6 +13095,13 @@ async fn main() {
         feature_flags.disabled_names().join(", ")
     );
 
+    let localization_room_config_path = args.ui_path.join(ROOM_CONFIG_FILENAME);
+    let localization_room_config =
+        load_initial_localization_room_config(&localization_room_config_path);
+    let localization_room_config_state =
+        localization::new_room_config_state(localization_room_config);
+    localization::install_room_config_state(Arc::clone(&localization_room_config_state));
+
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         latest_update: None,
         rssi_history: VecDeque::new(),
@@ -12973,6 +13227,7 @@ async fn main() {
         ui_path: args.ui_path.clone(),
         runtime_config_path: runtime_config_path.clone(),
         environment: runtime_config.environment.clone(),
+        localization_room_config: Arc::clone(&localization_room_config_state),
     }));
 
     #[cfg(target_os = "linux")]
@@ -13196,7 +13451,7 @@ async fn main() {
             "/api/v1/config/dedup-factor",
             get(config_get_dedup_factor).post(config_set_dedup_factor),
         )
-        .route("/api/v1/config/room", post(config_set_room))
+        .route("/api/v1/config/room", get(config_get_room).post(config_set_room))
         .route("/api/v1/config/alerts", post(config_set_alerts))
         .route("/api/v1/config/ground-truth", post(config_set_ground_truth))
         .route("/api/v1/config/schema", get(config_schema_endpoint))
@@ -13295,17 +13550,24 @@ mod topology_console_tests {
         topology_readiness_json, upsert_environment_node_positions, validate_config_file,
         validate_runtime_config, validate_ui_room_config, AccessPointConfig, AlertConfigUpdate,
         ConfigSchemaKind, EnvironmentConfig, EnvironmentLinkConfig, EnvironmentObstacleConfig,
-        EnvironmentNodeConfig, LogFormat, NodePositionUpdate, NodeState, RoomConfig,
-        RuntimeConfig, UiRoomConfig, UiRoomNodeConfig, ESP32_OFFLINE_TIMEOUT,
-        MODULE_CONFIG_VERSION, MODULE_PRESETS,
+        EnvironmentNodeConfig, EnvironmentRoomConfig, LogFormat, NodePositionUpdate, NodeState,
+        RuntimeConfig, UiRoomConfig, UiRoomNodeConfig, UiRoomPointConfig, UiRoomShapeConfig,
+        ESP32_OFFLINE_TIMEOUT, MODULE_CONFIG_VERSION, MODULE_PRESETS,
     };
-    use std::collections::HashMap;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header::CONTENT_TYPE, Method, Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::time::{Duration, Instant};
+    use tower::ServiceExt;
 
     fn configured_test_environment() -> EnvironmentConfig {
         EnvironmentConfig {
-            room: RoomConfig {
+            room: EnvironmentRoomConfig {
                 name: "test".to_string(),
                 dimensions_m: [4.0, 3.0, 2.8],
                 coordinate_system: "x_right_y_up_z_depth".to_string(),
@@ -13415,8 +13677,16 @@ mod topology_console_tests {
 
     fn valid_ui_room_config() -> UiRoomConfig {
         UiRoomConfig {
-            room_width_meters: 6.0,
-            room_height_meters: 4.0,
+            version: 2,
+            room: UiRoomShapeConfig {
+                shape: "polygon".to_string(),
+                boundary: vec![
+                    UiRoomPointConfig { x: 0.0, y: 0.0 },
+                    UiRoomPointConfig { x: 6.0, y: 0.0 },
+                    UiRoomPointConfig { x: 6.0, y: 4.0 },
+                    UiRoomPointConfig { x: 0.0, y: 4.0 },
+                ],
+            },
             nodes: vec![
                 UiRoomNodeConfig {
                     id: 1,
@@ -13439,23 +13709,34 @@ mod topology_console_tests {
         let config = valid_ui_room_config();
         assert!(validate_ui_room_config(&config).is_ok());
 
-        let mut bad_width = config.clone();
-        bad_width.room_width_meters = 31.0;
-        assert!(validate_ui_room_config(&bad_width)
-            .expect_err("width above 30m must fail")
-            .contains("room_width_meters"));
+        let mut bad_version = config.clone();
+        bad_version.version = 1;
+        assert_eq!(
+            validate_ui_room_config(&bad_version)
+                .expect_err("wrong version must fail")
+                .field,
+            "version"
+        );
+
+        let mut bad_boundary = config.clone();
+        bad_boundary.room.boundary[1].x = 31.0;
+        let err =
+            validate_ui_room_config(&bad_boundary).expect_err("boundary width above 30m must fail");
+        assert_eq!(err.field, "boundary");
+        assert!(err.reason.contains("room boundary width"));
 
         let mut bad_id = config.clone();
-        bad_id.nodes[0].id = 7;
-        assert!(validate_ui_room_config(&bad_id)
-            .expect_err("node ids are capped at six")
-            .contains("node id 7"));
+        bad_id.nodes[0].id = 101;
+        let err = validate_ui_room_config(&bad_id).expect_err("node ids are capped");
+        assert_eq!(err.field, "nodes");
+        assert!(err.reason.contains("node id 101"));
 
         let mut out_of_room = config;
-        out_of_room.nodes[0].x = 6.1;
-        assert!(validate_ui_room_config(&out_of_room)
-            .expect_err("coordinates outside the room must fail")
-            .contains("inside the room width"));
+        out_of_room.nodes[0].x = f32::NAN;
+        let err =
+            validate_ui_room_config(&out_of_room).expect_err("non-finite coordinates must fail");
+        assert_eq!(err.field, "nodes");
+        assert!(err.reason.contains("node 1 x"));
     }
 
     #[test]
@@ -13480,8 +13761,286 @@ mod topology_console_tests {
         let path = dir.path().join("room-config.json");
         let saved = fs::read_to_string(path).expect("room-config.json should exist");
         let loaded: UiRoomConfig = serde_json::from_str(&saved).expect("saved JSON should parse");
-        assert_eq!(loaded.room_width_meters, 6.0);
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.room.shape, "polygon");
+        assert_eq!(loaded.room.boundary[1], UiRoomPointConfig { x: 6.0, y: 0.0 });
         assert!(!loaded.nodes[1].active);
+    }
+
+    #[test]
+    fn load_ui_room_config_migrates_legacy_rectangle_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("room-config.json"),
+            serde_json::json!({
+                "room_width_meters": 5.0,
+                "room_height_meters": 4.0,
+                "nodes": [
+                    { "id": 1, "x": 0.0, "y": 0.0 },
+                    { "id": 2, "x": 5.0, "y": 0.0 }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("legacy write");
+
+        let migrated = super::load_ui_room_config_file(dir.path()).expect("legacy migrates");
+
+        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.room.boundary.len(), 4);
+        assert_eq!(migrated.room.boundary[2], UiRoomPointConfig { x: 5.0, y: 4.0 });
+        assert!(migrated.nodes.iter().all(|node| node.active));
+
+        let saved = fs::read_to_string(dir.path().join("room-config.json")).expect("rewritten");
+        let value: serde_json::Value = serde_json::from_str(&saved).expect("json");
+        assert!(value.get("room_width_meters").is_none());
+        assert_eq!(value["room"]["shape"], serde_json::json!("polygon"));
+    }
+
+    fn test_state(ui_path: &std::path::Path, initial_room: &UiRoomConfig) -> super::SharedState {
+        let feature_flags = super::FeatureFlags::default();
+        let alert_thresholds = feature_flags.alert_thresholds.clone();
+        let (tx, _) = tokio::sync::broadcast::channel::<String>(16);
+        let (intro_tx, _) = tokio::sync::broadcast::channel::<String>(16);
+        let localization_room_config =
+            super::localization_room_config_from_ui(initial_room);
+        let localization_room_config_state =
+            super::localization::new_room_config_state(localization_room_config);
+        let runtime_config_path = ui_path.join("data").join("config.json");
+
+        std::sync::Arc::new(tokio::sync::RwLock::new(super::AppStateInner {
+            latest_update: None,
+            rssi_history: VecDeque::new(),
+            frame_history: VecDeque::new(),
+            tick: 0,
+            source: "esp32".to_string(),
+            feature_flags,
+            alert_manager: super::AlertManager::new(alert_thresholds),
+            last_esp32_frame: None,
+            tx,
+            intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
+            intro_tx,
+            total_detections: 0,
+            start_time: std::time::Instant::now(),
+            vital_detector: super::VitalSignDetector::new(10.0),
+            latest_vitals: super::VitalSigns::default(),
+            last_breathing_fusion_at: None,
+            rvf_info: None,
+            save_rvf_path: None,
+            progressive_loader: None,
+            active_sona_profile: None,
+            model_loaded: false,
+            smoothed_person_score: 0.0,
+            prev_person_count: 0,
+            smoothed_motion: 0.0,
+            current_motion_level: "absent".to_string(),
+            debounce_counter: 0,
+            debounce_candidate: "absent".to_string(),
+            baseline_motion: 0.0,
+            baseline_frames: 0,
+            smoothed_hr: 0.0,
+            smoothed_br: 0.0,
+            smoothed_hr_conf: 0.0,
+            smoothed_br_conf: 0.0,
+            hr_buffer: VecDeque::with_capacity(8),
+            br_buffer: VecDeque::with_capacity(8),
+            edge_vitals: None,
+            latest_wasm_events: None,
+            discovered_models: Vec::new(),
+            active_model_id: None,
+            recordings: Vec::new(),
+            recording_active: false,
+            recording_start_time: None,
+            recording_current_id: None,
+            recording_stop_tx: None,
+            training_status: "idle".to_string(),
+            training_config: None,
+            adaptive_model: None,
+            node_states: HashMap::new(),
+            udp_jitter_stats: HashMap::new(),
+            detected_access_points: Vec::new(),
+            wifi_interface: "test0".to_string(),
+            ap_scan_interval_secs: 1,
+            pose_tracker: super::PoseTracker::new(),
+            location_smoother: super::LocationSmoother::default(),
+            last_tracker_instant: None,
+            stable_rendered_person_count: 0,
+            count_candidate_persons: 0,
+            count_candidate_since: None,
+            last_present_at: None,
+            last_present_count: 0,
+            last_present_confidence: 0.0,
+            multistatic_fuser: super::MultistaticFuser::with_config(super::MultistaticConfig {
+                min_nodes: 1,
+                ..Default::default()
+            }),
+            field_model: None,
+            auto_calibration_enabled: false,
+            auto_calibration_policy: "safe".to_string(),
+            auto_calibration_quiet_since: None,
+            auto_calibration_last_action: None,
+            p95_variance: super::RollingP95::new(600, 60),
+            p95_motion_band_power: super::RollingP95::new(600, 60),
+            p95_spectral_power: super::RollingP95::new(600, 60),
+            latest_pose_latency_ms: 0.0,
+            pose_latency_p95_ms: super::RollingP95::new(600, 10),
+            latest_dsp_latency_ms: 0.0,
+            dsp_latency_p95_ms: super::RollingP95::new(600, 10),
+            dedup_factor: super::default_dedup_factor(),
+            enabled_modules: super::default_enabled_modules().into_iter().collect(),
+            min_nodes: 1,
+            data_dir: ui_path.join("data"),
+            ui_path: ui_path.to_path_buf(),
+            runtime_config_path,
+            environment: configured_test_environment(),
+            localization_room_config: localization_room_config_state,
+        }))
+    }
+
+    fn room_test_app(state: super::SharedState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/config/room",
+                get(super::config_get_room).post(super::config_set_room),
+            )
+            .route("/api/v1/location", get(super::location_endpoint))
+            .with_state(state)
+    }
+
+    async fn request_json(
+        app: Router,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        let request = if let Some(body) = body {
+            builder = builder.header(CONTENT_TYPE, "application/json");
+            builder.body(Body::from(body.to_string())).unwrap()
+        } else {
+            builder.body(Body::empty()).unwrap()
+        };
+        let response = app.oneshot(request).await.expect("router response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn post_room_config_valid_payload_writes_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = valid_ui_room_config();
+        let state = test_state(dir.path(), &config);
+        let app = room_test_app(state);
+
+        let (status, json) = request_json(
+            app.clone(),
+            Method::POST,
+            "/api/v1/config/room",
+            Some(serde_json::to_value(&config).expect("json")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!({ "status": "ok" }));
+        let saved = fs::read_to_string(dir.path().join("room-config.json")).expect("room file");
+        let loaded: UiRoomConfig = serde_json::from_str(&saved).expect("v2 room config");
+        assert_eq!(loaded, config);
+
+        let (get_status, get_json) =
+            request_json(app, Method::GET, "/api/v1/config/room", None).await;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_json, serde_json::to_value(&config).expect("json"));
+    }
+
+    #[tokio::test]
+    async fn post_room_config_boundary_with_two_points_returns_422() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = valid_ui_room_config();
+        config.room.boundary.truncate(2);
+        let state = test_state(dir.path(), &valid_ui_room_config());
+        let app = room_test_app(state);
+
+        let (status, json) = request_json(
+            app,
+            Method::POST,
+            "/api/v1/config/room",
+            Some(serde_json::to_value(&config).expect("json")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["error"], serde_json::json!("validation_failed"));
+        assert_eq!(json["field"], serde_json::json!("boundary"));
+        assert!(json["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("at least 3 points"));
+    }
+
+    #[tokio::test]
+    async fn post_room_config_updates_location_node_positions_without_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let initial = valid_ui_room_config();
+        let state = test_state(dir.path(), &initial);
+        {
+            let mut s = state.write().await;
+            let now = std::time::Instant::now();
+            for node_id in [1_u8, 2_u8] {
+                let mut node = NodeState::new();
+                node.last_csi_time = Some(now);
+                node.rssi_history.push_back(-42.0);
+                s.node_states.insert(node_id, node);
+            }
+        }
+        let app = room_test_app(state);
+        let updated = UiRoomConfig {
+            version: 2,
+            room: UiRoomShapeConfig {
+                shape: "polygon".to_string(),
+                boundary: vec![
+                    UiRoomPointConfig { x: 10.0, y: 0.0 },
+                    UiRoomPointConfig { x: 14.0, y: 0.0 },
+                    UiRoomPointConfig { x: 14.0, y: 4.0 },
+                    UiRoomPointConfig { x: 10.0, y: 4.0 },
+                ],
+            },
+            nodes: vec![
+                UiRoomNodeConfig {
+                    id: 1,
+                    x: 10.0,
+                    y: 0.0,
+                    active: true,
+                },
+                UiRoomNodeConfig {
+                    id: 2,
+                    x: 14.0,
+                    y: 0.0,
+                    active: true,
+                },
+            ],
+        };
+
+        let (post_status, _) = request_json(
+            app.clone(),
+            Method::POST,
+            "/api/v1/config/room",
+            Some(serde_json::to_value(&updated).expect("json")),
+        )
+        .await;
+        assert_eq!(post_status, StatusCode::OK);
+
+        let (location_status, location) =
+            request_json(app, Method::GET, "/api/v1/location", None).await;
+        assert_eq!(location_status, StatusCode::OK);
+        let person = &location["persons"][0];
+        let x = person["x"].as_f64().expect("x");
+        let y = person["y"].as_f64().expect("y");
+        assert!((x - 12.0).abs() < 0.05, "expected x near 12.0, got {x}");
+        assert!(y.abs() < 0.05, "expected y near 0.0, got {y}");
     }
 
     #[test]
@@ -14334,24 +14893,54 @@ mod novelty_tests {
 
 // ── ADR-044 §5.3: dedup_factor runtime configuration endpoints ────────────────
 
+fn room_validation_failed_response(
+    error: RoomValidationError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "error": "validation_failed",
+            "field": error.field,
+            "reason": error.reason,
+        })),
+    )
+}
+
+/// `GET /api/v1/config/room` - return the operator room layout.
+async fn config_get_room(
+    State(state): State<SharedState>,
+) -> Result<Json<UiRoomConfig>, (StatusCode, Json<serde_json::Value>)> {
+    let s = state.read().await;
+    let ui_path = s.ui_path.clone();
+    drop(s);
+    load_ui_room_config_file(&ui_path)
+        .map(Json)
+        .map_err(|message| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "status": "error", "message": message })),
+            )
+        })
+}
+
 /// `POST /api/v1/config/room` - persist the operator room layout.
 async fn config_set_room(
     State(state): State<SharedState>,
     Json(body): Json<UiRoomConfig>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    validate_ui_room_config(&body).map_err(|message| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "status": "error", "message": message })),
-        )
-    })?;
+    validate_ui_room_config(&body).map_err(room_validation_failed_response)?;
 
     let s = state.read().await;
     let environment = environment_from_ui_room_config(&s.environment, &body);
+    let localization_room_config = localization_room_config_from_ui(&body);
     validate_environment(&environment).map_err(|message| {
         (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "status": "error", "message": message })),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "validation_failed",
+                "field": "environment",
+                "reason": message,
+            })),
         )
     })?;
     let ui_path = s.ui_path.clone();
@@ -14384,6 +14973,13 @@ async fn config_set_room(
 
     let mut s = state.write().await;
     s.environment = environment.clone();
+    localization::update_room_config_state(&s.localization_room_config, localization_room_config)
+        .map_err(|message| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "status": "error", "message": message })),
+            )
+        })?;
     apply_environment_node_positions(&mut s.multistatic_fuser, &environment);
 
     Ok(Json(serde_json::json!({ "status": "ok" })))

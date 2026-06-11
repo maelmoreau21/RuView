@@ -108,14 +108,10 @@
   <script src="websocket.js"></script>
   <script>
     (() => {
-      const DEFAULT_ROOM = {
-        room_width_meters: 5,
-        room_height_meters: 4,
-        nodes: [
-          { id: 1, x: 0, y: 0, label: 'Node 1' },
-          { id: 2, x: 5, y: 0, label: 'Node 2' },
-          { id: 3, x: 2.5, y: 4, label: 'Node 3' },
-        ],
+      const EMPTY_ROOM_CONFIG = {
+        version: 2,
+        room: { shape: 'polygon', boundary: [] },
+        nodes: [],
       };
       const ROOM_CANVAS_MARGIN = 40;
 
@@ -201,35 +197,69 @@
         return normalizeNodeId(node?.node_id ?? node?.id ?? fallback);
       }
 
+      function pointFrom(value) {
+        const x = safeNumber(value?.x);
+        const y = safeNumber(value?.y);
+        return x == null || y == null ? null : { x, y };
+      }
+
+      function normalizeRoomConfig(config) {
+        if (!config || config.version !== 2 || config.room?.shape !== 'polygon') return null;
+        const boundary = Array.isArray(config.room.boundary)
+          ? config.room.boundary.map(pointFrom).filter(Boolean)
+          : [];
+        if (boundary.length < 3) return null;
+
+        const nodes = Array.isArray(config.nodes)
+          ? config.nodes.map((node) => {
+            const point = pointFrom(node);
+            if (!node || node.id == null || !point) return null;
+            return {
+              id: node.id,
+              x: point.x,
+              y: point.y,
+              active: node.active !== false,
+            };
+          }).filter(Boolean)
+          : [];
+
+        return {
+          version: 2,
+          room: { shape: 'polygon', boundary },
+          nodes,
+        };
+      }
+
       function roomConfig() {
-        return window.RS.room_config || DEFAULT_ROOM;
+        return window.RS.room_config || EMPTY_ROOM_CONFIG;
       }
 
-      function roomWidth() {
-        const config = roomConfig();
-        return safeNumber(config.room_width_meters)
-          || safeNumber(config.width_meters)
-          || safeNumber(config.width_m)
-          || safeNumber(config.dimensions?.width)
-          || safeNumber(config.dimensions_m?.[0])
-          || 5;
+      function roomBoundary() {
+        const boundary = roomConfig().room?.boundary;
+        return Array.isArray(boundary) ? boundary.map(pointFrom).filter(Boolean) : [];
       }
 
-      function roomHeight() {
-        const config = roomConfig();
-        return safeNumber(config.room_height_meters)
-          || safeNumber(config.height_meters)
-          || safeNumber(config.depth_meters)
-          || safeNumber(config.height_m)
-          || safeNumber(config.dimensions?.height)
-          || safeNumber(config.dimensions_m?.[1])
-          || 4;
+      function roomBounds(boundary = roomBoundary()) {
+        if (!boundary.length) return null;
+        const xs = boundary.map((point) => point.x);
+        const ys = boundary.map((point) => point.y);
+        const minX = Math.min(...xs);
+        const minY = Math.min(...ys);
+        const maxX = Math.max(...xs);
+        const maxY = Math.max(...ys);
+        return {
+          minX,
+          minY,
+          maxX,
+          maxY,
+          width: Math.max(0.001, maxX - minX),
+          height: Math.max(0.001, maxY - minY),
+        };
       }
 
       function configuredNodes() {
-        const config = roomConfig();
-        const rawNodes = Array.isArray(config.nodes) ? config.nodes : [];
-        return rawNodes.length ? rawNodes : DEFAULT_ROOM.nodes;
+        const nodes = roomConfig().nodes;
+        return Array.isArray(nodes) ? nodes : [];
       }
 
       function liveNodesById() {
@@ -262,7 +292,7 @@
               id: node.id ?? id,
               node_id: node.node_id ?? id,
             },
-            state: liveById.get(id) || null,
+            state: liveById.get(id) || { active: node.active === true },
             configured: true,
             index: nodesById.size,
           });
@@ -276,8 +306,8 @@
               id,
               node_id: id,
               label: node.label || node.name || `Node ${id}`,
-              x: node.x ?? node.position?.x ?? node.position_m?.[0],
-              y: node.y ?? node.position?.y ?? node.position_m?.[1],
+              x: node.x,
+              y: node.y,
             },
             state: node,
             configured: false,
@@ -367,42 +397,40 @@
         const state = entry?.state || {};
         const x = safeNumber(
           config.x
-          ?? config.position?.x
-          ?? config.position_m?.[0]
           ?? state.x
-          ?? state.position?.x
-          ?? state.position_m?.[0],
         );
         const y = safeNumber(
           config.y
-          ?? config.position?.y
-          ?? config.position_m?.[1]
           ?? state.y
-          ?? state.position?.y
-          ?? state.position_m?.[1],
         );
         return x == null || y == null ? null : { x, y };
       }
 
-      function defaultNodePosition(entry) {
-        const id = Number(entry?.node_id ?? entry?.config?.id ?? entry?.index + 1);
-        const roomW = roomWidth();
-        const roomH = roomHeight();
-        const anchors = [
-          { x: 0, y: 0 },
-          { x: roomW, y: 0 },
-          { x: roomW, y: roomH },
-          { x: 0, y: roomH },
-          { x: roomW / 2, y: 0 },
-          { x: roomW / 2, y: roomH },
-          { x: 0, y: roomH / 2 },
-          { x: roomW, y: roomH / 2 },
-        ];
-        return anchors[((Number.isFinite(id) ? Math.max(1, id) : entry.index + 1) - 1) % anchors.length];
+      function isPointOnSegment(x, y, a, b) {
+        const cross = (y - a.y) * (b.x - a.x) - (x - a.x) * (b.y - a.y);
+        if (Math.abs(cross) > 0.000001) return false;
+        const dot = (x - a.x) * (b.x - a.x) + (y - a.y) * (b.y - a.y);
+        if (dot < 0) return false;
+        const lengthSq = ((b.x - a.x) ** 2) + ((b.y - a.y) ** 2);
+        return dot <= lengthSq;
       }
 
-      function isOutsideConfiguredRoom(x, y, roomW = roomWidth(), roomH = roomHeight()) {
-        return x < 0 || y < 0 || x > roomW || y > roomH;
+      function isPointInPolygon(x, y, boundary = roomBoundary()) {
+        if (boundary.length < 3) return false;
+        let inside = false;
+        for (let i = 0, j = boundary.length - 1; i < boundary.length; j = i, i += 1) {
+          const current = boundary[i];
+          const previous = boundary[j];
+          if (isPointOnSegment(x, y, previous, current)) return true;
+          const intersects = ((current.y > y) !== (previous.y > y))
+            && (x < ((previous.x - current.x) * (y - current.y)) / (previous.y - current.y) + current.x);
+          if (intersects) inside = !inside;
+        }
+        return inside;
+      }
+
+      function isOutsideConfiguredRoom(x, y, boundary = roomBoundary()) {
+        return !isPointInPolygon(x, y, boundary);
       }
 
       function nodeOutsideConfiguredRoom(entry) {
@@ -410,9 +438,10 @@
         return Boolean(position && isOutsideConfiguredRoom(position.x, position.y));
       }
 
-      function outOfBoundsArrow(x, y, roomW, roomH) {
-        if (x < 0 || x > roomW) return '→';
-        if (y < 0 || y > roomH) return '↑';
+      function outOfBoundsArrow(x, y, bounds = canvasMetrics?.bounds) {
+        if (!bounds) return '';
+        if (x < bounds.minX || x > bounds.maxX) return '→';
+        if (y < bounds.minY || y > bounds.maxY) return '↑';
         return '';
       }
 
@@ -661,30 +690,51 @@
         ctx.strokeStyle = '#1f2937';
         ctx.lineWidth = 1;
         ctx.beginPath();
-        for (let x = 0; x <= metrics.roomW + 0.001; x += 1) {
-          const sx = metrics.roomX + (x / metrics.roomW) * metrics.usableW;
+        const startX = Math.ceil(metrics.bounds.minX);
+        const endX = Math.floor(metrics.bounds.maxX);
+        const startY = Math.ceil(metrics.bounds.minY);
+        const endY = Math.floor(metrics.bounds.maxY);
+        for (let x = startX; x <= endX; x += 1) {
+          const sx = roomToScreen(x, metrics.bounds.minY).x;
           ctx.moveTo(sx, metrics.roomY);
           ctx.lineTo(sx, metrics.roomY + metrics.usableH);
         }
-        for (let y = 0; y <= metrics.roomH + 0.001; y += 1) {
-          const sy = metrics.roomY + (y / metrics.roomH) * metrics.usableH;
+        for (let y = startY; y <= endY; y += 1) {
+          const sy = roomToScreen(metrics.bounds.minX, y).y;
           ctx.moveTo(metrics.roomX, sy);
           ctx.lineTo(metrics.roomX + metrics.usableW, sy);
         }
         ctx.stroke();
       }
 
+      function drawRoomPolygon(ctx, boundary) {
+        if (!boundary.length) return;
+        ctx.beginPath();
+        boundary.forEach((point, index) => {
+          const p = roomToScreen(point.x, point.y);
+          if (index === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.08)';
+        ctx.fill();
+        ctx.strokeStyle = '#374151';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
       function drawNodes(ctx) {
         allNodesForUi().forEach((entry) => {
-          const position = nodePosition(entry) || defaultNodePosition(entry);
+          const position = nodePosition(entry);
+          if (!position) return;
           const x = position.x;
           const y = position.y;
           const active = isNodeActive(entry.state);
-          const outsideConfiguredRoom = isOutsideConfiguredRoom(x, y, canvasMetrics.configRoomW, canvasMetrics.configRoomH);
+          const outsideConfiguredRoom = isOutsideConfiguredRoom(x, y);
           const p = roomToScreen(x, y, { clamp: true, entry });
           const arrow = p.clamped
             ? (p.rawY < 0 || p.rawY > canvasMetrics.height ? '↑' : '→')
-            : outOfBoundsArrow(x, y, canvasMetrics.configRoomW, canvasMetrics.configRoomH);
+            : outOfBoundsArrow(x, y);
 
           if (active) {
             ctx.beginPath();
@@ -814,9 +864,9 @@
       function drawRoom() {
         const canvas = els['room-canvas'];
         const { ctx, width, height } = resizeCanvas(canvas);
-        const roomW = roomWidth();
-        const roomH = roomHeight();
-        if (!roomW || !roomH) {
+        const boundary = roomBoundary();
+        const bounds = roomBounds(boundary);
+        if (!bounds) {
           ctx.clearRect(0, 0, width, height);
           ctx.fillStyle = '#0d1117';
           ctx.fillRect(0, 0, width, height);
@@ -827,25 +877,27 @@
         const margin = ROOM_CANVAS_MARGIN;
         const usableW = Math.max(1, width - margin * 2);
         const usableH = Math.max(1, height - margin * 2);
-        const nodes = allNodesForUi();
-        const fit = zoomToFitBounds(nodes, roomW, roomH);
+        const scale = Math.min(usableW / bounds.width, usableH / bounds.height);
+        const fittedW = bounds.width * scale;
+        const fittedH = bounds.height * scale;
         canvasMetrics = {
           width,
           height,
           canvasWidth: canvas.width,
           canvasHeight: canvas.height,
-          configRoomW: roomW,
-          configRoomH: roomH,
-          originX: fit.originX,
-          originY: fit.originY,
-          roomW: fit.roomW,
-          roomH: fit.roomH,
-          usableW,
-          usableH,
-          scale: Math.min(usableW / fit.roomW, usableH / fit.roomH),
-          roomX: margin,
-          roomY: margin,
-          zoomedToFit: fit.zoomed,
+          configRoomW: bounds.width,
+          configRoomH: bounds.height,
+          originX: bounds.minX,
+          originY: bounds.minY,
+          roomW: bounds.width,
+          roomH: bounds.height,
+          usableW: fittedW,
+          usableH: fittedH,
+          scale,
+          roomX: margin + (usableW - fittedW) / 2,
+          roomY: margin + (usableH - fittedH) / 2,
+          bounds,
+          zoomedToFit: false,
         };
 
         ctx.clearRect(0, 0, width, height);
@@ -853,17 +905,7 @@
         ctx.fillRect(0, 0, width, height);
 
         drawGrid(ctx, canvasMetrics);
-
-        ctx.strokeStyle = '#374151';
-        ctx.lineWidth = 2;
-        const roomStart = roomToScreen(0, 0);
-        const roomEnd = roomToScreen(canvasMetrics.configRoomW, canvasMetrics.configRoomH);
-        ctx.strokeRect(
-          Math.min(roomStart.x, roomEnd.x),
-          Math.min(roomStart.y, roomEnd.y),
-          Math.abs(roomEnd.x - roomStart.x),
-          Math.abs(roomEnd.y - roomStart.y),
-        );
+        drawRoomPolygon(ctx, boundary);
 
         drawNodes(ctx);
         drawPersons(ctx);
@@ -1162,15 +1204,7 @@
 
       async function loadRoomConfigForDashboard() {
         const apiConfig = await window.RSApi?.loadRoomConfig?.();
-        if (apiConfig) return apiConfig;
-        try {
-          const response = await fetch('/ui/room-config.json', { cache: 'no-store' });
-          if (!response.ok) return null;
-          const config = await response.json();
-          return config && typeof config === 'object' ? config : null;
-        } catch {
-          return null;
-        }
+        return normalizeRoomConfig(apiConfig);
       }
 
       function bindEvents() {
@@ -1210,10 +1244,10 @@
       async function loadInitialData() {
         try {
           const config = await loadRoomConfigForDashboard();
-          window.RS.room_config = config || DEFAULT_ROOM;
-          window.RS.room_config_source = config ? 'file' : 'default';
+          window.RS.room_config = config || EMPTY_ROOM_CONFIG;
+          window.RS.room_config_source = config ? 'api' : 'default';
         } catch {
-          window.RS.room_config = DEFAULT_ROOM;
+          window.RS.room_config = EMPTY_ROOM_CONFIG;
           window.RS.room_config_source = 'default';
         }
 

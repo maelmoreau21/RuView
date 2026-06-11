@@ -1,11 +1,28 @@
 (function () {
   'use strict';
 
-  const NODE_COUNT = 6;
-  const DEFAULT_WIDTH = 5;
-  const DEFAULT_HEIGHT = 4;
+  const MAX_NODES = 6;
   const DEFAULT_PORT = '3000';
+  const GRID_PX = 50;
+  const DEFAULT_GRID_METERS = 0.5;
   const FPS_VALUES = [5, 10, 20, 30];
+  const DEFAULT_ROOM = {
+    version: 2,
+    room: {
+      shape: 'polygon',
+      boundary: [
+        { x: 0, y: 0 },
+        { x: 5, y: 0 },
+        { x: 5, y: 4 },
+        { x: 0, y: 4 },
+      ],
+    },
+    nodes: [
+      { id: 1, x: 0, y: 0, active: true },
+      { id: 2, x: 5, y: 0, active: true },
+      { id: 3, x: 2.5, y: 4, active: true },
+    ],
+  };
   const DEFAULT_DISPLAY = {
     canvas_fps: 10,
     show_grid: true,
@@ -22,13 +39,20 @@
     'settings-connection-dot',
     'settings-host-summary',
     'settings-clock',
-    'room-width-input',
-    'room-height-input',
+    'room-load-button',
     'room-reset-button',
     'room-save-button',
     'room-status',
-    'room-preview-canvas',
-    'node-settings-grid',
+    'room-editor-canvas',
+    'room-mode-draw-button',
+    'room-mode-nodes-button',
+    'room-close-polygon-button',
+    'room-suggest-button',
+    'room-grid-step-input',
+    'room-add-node-button',
+    'room-remove-node-button',
+    'room-live-node-count',
+    'room-node-list',
     'connection-ip-input',
     'connection-port-input',
     'connection-save-button',
@@ -56,10 +80,12 @@
   ];
 
   const els = {};
-  const nodeCanvases = [];
-  let room = defaultRoom(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-  let display = normalizeDisplay(loadJsonStorage('ruvsense_display', DEFAULT_DISPLAY));
+  let room = cloneRoom(DEFAULT_ROOM);
+  let polygonClosed = true;
+  let editorMode = 'draw';
+  let dragNodeId = null;
   let animationFrame = 0;
+  let display = normalizeDisplay(loadJsonStorage('ruvsense_display', DEFAULT_DISPLAY));
 
   function $(id) {
     return document.getElementById(id);
@@ -71,7 +97,7 @@
     });
   }
 
-  function safeNumber(value, fallback) {
+  function safeNumber(value, fallback = null) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;
   }
@@ -84,77 +110,63 @@
     return Math.round(value * 100) / 100;
   }
 
-  function defaultNodes(width, height) {
-    const w = clamp(safeNumber(width, DEFAULT_WIDTH), 1, 30);
-    const h = clamp(safeNumber(height, DEFAULT_HEIGHT), 1, 30);
-    return [
-      { id: 1, x: 0, y: 0, active: true, label: 'Node 1' },
-      { id: 2, x: w, y: 0, active: true, label: 'Node 2' },
-      { id: 3, x: w, y: h, active: true, label: 'Node 3' },
-      { id: 4, x: 0, y: h, active: true, label: 'Node 4' },
-      { id: 5, x: roundMeters(w / 2), y: 0, active: false, label: 'Node 5' },
-      { id: 6, x: roundMeters(w / 2), y: h, active: false, label: 'Node 6' },
-    ];
-  }
-
-  function defaultRoom(width, height) {
-    const roomWidth = clamp(safeNumber(width, DEFAULT_WIDTH), 1, 30);
-    const roomHeight = clamp(safeNumber(height, DEFAULT_HEIGHT), 1, 30);
+  function cloneRoom(value) {
     return {
-      room_width_meters: roomWidth,
-      room_height_meters: roomHeight,
-      nodes: defaultNodes(roomWidth, roomHeight),
+      version: 2,
+      room: {
+        shape: 'polygon',
+        boundary: (value?.room?.boundary || []).map((point) => ({
+          x: roundMeters(safeNumber(point?.x, 0)),
+          y: roundMeters(safeNumber(point?.y, 0)),
+        })),
+      },
+      nodes: (value?.nodes || []).slice(0, MAX_NODES).map((node, index) => ({
+        id: safeNumber(node?.id, index + 1),
+        x: roundMeters(safeNumber(node?.x, 0)),
+        y: roundMeters(safeNumber(node?.y, 0)),
+        active: node?.active !== false,
+      })),
     };
   }
 
-  function readNodeCoordinate(raw, key, width, height, fallback) {
-    const value = safeNumber(
-      raw?.[key] ?? raw?.position?.[key] ?? (key === 'x' ? raw?.position_m?.[0] : raw?.position_m?.[1]),
-      fallback,
-    );
-    return roundMeters(clamp(value, 0, key === 'x' ? width : height));
-  }
+  function normalizeRoomConfig(value) {
+    if (!value || value.version !== 2 || value.room?.shape !== 'polygon') return null;
+    const boundary = Array.isArray(value.room.boundary)
+      ? value.room.boundary
+        .map((point) => {
+          const x = safeNumber(point?.x);
+          const y = safeNumber(point?.y);
+          return x == null || y == null ? null : { x: roundMeters(x), y: roundMeters(y) };
+        })
+        .filter(Boolean)
+      : [];
+    if (boundary.length < 3) return null;
 
-  function normalizeRoomConfig(config) {
-    const width = clamp(
-      safeNumber(
-        config?.room_width_meters ?? config?.width_meters ?? config?.width_m ?? config?.dimensions?.width,
-        DEFAULT_WIDTH,
-      ),
-      1,
-      30,
-    );
-    const height = clamp(
-      safeNumber(
-        config?.room_height_meters ?? config?.height_meters ?? config?.height_m ?? config?.dimensions?.height,
-        DEFAULT_HEIGHT,
-      ),
-      1,
-      30,
-    );
-    const defaults = defaultNodes(width, height);
-    const rawNodes = Array.isArray(config?.nodes) ? config.nodes : [];
-    const nodes = defaults.map((fallback, index) => {
-      const raw = rawNodes.find((node) => String(node?.id ?? node?.node_id) === String(index + 1)) || rawNodes[index];
-      return {
-        id: index + 1,
-        x: readNodeCoordinate(raw, 'x', width, height, fallback.x),
-        y: readNodeCoordinate(raw, 'y', width, height, fallback.y),
-        active: raw ? raw.active !== false : fallback.active,
-        label: String(raw?.label || raw?.name || fallback.label),
-      };
+    const nodes = Array.isArray(value.nodes)
+      ? value.nodes
+        .slice(0, MAX_NODES)
+        .map((node, index) => {
+          const x = safeNumber(node?.x);
+          const y = safeNumber(node?.y);
+          if (x == null || y == null) return null;
+          return {
+            id: clamp(Math.round(safeNumber(node?.id, index + 1)), 1, MAX_NODES),
+            x: roundMeters(x),
+            y: roundMeters(y),
+            active: node?.active !== false,
+          };
+        })
+        .filter(Boolean)
+      : [];
+
+    if (!nodes.length) return null;
+    const ids = new Set();
+    nodes.forEach((node, index) => {
+      while (ids.has(node.id)) node.id = clamp(index + 1, 1, MAX_NODES);
+      ids.add(node.id);
     });
-    return { room_width_meters: width, room_height_meters: height, nodes };
-  }
 
-  function normalizeDisplay(value) {
-    const fps = FPS_VALUES.includes(Number(value?.canvas_fps)) ? Number(value.canvas_fps) : DEFAULT_DISPLAY.canvas_fps;
-    return {
-      canvas_fps: fps,
-      show_grid: value?.show_grid !== false,
-      show_node_ranges: value?.show_node_ranges !== false,
-      show_position_trail: value?.show_position_trail !== false,
-    };
+    return { version: 2, room: { shape: 'polygon', boundary }, nodes };
   }
 
   function loadJsonStorage(key, fallback) {
@@ -173,6 +185,14 @@
     } catch {
       return fallback;
     }
+  }
+
+  function defaultConnectionHost() {
+    return window.location.protocol === 'file:' ? 'localhost' : (window.location.hostname || 'localhost');
+  }
+
+  function defaultConnectionPort() {
+    return window.location.protocol === 'file:' ? DEFAULT_PORT : (window.location.port || DEFAULT_PORT);
   }
 
   function setStatus(el, message, state) {
@@ -239,7 +259,7 @@
 
   async function fetchApi(path, options = {}) {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 4000);
+    const timeout = window.setTimeout(() => controller.abort(), 5000);
     try {
       const response = await fetch(`${hostForBaseUrl()}/api/v1/${path}`, {
         cache: 'no-store',
@@ -257,107 +277,312 @@
     }
   }
 
-  async function loadRoomConfig() {
-    try {
-      const response = await fetch('room-config.json', { cache: 'no-store' });
-      if (!response.ok) throw new Error('room-config');
-      room = normalizeRoomConfig(await response.json());
-    } catch {
-      room = defaultRoom(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+  function serverMessage(result) {
+    if (typeof result?.data === 'string') return result.data;
+    if (result?.data?.message) return String(result.data.message);
+    if (result?.data?.error && result?.data?.reason) {
+      const field = result.data.field ? `${result.data.field}: ` : '';
+      return `${field}${result.data.reason}`;
     }
-    syncRoomInputs();
-    renderNodeCards();
+    if (result?.data?.error) return String(result.data.error);
+    if (result?.error?.message) return String(result.error.message);
+    return `HTTP ${result?.status || 0}`;
   }
 
-  function syncRoomInputs() {
-    els['room-width-input'].value = room.room_width_meters;
-    els['room-height-input'].value = room.room_height_meters;
-    room.nodes.forEach((node) => {
-      const active = $(`node-${node.id}-active`);
-      const x = $(`node-${node.id}-x`);
-      const y = $(`node-${node.id}-y`);
-      if (active) active.checked = Boolean(node.active);
-      if (x) {
-        x.max = room.room_width_meters;
-        x.value = node.x;
-      }
-      if (y) {
-        y.max = room.room_height_meters;
-        y.value = node.y;
-      }
-    });
+  function gridMeters() {
+    return clamp(safeNumber(els['room-grid-step-input']?.value, DEFAULT_GRID_METERS), 0.1, 5);
   }
 
-  function updateRoomFromInputs(syncNodes) {
-    room.room_width_meters = roundMeters(clamp(safeNumber(els['room-width-input'].value, DEFAULT_WIDTH), 1, 30));
-    room.room_height_meters = roundMeters(clamp(safeNumber(els['room-height-input'].value, DEFAULT_HEIGHT), 1, 30));
-    room.nodes.forEach((node) => {
-      const active = $(`node-${node.id}-active`);
-      const x = $(`node-${node.id}-x`);
-      const y = $(`node-${node.id}-y`);
-      node.active = active ? active.checked : node.active;
-      node.x = roundMeters(clamp(safeNumber(x?.value, node.x), 0, room.room_width_meters));
-      node.y = roundMeters(clamp(safeNumber(y?.value, node.y), 0, room.room_height_meters));
-    });
-    if (syncNodes) syncRoomInputs();
-  }
-
-  function renderNodeCards() {
-    const container = els['node-settings-grid'];
-    container.replaceChildren();
-    nodeCanvases.length = 0;
-    room.nodes.forEach((node) => {
-      const card = document.createElement('article');
-      card.className = 'card node-settings-card';
-      card.innerHTML = `
-        <div class="node-settings-head">
-          <h3>${node.label || `Node ${node.id}`}</h3>
-          <label class="settings-check node-active-check">
-            <input id="node-${node.id}-active" type="checkbox">
-            <span>Actif</span>
-          </label>
-        </div>
-        <canvas id="node-${node.id}-canvas" class="node-live-canvas" width="200" height="200" aria-label="Aperçu Node ${node.id}"></canvas>
-        <div class="node-coordinate-row">
-          <div class="settings-field">
-            <label for="node-${node.id}-x">Position X (mètres)</label>
-            <input id="node-${node.id}-x" type="number" min="0" max="${room.room_width_meters}" step="0.1" inputmode="decimal">
-          </div>
-          <div class="settings-field">
-            <label for="node-${node.id}-y">Position Y (mètres)</label>
-            <input id="node-${node.id}-y" type="number" min="0" max="${room.room_height_meters}" step="0.1" inputmode="decimal">
-          </div>
-        </div>
-      `;
-      container.append(card);
-      nodeCanvases.push($(`node-${node.id}-canvas`));
-      [`node-${node.id}-active`, `node-${node.id}-x`, `node-${node.id}-y`].forEach((id) => {
-        $(id).addEventListener('input', () => updateRoomFromInputs(false));
-      });
-    });
-    syncRoomInputs();
-  }
-
-  function resetRoomToCorners() {
-    const width = clamp(safeNumber(els['room-width-input'].value, DEFAULT_WIDTH), 1, 30);
-    const height = clamp(safeNumber(els['room-height-input'].value, DEFAULT_HEIGHT), 1, 30);
-    room = defaultRoom(width, height);
-    renderNodeCards();
-    setStatus(els['room-status'], '✅ Valeurs réinitialisées', 'ok');
-  }
-
-  function roomPayload() {
-    updateRoomFromInputs(true);
+  function roomBounds() {
+    const boundary = room.room.boundary;
+    if (!boundary.length) return { minX: 0, minY: 0, maxX: 5, maxY: 4, width: 5, height: 4 };
+    const xs = boundary.map((point) => point.x);
+    const ys = boundary.map((point) => point.y);
+    const minX = Math.min(...xs);
+    const minY = Math.min(...ys);
+    const maxX = Math.max(...xs);
+    const maxY = Math.max(...ys);
     return {
-      room_width_meters: room.room_width_meters,
-      room_height_meters: room.room_height_meters,
+      minX,
+      minY,
+      maxX,
+      maxY,
+      width: Math.max(0.001, maxX - minX),
+      height: Math.max(0.001, maxY - minY),
+    };
+  }
+
+  function fitGridToRoom() {
+    const canvas = els['room-editor-canvas'];
+    const bounds = roomBounds();
+    const maxCells = Math.max(1, Math.floor(canvas.width / GRID_PX) - 1);
+    const needed = Math.max(bounds.maxX, bounds.maxY) / maxCells;
+    if (needed > gridMeters()) {
+      els['room-grid-step-input'].value = roundMeters(Math.min(5, Math.max(DEFAULT_GRID_METERS, needed))).toFixed(1);
+    }
+  }
+
+  function meterToCanvas(point) {
+    const pixelsPerMeter = GRID_PX / gridMeters();
+    return {
+      x: point.x * pixelsPerMeter,
+      y: point.y * pixelsPerMeter,
+    };
+  }
+
+  function canvasToMeter(event) {
+    const canvas = els['room-editor-canvas'];
+    const rect = canvas.getBoundingClientRect();
+    const px = clamp(((event.clientX - rect.left) / rect.width) * canvas.width, 0, canvas.width);
+    const py = clamp(((event.clientY - rect.top) / rect.height) * canvas.height, 0, canvas.height);
+    const metersPerPixel = gridMeters() / GRID_PX;
+    return {
+      x: roundMeters(px * metersPerPixel),
+      y: roundMeters(py * metersPerPixel),
+    };
+  }
+
+  function drawGrid(ctx, canvas) {
+    ctx.strokeStyle = '#1f2937';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= canvas.width; x += GRID_PX) {
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, canvas.height);
+    }
+    for (let y = 0; y <= canvas.height; y += GRID_PX) {
+      ctx.moveTo(0, y);
+      ctx.lineTo(canvas.width, y);
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '10px system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    for (let x = GRID_PX; x < canvas.width; x += GRID_PX * 2) {
+      ctx.fillText(`${roundMeters((x / GRID_PX) * gridMeters())}m`, x + 3, 3);
+    }
+  }
+
+  function drawPolygon(ctx) {
+    const boundary = room.room.boundary;
+    if (!boundary.length) return;
+    ctx.beginPath();
+    boundary.forEach((point, index) => {
+      const p = meterToCanvas(point);
+      if (index === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    });
+    if (polygonClosed && boundary.length >= 3) ctx.closePath();
+    if (polygonClosed && boundary.length >= 3) {
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.08)';
+      ctx.fill();
+    }
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    boundary.forEach((point, index) => {
+      const p = meterToCanvas(point);
+      ctx.beginPath();
+      ctx.fillStyle = '#0d1117';
+      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#bfdbfe';
+      ctx.stroke();
+      ctx.fillStyle = '#dbeafe';
+      ctx.font = '700 10px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(index + 1), p.x, p.y - 14);
+    });
+  }
+
+  function drawNodes(ctx) {
+    room.nodes.forEach((node) => {
+      const p = meterToCanvas(node);
+      if (node.active) {
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(16, 185, 129, 0.10)';
+        ctx.arc(p.x, p.y, 22, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.fillStyle = node.active ? '#10b981' : '#374151';
+      ctx.arc(p.x, p.y, 13, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = node.active ? '#d1fae5' : '#9ca3af';
+      ctx.lineWidth = dragNodeId === node.id ? 3 : 1.5;
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 11px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`N${node.id}`, p.x, p.y);
+    });
+  }
+
+  function drawEditor() {
+    const canvas = els['room-editor-canvas'];
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#0d1117';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawGrid(ctx, canvas);
+    drawPolygon(ctx);
+    drawNodes(ctx);
+    animationFrame = requestAnimationFrame(drawEditor);
+  }
+
+  function renderNodeList() {
+    const container = els['room-node-list'];
+    container.replaceChildren();
+    room.nodes.forEach((node) => {
+      const row = document.createElement('label');
+      row.className = 'room-node-row';
+      row.classList.toggle('is-inactive', !node.active);
+
+      const pill = document.createElement('span');
+      pill.className = 'room-node-pill';
+      pill.textContent = `N${node.id}`;
+
+      const coords = document.createElement('span');
+      coords.className = 'room-node-coords';
+      const activeText = node.active ? 'actif' : 'inactif';
+      coords.innerHTML = `<strong>${node.x.toFixed(2)}m, ${node.y.toFixed(2)}m</strong>${activeText}`;
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = node.active;
+      checkbox.setAttribute('aria-label', `N${node.id} actif`);
+      checkbox.addEventListener('change', () => {
+        node.active = checkbox.checked;
+        renderNodeList();
+      });
+
+      row.append(pill, coords, checkbox);
+      container.append(row);
+    });
+    els['room-add-node-button'].disabled = room.nodes.length >= MAX_NODES;
+    els['room-remove-node-button'].disabled = room.nodes.length <= 1;
+  }
+
+  function setEditorMode(mode) {
+    editorMode = mode;
+    const draw = mode === 'draw';
+    els['room-mode-draw-button'].classList.toggle('is-active', draw);
+    els['room-mode-nodes-button'].classList.toggle('is-active', !draw);
+    els['room-mode-draw-button'].setAttribute('aria-pressed', String(draw));
+    els['room-mode-nodes-button'].setAttribute('aria-pressed', String(!draw));
+  }
+
+  function hitNode(point) {
+    return [...room.nodes].reverse().find((node) => {
+      const p = meterToCanvas(node);
+      const pointer = meterToCanvas(point);
+      return Math.hypot(p.x - pointer.x, p.y - pointer.y) <= 18;
+    }) || null;
+  }
+
+  function addPolygonPoint(point) {
+    if (polygonClosed && room.room.boundary.length >= 3) {
+      room.room.boundary = [];
+      polygonClosed = false;
+    }
+    room.room.boundary.push(point);
+    setStatus(els['room-status'], `${room.room.boundary.length} point(s)`, null);
+  }
+
+  function closestDefaultPoint(index) {
+    const boundary = room.room.boundary;
+    if (boundary[index]) return boundary[index];
+    const bounds = roomBounds();
+    const points = [
+      { x: bounds.minX, y: bounds.minY },
+      { x: bounds.maxX, y: bounds.minY },
+      { x: bounds.maxX, y: bounds.maxY },
+      { x: bounds.minX, y: bounds.maxY },
+      { x: bounds.minX + bounds.width / 2, y: bounds.minY },
+      { x: bounds.minX + bounds.width / 2, y: bounds.maxY },
+    ];
+    return points[index % points.length];
+  }
+
+  function addNode() {
+    if (room.nodes.length >= MAX_NODES) return;
+    const used = new Set(room.nodes.map((node) => node.id));
+    let id = 1;
+    while (used.has(id) && id <= MAX_NODES) id += 1;
+    const point = closestDefaultPoint(room.nodes.length);
+    room.nodes.push({ id, x: roundMeters(point.x), y: roundMeters(point.y), active: true });
+    room.nodes.sort((a, b) => a.id - b.id);
+    renderNodeList();
+  }
+
+  function removeNode() {
+    if (room.nodes.length <= 1) return;
+    room.nodes.pop();
+    renderNodeList();
+  }
+
+  function closePolygon() {
+    if (room.room.boundary.length < 3) {
+      setStatus(els['room-status'], 'Ajoutez au moins 3 points avant de fermer la forme', 'error');
+      return;
+    }
+    polygonClosed = true;
+    setStatus(els['room-status'], 'Forme fermée', 'ok');
+  }
+
+  // Diagnostic 422: the old payload sent nodes[].label and omitted nodes[].active,
+  // while the Rust API now accepts only schema v2 { version, room.boundary, nodes[].active }.
+  function roomPayload() {
+    return {
+      version: 2,
+      room: {
+        shape: 'polygon',
+        boundary: room.room.boundary.map((point) => ({
+          x: roundMeters(point.x),
+          y: roundMeters(point.y),
+        })),
+      },
       nodes: room.nodes.map((node) => ({
-        id: node.id,
-        x: node.x,
-        y: node.y,
-        label: node.label || `Node ${node.id}`,
+        id: Number(node.id),
+        x: roundMeters(node.x),
+        y: roundMeters(node.y),
+        active: Boolean(node.active),
       })),
     };
+  }
+
+  function applyRoomConfig(config, message = null) {
+    room = cloneRoom(config);
+    polygonClosed = true;
+    fitGridToRoom();
+    renderNodeList();
+    if (message) setStatus(els['room-status'], message, 'ok');
+  }
+
+  async function loadRoomConfig() {
+    const result = await fetchApi('config/room');
+    if (!result.ok) {
+      setStatus(els['room-status'], `Chargement impossible - ${serverMessage(result)}`, 'error');
+      applyRoomConfig(DEFAULT_ROOM);
+      return null;
+    }
+    const config = normalizeRoomConfig(result.data);
+    if (!config) {
+      setStatus(els['room-status'], 'Configuration reçue invalide', 'error');
+      applyRoomConfig(DEFAULT_ROOM);
+      return null;
+    }
+    applyRoomConfig(config, 'Configuration actuelle chargée');
+    return config;
+  }
+
+  function resetRoomToDefault() {
+    applyRoomConfig(DEFAULT_ROOM, 'Valeurs réinitialisées');
   }
 
   function broadcastConfigUpdated() {
@@ -373,26 +598,97 @@
 
   async function saveRoom() {
     const button = els['room-save-button'];
+    const payload = roomPayload();
+    if (payload.room.boundary.length < 3) {
+      setStatus(els['room-status'], 'La pièce doit contenir au moins 3 points', 'error');
+      return;
+    }
     button.disabled = true;
     setStatus(els['room-status'], 'Sauvegarde...', null);
     const result = await fetchApi('config/room', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(roomPayload()),
+      body: JSON.stringify(payload),
     });
     if (result.ok) {
-      setStatus(els['room-status'], '✅ Pièce sauvegardée', 'ok');
+      setStatus(els['room-status'], 'Pièce sauvegardée', 'ok');
       broadcastConfigUpdated();
     } else {
-      const message = result.data?.message ? ` - ${result.data.message}` : '';
-      setStatus(els['room-status'], `❌ Erreur ${result.status || ''}${message}`.trim(), 'error');
+      setStatus(els['room-status'], serverMessage(result), 'error');
     }
     button.disabled = false;
   }
 
+  function liveNodes() {
+    const values = Object.values(window.RS?.nodes || {});
+    return values.filter((node) => {
+      const status = String(node?.status || node?.health_status || '').toLowerCase();
+      if (node?.active === false || ['offline', 'stale', 'sync_only', 'no_nodes'].includes(status)) return false;
+      const last = safeNumber(node?.last_seen ?? node?.lastSeen ?? node?.last_seen_ms);
+      if (last == null) return node?.active === true || status === 'live';
+      if (last > 100000000000) return Date.now() - last < 10000;
+      if (last > 1000000000) return Date.now() - last * 1000 < 10000;
+      return last < 10000;
+    });
+  }
+
+  function updateLiveNodeCount() {
+    const count = liveNodes().length;
+    els['room-live-node-count'].textContent = String(count);
+    return count;
+  }
+
+  function suggestStarterPositions() {
+    const activeCount = updateLiveNodeCount();
+    if (activeCount < 3) {
+      setStatus(els['room-status'], '3 nœuds actifs requis via WebSocket', 'error');
+      return;
+    }
+    const count = clamp(activeCount, 3, MAX_NODES);
+    const base = [
+      { x: 0, y: 0 },
+      { x: 5, y: 0 },
+      { x: 2.5, y: 4 },
+      { x: 5, y: 4 },
+      { x: 0, y: 4 },
+      { x: 2.5, y: 0 },
+    ];
+    const square = [
+      { x: 0, y: 0 },
+      { x: 5, y: 0 },
+      { x: 5, y: 4 },
+      { x: 0, y: 4 },
+      { x: 2.5, y: 0 },
+      { x: 2.5, y: 4 },
+    ];
+    const positions = count === 3 ? base : square;
+    room = {
+      version: 2,
+      room: {
+        shape: 'polygon',
+        boundary: [
+          { x: 0, y: 0 },
+          { x: 5, y: 0 },
+          { x: 5, y: 4 },
+          { x: 0, y: 4 },
+        ],
+      },
+      nodes: positions.slice(0, count).map((point, index) => ({
+        id: index + 1,
+        x: point.x,
+        y: point.y,
+        active: true,
+      })),
+    };
+    polygonClosed = true;
+    els['room-grid-step-input'].value = DEFAULT_GRID_METERS;
+    renderNodeList();
+    setStatus(els['room-status'], 'Position de départ approximative — ajustez selon votre pièce réelle', 'ok');
+  }
+
   function loadConnection() {
-    els['connection-ip-input'].value = localStorageValue('ruvsense_ip', 'localhost');
-    els['connection-port-input'].value = localStorageValue('ruvsense_port', DEFAULT_PORT);
+    els['connection-ip-input'].value = localStorageValue('ruvsense_ip', defaultConnectionHost());
+    els['connection-port-input'].value = localStorageValue('ruvsense_port', defaultConnectionPort());
     updateHostSummary();
   }
 
@@ -400,7 +696,8 @@
     localStorage.setItem('ruvsense_ip', els['connection-ip-input'].value.trim() || 'localhost');
     localStorage.setItem('ruvsense_port', els['connection-port-input'].value.trim() || DEFAULT_PORT);
     updateHostSummary();
-    setStatus(els['connection-status'], '✅ Connexion sauvegardée', 'ok');
+    window.RuvSenseWS?.connect(hostForBaseUrl());
+    setStatus(els['connection-status'], 'Connexion sauvegardée', 'ok');
   }
 
   async function testConnection() {
@@ -417,11 +714,11 @@
       els['connection-state'].textContent = 'Connecté';
       els['connection-version'].textContent = version;
       setConnectionOnline(true);
-      setStatus(els['connection-status'], `✅ Connecté - version ${version}`, 'ok');
+      setStatus(els['connection-status'], `Connecté - version ${version}`, 'ok');
     } else {
       els['connection-state'].textContent = 'Hors ligne';
       setConnectionOnline(false);
-      setStatus(els['connection-status'], '❌ Impossible de joindre le serveur', 'error');
+      setStatus(els['connection-status'], 'Impossible de joindre le serveur', 'error');
     }
     button.disabled = false;
   }
@@ -461,10 +758,20 @@
     });
     setStatus(
       els['alerts-status'],
-      result.ok ? '✅ Alertes sauvegardées' : `❌ Erreur ${result.status || ''}`.trim(),
+      result.ok ? 'Alertes sauvegardées' : serverMessage(result),
       result.ok ? 'ok' : 'error',
     );
     button.disabled = false;
+  }
+
+  function normalizeDisplay(value) {
+    const fps = FPS_VALUES.includes(Number(value?.canvas_fps)) ? Number(value.canvas_fps) : DEFAULT_DISPLAY.canvas_fps;
+    return {
+      canvas_fps: fps,
+      show_grid: value?.show_grid !== false,
+      show_node_ranges: value?.show_node_ranges !== false,
+      show_position_trail: value?.show_position_trail !== false,
+    };
   }
 
   function syncDisplayInputs() {
@@ -492,102 +799,7 @@
   function saveDisplay(showStatus) {
     display = displayPayload();
     localStorage.setItem('ruvsense_display', JSON.stringify(display));
-    if (showStatus) setStatus(els['display-status'], '✅ Affichage sauvegardé', 'ok');
-  }
-
-  function roomMetrics(canvas, padding) {
-    const width = canvas.width;
-    const height = canvas.height;
-    const roomW = clamp(safeNumber(room.room_width_meters, DEFAULT_WIDTH), 1, 30);
-    const roomH = clamp(safeNumber(room.room_height_meters, DEFAULT_HEIGHT), 1, 30);
-    const availableW = width - padding.left - padding.right;
-    const availableH = height - padding.top - padding.bottom;
-    const scale = Math.min(availableW / roomW, availableH / roomH);
-    return {
-      width,
-      height,
-      roomW,
-      roomH,
-      scale,
-      x: padding.left + (availableW - roomW * scale) / 2,
-      y: padding.top + (availableH - roomH * scale) / 2,
-      w: roomW * scale,
-      h: roomH * scale,
-    };
-  }
-
-  function drawGrid(ctx, metrics) {
-    if (!display.show_grid) return;
-    ctx.strokeStyle = '#1f2937';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let x = 0; x <= metrics.roomW + 0.001; x += 1) {
-      const sx = metrics.x + x * metrics.scale;
-      ctx.moveTo(sx, metrics.y);
-      ctx.lineTo(sx, metrics.y + metrics.h);
-    }
-    for (let y = 0; y <= metrics.roomH + 0.001; y += 1) {
-      const sy = metrics.y + y * metrics.scale;
-      ctx.moveTo(metrics.x, sy);
-      ctx.lineTo(metrics.x + metrics.w, sy);
-    }
-    ctx.stroke();
-  }
-
-  function drawCanvas(canvas, focusIndex, now) {
-    const ctx = canvas.getContext('2d');
-    const padding = canvas.width === 200
-      ? { left: 20, right: 20, top: 20, bottom: 28 }
-      : { left: 42, right: 32, top: 28, bottom: 42 };
-    const metrics = roomMetrics(canvas, padding);
-    ctx.clearRect(0, 0, metrics.width, metrics.height);
-    ctx.fillStyle = '#0d1117';
-    ctx.fillRect(0, 0, metrics.width, metrics.height);
-    drawGrid(ctx, metrics);
-    ctx.strokeStyle = '#374151';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(metrics.x, metrics.y, metrics.w, metrics.h);
-    room.nodes.forEach((node, index) => {
-      const sx = metrics.x + (node.x / metrics.roomW) * metrics.w;
-      const sy = metrics.y + (node.y / metrics.roomH) * metrics.h;
-      const focused = index === focusIndex;
-      if (display.show_node_ranges && node.active) {
-        ctx.beginPath();
-        ctx.fillStyle = focused ? 'rgba(59, 130, 246, 0.14)' : 'rgba(59, 130, 246, 0.06)';
-        ctx.arc(sx, sy, focused ? 30 : 20, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      if (focused) {
-        const pulse = 0.5 + Math.sin(now / 280) * 0.5;
-        ctx.beginPath();
-        ctx.fillStyle = `rgba(59, 130, 246, ${0.08 + pulse * 0.08})`;
-        ctx.arc(sx, sy, 22 + pulse * 10, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.beginPath();
-      ctx.fillStyle = node.active ? (focused ? '#3b82f6' : '#64748b') : '#374151';
-      ctx.arc(sx, sy, focused ? 8 : 5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = node.active ? 'rgba(249, 250, 251, 0.68)' : 'rgba(107, 114, 128, 0.42)';
-      ctx.lineWidth = focused ? 2 : 1;
-      ctx.stroke();
-      ctx.fillStyle = focused ? '#f9fafb' : '#6b7280';
-      ctx.font = `${focused ? 700 : 600} ${canvas.width === 200 ? 10 : 12}px system-ui, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'top';
-      ctx.fillText(`N${index + 1}`, sx, sy + 11);
-    });
-    ctx.fillStyle = '#6b7280';
-    ctx.font = `${canvas.width === 200 ? 10 : 12}px system-ui, sans-serif`;
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText(`${metrics.roomW.toFixed(1)}m x ${metrics.roomH.toFixed(1)}m`, 10, metrics.height - 8);
-  }
-
-  function drawAllCanvases(now) {
-    nodeCanvases.forEach((canvas, index) => drawCanvas(canvas, index, now));
-    drawCanvas(els['room-preview-canvas'], -1, now);
-    animationFrame = requestAnimationFrame(drawAllCanvases);
+    if (showStatus) setStatus(els['display-status'], 'Affichage sauvegardé', 'ok');
   }
 
   function activateTab(name) {
@@ -603,14 +815,58 @@
     });
   }
 
+  function bindRoomEditor() {
+    const canvas = els['room-editor-canvas'];
+    els['room-mode-draw-button'].addEventListener('click', () => setEditorMode('draw'));
+    els['room-mode-nodes-button'].addEventListener('click', () => setEditorMode('nodes'));
+    els['room-close-polygon-button'].addEventListener('click', closePolygon);
+    els['room-load-button'].addEventListener('click', () => loadRoomConfig());
+    els['room-reset-button'].addEventListener('click', resetRoomToDefault);
+    els['room-save-button'].addEventListener('click', saveRoom);
+    els['room-add-node-button'].addEventListener('click', addNode);
+    els['room-remove-node-button'].addEventListener('click', removeNode);
+    els['room-suggest-button'].addEventListener('click', suggestStarterPositions);
+    els['room-grid-step-input'].addEventListener('input', () => {
+      els['room-grid-step-input'].value = gridMeters();
+    });
+
+    canvas.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      const point = canvasToMeter(event);
+      if (editorMode === 'draw') {
+        addPolygonPoint(point);
+        return;
+      }
+      const node = hitNode(point);
+      if (!node) return;
+      dragNodeId = node.id;
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener('pointermove', (event) => {
+      if (dragNodeId == null || editorMode !== 'nodes') return;
+      const node = room.nodes.find((candidate) => candidate.id === dragNodeId);
+      if (!node) return;
+      const point = canvasToMeter(event);
+      node.x = point.x;
+      node.y = point.y;
+      renderNodeList();
+    });
+    canvas.addEventListener('pointerup', (event) => {
+      if (dragNodeId != null) {
+        try { canvas.releasePointerCapture(event.pointerId); } catch {}
+      }
+      dragNodeId = null;
+    });
+    canvas.addEventListener('pointercancel', () => {
+      dragNodeId = null;
+    });
+  }
+
   function bindEvents() {
     document.querySelectorAll('.settings-tab').forEach((button) => {
       button.addEventListener('click', () => activateTab(button.dataset.tab));
     });
-    els['room-width-input'].addEventListener('input', () => updateRoomFromInputs(true));
-    els['room-height-input'].addEventListener('input', () => updateRoomFromInputs(true));
-    els['room-reset-button'].addEventListener('click', resetRoomToCorners);
-    els['room-save-button'].addEventListener('click', saveRoom);
+    bindRoomEditor();
     els['connection-ip-input'].addEventListener('input', updateHostSummary);
     els['connection-port-input'].addEventListener('input', updateHostSummary);
     els['connection-save-button'].addEventListener('click', saveConnection);
@@ -626,6 +882,7 @@
       });
     });
     els['display-save-button'].addEventListener('click', () => saveDisplay(true));
+    window.RuvSenseWS?.onUpdate(() => updateLiveNodeCount());
   }
 
   async function init() {
@@ -636,13 +893,17 @@
     loadAlerts();
     syncDisplayInputs();
     bindEvents();
+    renderNodeList();
+    window.RuvSenseWS?.connect(hostForBaseUrl());
     await loadRoomConfig();
-    setStatus(els['room-status'], '--', null);
     setStatus(els['connection-status'], '--', null);
     setStatus(els['alerts-status'], '--', null);
     setStatus(els['display-status'], '--', null);
-    animationFrame = requestAnimationFrame(drawAllCanvases);
+    updateLiveNodeCount();
+    animationFrame = requestAnimationFrame(drawEditor);
   }
+
+  window.loadRoomConfig = loadRoomConfig;
 
   window.addEventListener('beforeunload', () => {
     if (animationFrame) cancelAnimationFrame(animationFrame);

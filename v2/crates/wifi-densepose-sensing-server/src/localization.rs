@@ -1,8 +1,7 @@
 //! RSSI-based room localization for ESP32 CSI nodes.
 
 use serde::{Deserialize, Serialize};
-
-pub const ROOM_NODE_POSITIONS_ENV: &str = "ROOM_NODE_POSITIONS";
+use std::sync::{Arc, OnceLock, RwLock};
 
 const TX_POWER_DBM: f32 = -30.0;
 const PATH_LOSS_EXPONENT: f32 = 2.5;
@@ -16,6 +15,50 @@ pub struct NodePosition {
     pub x: f32,
     pub y: f32,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Point2D {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomShape {
+    pub shape: String,
+    pub boundary: Vec<Point2D>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeConfig {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomConfig {
+    pub version: u32,
+    pub room: RoomShape,
+    pub nodes: Vec<NodeConfig>,
+}
+
+impl Default for RoomConfig {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            room: RoomShape {
+                shape: "polygon".to_string(),
+                boundary: Vec::new(),
+            },
+            nodes: Vec::new(),
+        }
+    }
+}
+
+pub type SharedRoomConfig = Arc<RwLock<RoomConfig>>;
+
+static ROOM_CONFIG_STATE: OnceLock<SharedRoomConfig> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PersonLocation {
@@ -109,6 +152,57 @@ impl LocationSmoother {
     }
 }
 
+pub fn new_room_config_state(config: RoomConfig) -> SharedRoomConfig {
+    Arc::new(RwLock::new(config))
+}
+
+pub fn install_room_config_state(state: SharedRoomConfig) {
+    if ROOM_CONFIG_STATE.set(Arc::clone(&state)).is_err() {
+        if let Ok(config) = state.read().map(|guard| guard.clone()) {
+            let _ = update_room_config_state(&room_config_state(), config);
+        }
+    }
+}
+
+pub fn room_config_state() -> SharedRoomConfig {
+    Arc::clone(ROOM_CONFIG_STATE.get_or_init(|| new_room_config_state(RoomConfig::default())))
+}
+
+pub fn update_room_config_state(
+    state: &SharedRoomConfig,
+    config: RoomConfig,
+) -> Result<(), String> {
+    let mut guard = state
+        .write()
+        .map_err(|_| "room config state lock poisoned".to_string())?;
+    *guard = config;
+    Ok(())
+}
+
+pub fn node_positions_from_room_config(config: &RoomConfig) -> Vec<NodePosition> {
+    let mut positions: Vec<NodePosition> = config
+        .nodes
+        .iter()
+        .filter(|node| node.active)
+        .filter(|node| node.id != 0 && node.id <= u8::MAX as u32)
+        .filter(|node| node.x.is_finite() && node.y.is_finite())
+        .map(|node| NodePosition {
+            node_id: node.id as u8,
+            x: node.x,
+            y: node.y,
+        })
+        .collect();
+    positions.sort_by_key(|position| position.node_id);
+    positions
+}
+
+pub fn node_positions_from_room_config_state(state: &SharedRoomConfig) -> Vec<NodePosition> {
+    state
+        .read()
+        .map(|guard| node_positions_from_room_config(&guard))
+        .unwrap_or_default()
+}
+
 pub fn parse_node_positions(input: &str) -> Result<Vec<NodePosition>, String> {
     let mut positions = Vec::new();
     let trimmed = input.trim();
@@ -147,13 +241,6 @@ pub fn parse_node_positions(input: &str) -> Result<Vec<NodePosition>, String> {
     Ok(positions)
 }
 
-pub fn node_positions_from_env() -> Vec<NodePosition> {
-    std::env::var(ROOM_NODE_POSITIONS_ENV)
-        .ok()
-        .and_then(|value| parse_node_positions(&value).ok())
-        .unwrap_or_default()
-}
-
 pub fn rssi_to_distance_m(rssi_dbm: f32) -> f32 {
     10.0_f32.powf((TX_POWER_DBM - rssi_dbm) / (10.0 * PATH_LOSS_EXPONENT))
 }
@@ -176,7 +263,7 @@ pub fn locatable_node_count(node_rssi: &[(u8, f32)], positions: &[NodePosition])
 }
 
 pub fn locate_person(node_rssi: &[(u8, f32)]) -> Option<(f32, f32)> {
-    let positions = node_positions_from_env();
+    let positions = node_positions_from_room_config_state(&room_config_state());
     locate_person_with_positions(node_rssi, &positions)
 }
 
@@ -262,7 +349,7 @@ pub fn estimate_person_location(
     node_rssi: &[(u8, f32)],
     timestamp_ms: u64,
 ) -> Option<PersonLocation> {
-    let positions = node_positions_from_env();
+    let positions = node_positions_from_room_config_state(&room_config_state());
     estimate_person_location_with_positions(node_rssi, &positions, timestamp_ms)
 }
 
@@ -434,4 +521,81 @@ fn clamp_to_anchor_bounds(point: (f32, f32), nodes: &[RangedNode]) -> (f32, f32)
         point.0.clamp(min_x - margin, max_x + margin),
         point.1.clamp(min_y - margin, max_y + margin),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn room_config(nodes: Vec<NodeConfig>) -> RoomConfig {
+        RoomConfig {
+            version: 2,
+            room: RoomShape {
+                shape: "polygon".to_string(),
+                boundary: vec![
+                    Point2D { x: 0.0, y: 0.0 },
+                    Point2D { x: 5.0, y: 0.0 },
+                    Point2D { x: 5.0, y: 4.0 },
+                    Point2D { x: 0.0, y: 4.0 },
+                ],
+            },
+            nodes,
+        }
+    }
+
+    fn node(id: u32, x: f32, y: f32) -> NodeConfig {
+        NodeConfig {
+            id,
+            x,
+            y,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn locate_person_uses_shared_room_config_state() {
+        let state = room_config_state();
+        update_room_config_state(
+            &state,
+            room_config(vec![node(1, 0.0, 0.0), node(2, 4.0, 0.0)]),
+        )
+        .expect("initial room config");
+
+        let first = locate_person(&[(1, -42.0), (2, -42.0)]).expect("initial location");
+        assert!((first.0 - 2.0).abs() < 0.25);
+
+        update_room_config_state(&state, room_config(vec![node(1, 10.0, 0.0), node(2, 14.0, 0.0)]))
+            .expect("room config update");
+        let second = locate_person(&[(1, -42.0), (2, -42.0)]).expect("updated location");
+        assert!((second.0 - 12.0).abs() < 0.25);
+
+        update_room_config_state(&state, RoomConfig::default()).expect("reset room config");
+    }
+
+    #[test]
+    fn room_config_positions_ignore_inactive_nodes() {
+        let mut inactive = node(3, 2.0, 2.0);
+        inactive.active = false;
+        let positions = node_positions_from_room_config(&room_config(vec![
+            node(2, 4.0, 0.0),
+            inactive,
+            node(1, 0.0, 0.0),
+        ]));
+
+        assert_eq!(
+            positions,
+            vec![
+                NodePosition {
+                    node_id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                },
+                NodePosition {
+                    node_id: 2,
+                    x: 4.0,
+                    y: 0.0,
+                },
+            ]
+        );
+    }
 }

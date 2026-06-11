@@ -22,8 +22,9 @@
 .settings-check{min-height:36px;display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-darker);padding:7px 9px}.settings-check input{width:16px;height:16px;accent-color:var(--accent)}.settings-status-line{min-height:22px;color:var(--text-secondary);font-size:12px;font-weight:700}.settings-status-line.is-ok{color:var(--accent-health)}.settings-status-line.is-error{color:var(--alert-red)}
 .room-preview-canvas{width:100%;height:260px;display:block;border:1px solid var(--border);border-radius:8px;background:var(--bg-darker)}.node-settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.node-settings-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.node-settings-head h3{min-width:0;margin:0;overflow:hidden;color:var(--text-primary);font-size:14px;text-overflow:ellipsis;white-space:nowrap}
 .node-live-badge{min-height:20px;display:inline-flex;align-items:center;border-radius:999px;background:rgba(16,185,129,.14);color:var(--accent-health);padding:2px 7px;font-size:10px;font-weight:900}.node-live-canvas{width:200px;height:200px;justify-self:center;display:block;border:1px solid var(--border);border-radius:8px;background:var(--bg-darker)}.node-coordinate-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.room-editor-shell{display:grid;grid-template-columns:minmax(0,540px) minmax(260px,1fr);gap:12px;align-items:start}.room-editor-card{display:grid;gap:12px}.room-toolbar{display:flex;flex-wrap:wrap;align-items:end;gap:8px}.room-tool-group{display:inline-flex;gap:6px}.room-tool-button{min-height:34px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:6px;background:var(--bg-darker);color:var(--text-secondary);cursor:pointer;padding:7px 10px;font-size:12px;font-weight:900}.room-tool-button:hover,.room-tool-button.is-active{border-color:rgba(59,130,246,.78);background:rgba(59,130,246,.12);color:var(--text-primary)}.room-tool-button:disabled{cursor:not-allowed;opacity:.5}.room-grid-control{width:155px;display:grid;grid-template-columns:auto minmax(54px,1fr) auto;align-items:center;gap:6px}.room-grid-control span{color:var(--text-secondary);font-size:11px;font-weight:800;text-transform:uppercase}.room-grid-control input{min-height:34px}.room-canvas-wrap{max-width:100%;overflow:auto}.room-editor-canvas{width:500px;height:500px;display:block;border:1px solid var(--border);border-radius:8px;background:var(--bg-darker);touch-action:none}.room-side-panel{display:grid;gap:12px}.room-side-actions{display:flex;gap:8px}.room-node-list{display:grid;gap:8px}.room-node-row{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-darker);padding:8px}.room-node-pill{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;background:rgba(59,130,246,.18);color:var(--text-primary);font-size:12px;font-weight:950}.room-node-row.is-inactive .room-node-pill{background:rgba(107,114,128,.22);color:var(--text-secondary)}.room-node-coords{min-width:0;color:var(--text-secondary);font-size:12px;font-weight:800}.room-node-coords strong{display:block;color:var(--text-primary);font-size:13px}.room-live-readout{display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-darker);padding:10px;color:var(--text-secondary);font-size:12px;font-weight:800}.room-live-readout strong{color:var(--text-primary)}
 .connection-result{display:grid;gap:8px}.connection-readout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.readout-cell{border:1px solid var(--border);border-radius:8px;background:var(--bg-darker);padding:10px}.readout-cell span{display:block;color:var(--text-secondary);font-size:11px;font-weight:800;text-transform:uppercase}.readout-cell strong{display:block;min-width:0;margin-top:4px;overflow:hidden;color:var(--text-primary);font-size:13px;text-overflow:ellipsis;white-space:nowrap}
-@media (max-width:860px){.settings-header-shell,.settings-layout{grid-template-columns:1fr}.settings-title-strip,.settings-header-actions{justify-content:flex-start}.settings-nav{border-right:0;border-bottom:1px solid var(--border)}.settings-tab-list{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-grid,.settings-form-grid,.connection-readout{grid-template-columns:1fr}.settings-panel-head{align-items:stretch;flex-direction:column}.settings-action-row{justify-content:stretch}.settings-button{flex:1}}</style>
+@media (max-width:860px){.settings-header-shell,.settings-layout{grid-template-columns:1fr}.settings-title-strip,.settings-header-actions{justify-content:flex-start}.settings-nav{border-right:0;border-bottom:1px solid var(--border)}.settings-tab-list{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-grid,.settings-form-grid,.connection-readout,.room-editor-shell{grid-template-columns:1fr}.settings-panel-head{align-items:stretch;flex-direction:column}.settings-action-row{justify-content:stretch}.settings-button{flex:1}.room-toolbar,.room-side-actions{align-items:stretch;flex-direction:column}.room-tool-group{display:grid;grid-template-columns:1fr 1fr}.room-grid-control{width:100%}.room-editor-canvas{max-width:100%;height:auto;aspect-ratio:1}}</style>
 </head>
 <body>
   <header class="app-header settings-header-shell">
@@ -57,33 +58,43 @@
         <div class="settings-panel-head">
           <h1 class="settings-panel-title">Pièce &amp; Nœuds</h1>
           <div class="settings-action-row">
+            <button id="room-load-button" class="settings-button" type="button">Charger config actuelle</button>
             <button id="room-reset-button" class="settings-button" type="button">Réinitialiser</button>
             <button id="room-save-button" class="settings-button is-primary" type="button">Sauvegarder</button>
           </div>
         </div>
-        <div class="settings-grid">
-          <section class="card settings-form-card" aria-labelledby="room-dimensions-title">
-            <h2 id="room-dimensions-title" class="section-title">PIÈCE</h2>
-            <div class="settings-form-grid">
-              <div class="settings-field">
-                <label for="room-width-input">Largeur (mètres)</label>
-              <input id="room-width-input" type="number" min="1" max="30" step="0.1" inputmode="decimal">
-              </div>
-              <div class="settings-field">
-                <label for="room-height-input">Hauteur (mètres)</label>
-              <input id="room-height-input" type="number" min="1" max="30" step="0.1" inputmode="decimal">
-              </div>
+        <section class="card room-editor-card" aria-labelledby="room-editor-title">
+          <h2 id="room-editor-title" class="section-title">ÉDITEUR VISUEL</h2>
+          <div class="room-toolbar" aria-label="Outils pièce et nœuds">
+            <div class="room-tool-group" role="group" aria-label="Mode d'édition">
+              <button id="room-mode-draw-button" class="room-tool-button is-active" type="button" aria-pressed="true">Dessiner la pièce</button>
+              <button id="room-mode-nodes-button" class="room-tool-button" type="button" aria-pressed="false">Placer les nœuds</button>
             </div>
-            <p id="room-status" class="settings-status-line" aria-live="polite">--</p>
-          </section>
-          <section class="card settings-form-card" aria-labelledby="room-preview-title">
-            <h2 id="room-preview-title" class="section-title">APERÇU LIVE</h2>
-            <canvas id="room-preview-canvas" class="room-preview-canvas" width="520" height="260" aria-label="Aperçu live de la pièce"></canvas>
-          </section>
-        </div>
-        <section class="panel-section" aria-labelledby="nodes-config-title">
-          <h2 id="nodes-config-title" class="section-title">6 NŒUDS</h2>
-          <div id="node-settings-grid" class="node-settings-grid" aria-live="polite"></div>
+            <button id="room-close-polygon-button" class="room-tool-button" type="button">Fermer la forme</button>
+            <button id="room-suggest-button" class="room-tool-button" type="button" title="Position de départ approximative — ajustez selon votre pièce réelle">Suggestion de positions de départ</button>
+            <label class="settings-field room-grid-control" for="room-grid-step-input">
+              <span>1 case =</span>
+              <input id="room-grid-step-input" type="number" min="0.1" max="5" step="0.1" value="0.5" inputmode="decimal">
+              <span>mètres</span>
+            </label>
+          </div>
+          <div class="room-editor-shell">
+            <div class="room-canvas-wrap">
+              <canvas id="room-editor-canvas" class="room-editor-canvas" width="500" height="500" aria-label="Éditeur visuel de la pièce et des nœuds"></canvas>
+            </div>
+            <aside class="room-side-panel" aria-label="Nœuds placés">
+              <div class="room-side-actions">
+                <button id="room-add-node-button" class="settings-button" type="button">+ Nœud</button>
+                <button id="room-remove-node-button" class="settings-button" type="button">- Nœud</button>
+              </div>
+              <div class="room-live-readout">
+                <span>Nœuds actifs live</span>
+                <strong id="room-live-node-count">0</strong>
+              </div>
+              <div id="room-node-list" class="room-node-list" aria-live="polite"></div>
+              <p id="room-status" class="settings-status-line" aria-live="polite">--</p>
+            </aside>
+          </div>
         </section>
       </section>
       <section id="tab-connection" class="settings-panel" role="tabpanel" aria-labelledby="tab-button-connection" hidden>
@@ -190,6 +201,9 @@
       </section>
     </section>
   </main>
+  <script src="state.js"></script>
+  <script src="api.js"></script>
+  <script src="websocket.js"></script>
   <script src="settings.js"></script>
 </body>
 </html>

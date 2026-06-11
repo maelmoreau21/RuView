@@ -31,21 +31,32 @@ const C = {
 
 const MAX_SCENE_PERSONS = 8;
 const PERSON_DEDUPE_RADIUS_M = 0.65;
+const ROOM_CONFIG_ENDPOINT = '/api/v1/config/room';
 const ROOM_CONFIG_STORAGE_KEY = 'ruvsense:room-config';
 const NODE_ACTIVE_COLOR = 0x3b82f6;
 const NODE_INACTIVE_COLOR = 0x374151;
 const NODE_ACTIVE_WINDOW_MS = 5000;
 const NODE_CUBE_SIZE_M = 0.15;
+const NODE_ELEVATION_M = 0.1;
+const PERSON_HEIGHT_M = 1.7;
+const ROOM_VISUAL_HEIGHT_M = 2.6;
 const DEFAULT_ROOM_CONFIG = {
-  room_width_meters: 5.0,
-  room_height_meters: 4.0,
+  version: 2,
+  room: {
+    shape: 'polygon',
+    boundary: [
+      { x: 0, y: 0 },
+      { x: 5, y: 0 },
+      { x: 5, y: 4 },
+      { x: 0, y: 4 },
+    ],
+  },
   nodes: [
-    { id: 1, x: 0.0, y: 0.0, label: 'Node 1' },
-    { id: 2, x: 5.0, y: 0.0, label: 'Node 2' },
-    { id: 3, x: 2.5, y: 4.0, label: 'Node 3' },
+    { id: 1, x: 0, y: 0, active: true },
+    { id: 2, x: 5, y: 0, active: true },
+    { id: 3, x: 2.5, y: 4, active: true },
   ],
 };
-const ROOM_VISUAL_HEIGHT_M = 2.6;
 
 // SCENARIO_NAMES, DEFAULTS, SETTINGS_VERSION, PRESETS imported from hud-controller.js
 
@@ -222,17 +233,50 @@ class Observatory {
 
   // ---- Room ----
 
-  _buildRoom() {
-    const { width, height, depth } = this._roomSize;
+  _roomBoundary(config = this._roomConfig || DEFAULT_ROOM_CONFIG) {
+    const boundary = config?.room?.boundary;
+    return Array.isArray(boundary)
+      ? boundary
+        .map((point) => {
+          const x = Number(point?.x);
+          const y = Number(point?.y);
+          return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+        })
+        .filter(Boolean)
+      : [];
+  }
 
-    this._grid = this._createRoomGrid(width, depth);
+  _roomConfigBounds(config = this._roomConfig || DEFAULT_ROOM_CONFIG) {
+    const boundary = this._roomBoundary(config);
+    if (boundary.length < 3) {
+      return { minX: 0, minY: 0, maxX: 5, maxY: 4, width: 5, depth: 4, height: ROOM_VISUAL_HEIGHT_M };
+    }
+    const xs = boundary.map((point) => point.x);
+    const ys = boundary.map((point) => point.y);
+    const minX = Math.min(...xs);
+    const minY = Math.min(...ys);
+    const maxX = Math.max(...xs);
+    const maxY = Math.max(...ys);
+    return {
+      minX,
+      minY,
+      maxX,
+      maxY,
+      width: Math.max(0.001, maxX - minX),
+      depth: Math.max(0.001, maxY - minY),
+      height: ROOM_VISUAL_HEIGHT_M,
+    };
+  }
+
+  _buildRoom() {
+    const bounds = this._roomConfigBounds(DEFAULT_ROOM_CONFIG);
+
+    this._grid = this._createRoomGrid(bounds);
     this._scene.add(this._grid);
 
-    this._roomWire = this._createRoomWire(width, height, depth);
+    this._roomWire = this._createRoomWire(DEFAULT_ROOM_CONFIG, bounds.height);
     this._scene.add(this._roomWire);
 
-    // Reflective floor
-    const floorGeo = new THREE.PlaneGeometry(width, depth);
     this._floorMat = new THREE.MeshStandardMaterial({
       color: 0x101810,
       roughness: 1.0 - this.settings.reflect * 0.7,
@@ -240,7 +284,7 @@ class Observatory {
       emissive: 0x020404,
       emissiveIntensity: 0.08,
     });
-    this._floor = new THREE.Mesh(floorGeo, this._floorMat);
+    this._floor = new THREE.Mesh(this._createRoomFloorGeometry(DEFAULT_ROOM_CONFIG), this._floorMat);
     this._floor.rotation.x = -Math.PI / 2;
     this._floor.receiveShadow = true;
     this._floor.userData.obstacleName = 'Sol de la pièce';
@@ -250,6 +294,10 @@ class Observatory {
   }
 
   _roomDimensions(env) {
+    if (this._roomConfig) {
+      const bounds = this._roomConfigBounds(this._roomConfig);
+      return { width: bounds.width, height: bounds.height, depth: bounds.depth };
+    }
     const dims = env?.room?.dimensions_m;
     const width = Number(dims?.[0]);
     const height = Number(dims?.[1]);
@@ -261,14 +309,14 @@ class Observatory {
     };
   }
 
-  _createRoomGrid(width, depth) {
-    const divisions = Math.max(4, Math.min(80, Math.ceil(Math.max(width, depth) * 2)));
+  _createRoomGrid(bounds) {
+    const divisions = Math.max(4, Math.min(80, Math.ceil(Math.max(bounds.width, bounds.depth) * 2)));
     const vertices = [];
     for (let i = 0; i <= divisions; i++) {
-      const x = -width / 2 + (width * i) / divisions;
-      const z = -depth / 2 + (depth * i) / divisions;
-      vertices.push(x, 0.01, -depth / 2, x, 0.01, depth / 2);
-      vertices.push(-width / 2, 0.01, z, width / 2, 0.01, z);
+      const x = bounds.minX + (bounds.width * i) / divisions;
+      const z = bounds.minY + (bounds.depth * i) / divisions;
+      vertices.push(x, 0.01, bounds.minY, x, 0.01, bounds.maxY);
+      vertices.push(bounds.minX, 0.01, z, bounds.maxX, 0.01, z);
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
@@ -281,14 +329,31 @@ class Observatory {
     return new THREE.LineSegments(geo, mat);
   }
 
-  _createRoomWire(width, height, depth) {
-    const boxGeo = new THREE.BoxGeometry(width, height, depth);
-    const edges = new THREE.EdgesGeometry(boxGeo);
-    const wire = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
+  _createRoomFloorGeometry(config) {
+    const boundary = this._roomBoundary(config);
+    const shape = new THREE.Shape();
+    boundary.forEach((point, index) => {
+      if (index === 0) shape.moveTo(point.x, point.y);
+      else shape.lineTo(point.x, point.y);
+    });
+    shape.closePath();
+    return new THREE.ShapeGeometry(shape);
+  }
+
+  _createRoomWire(config, height) {
+    const boundary = this._roomBoundary(config);
+    const vertices = [];
+    boundary.forEach((point, index) => {
+      const next = boundary[(index + 1) % boundary.length];
+      vertices.push(point.x, 0.02, point.y, next.x, 0.02, next.y);
+      vertices.push(point.x, height, point.y, next.x, height, next.y);
+      vertices.push(point.x, 0.02, point.y, point.x, height, point.y);
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
       color: C.greenDim, opacity: 0.3, transparent: true,
     }));
-    wire.position.y = height / 2;
-    return wire;
   }
 
   _disposeLine(line) {
@@ -303,27 +368,31 @@ class Observatory {
   }
 
   _syncRoomGeometry(env) {
-    const next = this._roomDimensions(env);
+    const config = this._roomConfig || DEFAULT_ROOM_CONFIG;
+    const bounds = this._roomConfigBounds(config);
+    const next = { width: bounds.width, height: bounds.height, depth: bounds.depth };
     const same =
       Math.abs(next.width - this._roomSize.width) < 1e-6 &&
       Math.abs(next.height - this._roomSize.height) < 1e-6 &&
       Math.abs(next.depth - this._roomSize.depth) < 1e-6;
-    if (same) return;
+    const sameBoundary = this._roomGeometryKey === JSON.stringify(config.room.boundary);
+    if (same && sameBoundary) return;
 
     this._roomSize = next;
+    this._roomGeometryKey = JSON.stringify(config.room.boundary);
     this._disposeLine(this._grid);
-    this._grid = this._createRoomGrid(next.width, next.depth);
+    this._grid = this._createRoomGrid(bounds);
     this._grid.visible = this.settings.grid;
     this._scene.add(this._grid);
 
     this._disposeLine(this._roomWire);
-    this._roomWire = this._createRoomWire(next.width, next.height, next.depth);
+    this._roomWire = this._createRoomWire(config, bounds.height);
     this._roomWire.visible = this.settings.room;
     this._scene.add(this._roomWire);
 
     if (this._floor) {
       this._floor.geometry.dispose();
-      this._floor.geometry = new THREE.PlaneGeometry(next.width, next.depth);
+      this._floor.geometry = this._createRoomFloorGeometry(config);
     }
   }
 
@@ -442,23 +511,17 @@ class Observatory {
   }
 
   async _loadRoomConfig(ignoreStored = false) {
-    const stored = ignoreStored ? null : this._readStoredRoomConfig();
-    if (stored) {
-      this._applyRoomConfig(stored, 'local', false);
-      return;
-    }
-
     try {
-      const response = await fetch('/ui/room-config.json', { cache: 'no-store' });
+      const response = await fetch(ROOM_CONFIG_ENDPOINT, { cache: 'no-store' });
       if (response.ok) {
         const config = this._normalizeRoomConfig(await response.json());
         if (config) {
-          this._applyRoomConfig(config, 'file', false);
+          this._applyRoomConfig(config, 'api', false);
           return;
         }
       }
     } catch {
-      // The file is provisioned by deployment or another agent; use visual defaults until it exists.
+      // The API may still be starting; use visual defaults until it responds.
     }
 
     this._applyRoomConfig(DEFAULT_ROOM_CONFIG, 'default', false);
@@ -466,14 +529,22 @@ class Observatory {
 
   _normalizeRoomConfig(raw) {
     if (!raw || typeof raw !== 'object') return null;
-    const width = Number(raw.room_width_meters);
-    const depth = Number(raw.room_height_meters);
+    if (Number(raw.version) !== 2 || raw.room?.shape !== 'polygon') return null;
+    const boundary = Array.isArray(raw.room.boundary)
+      ? raw.room.boundary
+        .map((point) => {
+          const x = Number(point?.x);
+          const y = Number(point?.y);
+          return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+        })
+        .filter(Boolean)
+      : [];
     const nodes = Array.isArray(raw.nodes) ? raw.nodes : [];
-    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(depth) || depth <= 0) return null;
+    if (boundary.length < 3) return null;
 
     return {
-      room_width_meters: width,
-      room_height_meters: depth,
+      version: 2,
+      room: { shape: 'polygon', boundary },
       nodes: nodes.map((node, index) => {
         const id = Number(node?.id ?? node?.node_id ?? index + 1);
         const x = Number(node?.x);
@@ -482,7 +553,7 @@ class Observatory {
           id: Number.isFinite(id) ? id : index + 1,
           x: Number.isFinite(x) ? x : 0,
           y: Number.isFinite(y) ? y : 0,
-          label: String(node?.label || node?.display_label || `Node ${index + 1}`),
+          active: node?.active !== false,
         };
       }),
     };
@@ -497,11 +568,7 @@ class Observatory {
       try { localStorage.setItem(ROOM_CONFIG_STORAGE_KEY, JSON.stringify(config)); } catch {}
     }
 
-    if (!this._environment) {
-      this._syncRoomGeometry({
-        room: { dimensions_m: [config.room_width_meters, ROOM_VISUAL_HEIGHT_M, config.room_height_meters] },
-      });
-    }
+    this._syncRoomGeometry();
     this._rebuildRoomConfigScene(null);
     this._populateRoomConfigPanel();
     this._syncRoomConfigNodes(this._currentData || this._liveData || null);
@@ -509,10 +576,11 @@ class Observatory {
 
   _populateRoomConfigPanel() {
     if (!this._roomConfig || !this._roomConfigPanel) return;
+    const bounds = this._roomConfigBounds(this._roomConfig);
     const widthInput = document.getElementById('room-width-input');
     const heightInput = document.getElementById('room-height-input');
-    if (widthInput) widthInput.value = this._roomConfig.room_width_meters.toFixed(1);
-    if (heightInput) heightInput.value = this._roomConfig.room_height_meters.toFixed(1);
+    if (widthInput) widthInput.value = bounds.width.toFixed(1);
+    if (heightInput) heightInput.value = bounds.depth.toFixed(1);
     if (!this._roomNodeFields) return;
 
     this._roomNodeFields.replaceChildren();
@@ -550,10 +618,6 @@ class Observatory {
 
   _roomConfigFromPanel() {
     if (!this._roomConfig) return null;
-    const width = Number(document.getElementById('room-width-input')?.value);
-    const depth = Number(document.getElementById('room-height-input')?.value);
-    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(depth) || depth <= 0) return null;
-
     const nodes = this._roomConfig.nodes.map((node) => {
       const rows = [...(this._roomNodeFields?.querySelectorAll('.room-node-field') || [])];
       const row = rows.find((candidate) => candidate.dataset.nodeId === String(node.id));
@@ -567,19 +631,20 @@ class Observatory {
     });
 
     return {
-      room_width_meters: width,
-      room_height_meters: depth,
+      version: 2,
+      room: {
+        shape: 'polygon',
+        boundary: this._roomBoundary(this._roomConfig),
+      },
       nodes,
     };
   }
 
   _roomToScenePosition(x, y, elevation = 0) {
-    const width = Number(this._roomConfig?.room_width_meters || this._roomSize.width || 1);
-    const depth = Number(this._roomConfig?.room_height_meters || this._roomSize.depth || 1);
     return [
-      Number(x || 0) - width / 2,
+      Number(x || 0),
       elevation,
-      Number(y || 0) - depth / 2,
+      Number(y || 0),
     ];
   }
 
@@ -661,15 +726,14 @@ class Observatory {
   }
 
   _defaultRoomPointForNode(id) {
-    const width = Number(this._roomConfig?.room_width_meters || this._roomSize.width || DEFAULT_ROOM_CONFIG.room_width_meters || 1);
-    const depth = Number(this._roomConfig?.room_height_meters || this._roomSize.depth || DEFAULT_ROOM_CONFIG.room_height_meters || 1);
+    const bounds = this._roomConfigBounds(this._roomConfig || DEFAULT_ROOM_CONFIG);
     const corners = [
-      [0, 0],
-      [width, 0],
-      [width, depth],
-      [0, depth],
-      [width / 2, depth],
-      [width / 2, 0],
+      [bounds.minX, bounds.minY],
+      [bounds.maxX, bounds.minY],
+      [bounds.maxX, bounds.maxY],
+      [bounds.minX, bounds.maxY],
+      [bounds.minX + bounds.width / 2, bounds.maxY],
+      [bounds.minX + bounds.width / 2, bounds.minY],
     ];
     const slot = Math.max(0, Math.floor(Number(id || 1)) - 1);
     const point = corners[slot % corners.length];
@@ -678,19 +742,19 @@ class Observatory {
 
   _scenePositionForNode(id, node = null) {
     const cfg = this._roomConfigNodeById(id);
-    if (cfg) return this._roomToScenePosition(cfg.x, cfg.y, NODE_CUBE_SIZE_M / 2);
+    if (cfg) return this._roomToScenePosition(cfg.x, cfg.y, NODE_ELEVATION_M);
     const explicit = this._positionOf(node);
-    if (explicit) return [explicit[0], Math.max(explicit[1], NODE_CUBE_SIZE_M / 2), explicit[2]];
+    if (explicit) return [explicit[0], NODE_ELEVATION_M, explicit[2]];
     const fallback = this._defaultRoomPointForNode(id);
-    return this._roomToScenePosition(fallback.x, fallback.y, NODE_CUBE_SIZE_M / 2);
+    return this._roomToScenePosition(fallback.x, fallback.y, NODE_ELEVATION_M);
   }
 
   _nodeRangeRadius(node = null) {
     const direct = Number(node?.coverage?.radius_m ?? node?.coverage_radius_m ?? node?.range_m ?? node?.max_range_m);
     if (Number.isFinite(direct) && direct > 0) return Math.max(0.45, direct);
     const span = Math.max(
-      Number(this._roomConfig?.room_width_meters || 0),
-      Number(this._roomConfig?.room_height_meters || 0),
+      this._roomConfigBounds(this._roomConfig || DEFAULT_ROOM_CONFIG).width,
+      this._roomConfigBounds(this._roomConfig || DEFAULT_ROOM_CONFIG).depth,
       this._roomSize.width,
       this._roomSize.depth,
       2,
@@ -902,13 +966,13 @@ class Observatory {
       metalness: 0.08,
     });
     const headMat = bodyMat.clone();
-    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 1.7, 24), bodyMat);
-    body.position.y = 0.85;
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, PERSON_HEIGHT_M, 24), bodyMat);
+    body.position.y = PERSON_HEIGHT_M / 2;
     body.castShadow = true;
     group.add(body);
 
     const head = new THREE.Mesh(new THREE.SphereGeometry(0.15, 24, 16), headMat);
-    head.position.y = 1.85;
+    head.position.y = PERSON_HEIGHT_M + 0.15;
     head.castShadow = true;
     group.add(head);
 
@@ -920,7 +984,7 @@ class Observatory {
       background: 'rgba(8, 16, 28, 0.76)',
     });
     label.scale.set(1.08, 0.34, 1);
-    label.position.y = 2.18;
+    label.position.y = PERSON_HEIGHT_M + 0.48;
     group.add(label);
 
     this._presenceGroup.add(group);
@@ -959,7 +1023,7 @@ class Observatory {
       const id = this._personIdentity(person, index);
       activeIds.add(id);
       const entry = this._upsertPresenceSilhouette(id);
-      const position = this._parseVector3(person.position);
+      const position = this._personScenePosition(person);
       if (!position) return;
 
       const confidence = Math.max(0, Math.min(1, Number(person.confidence) || 0));
@@ -997,7 +1061,7 @@ class Observatory {
       positionState.target = { ...positionState.displayed };
 
       const yOffset = motionEnergy > 0.1 ? Math.sin(elapsed * 3.2 + index * 0.7) * 0.045 : 0;
-      const targetY = position[1] + yOffset;
+      const targetY = yOffset;
       if (!entry.hasPosition) {
         entry.group.position.set(positionState.target.x, targetY, positionState.target.y);
         entry.hasPosition = true;
@@ -1132,6 +1196,16 @@ class Observatory {
     return null;
   }
 
+  _personScenePosition(person) {
+    const directX = this._numberOrNull(person?.x ?? person?.position?.x ?? person?.location?.x);
+    const directY = this._numberOrNull(person?.y ?? person?.position?.y ?? person?.location?.y);
+    if (directX != null && directY != null) return [directX, 0, directY];
+    const metric = this._parseVector3(person?.position_m);
+    if (metric) return [metric[0], 0, metric[2]];
+    const vector = this._parseVector3(person?.position);
+    return vector ? [vector[0], 0, vector[2]] : null;
+  }
+
   _rawPositionOf(entity, { requirePositionM = false } = {}) {
     const metric = this._parseVector3(entity?.position_m);
     if (metric) return metric;
@@ -1248,7 +1322,7 @@ class Observatory {
   }
 
   _personDedupePosition(person) {
-    return this._parseVector3(person?.position_m) || this._parseVector3(person?.position);
+    return this._personScenePosition(person);
   }
 
   _personConfidence(person) {
@@ -1430,7 +1504,7 @@ class Observatory {
     const nodeCount = this._integerOrZero(frame?.node_count);
     if (!nodeCount || !Array.isArray(persons) || !persons.length) return [];
     return (this._roomConfig?.nodes || DEFAULT_ROOM_CONFIG.nodes).slice(0, nodeCount).map((node) => {
-      const position = this._roomToScenePosition(node.x, node.y, 0.08);
+      const position = this._roomToScenePosition(node.x, node.y, NODE_ELEVATION_M);
       return {
         id: node.id,
         node_id: node.id,
@@ -1485,7 +1559,7 @@ class Observatory {
     const nodeCount = this._integerOrZero(rawFrame.node_count);
     const nodes = (this._roomConfig?.nodes || DEFAULT_ROOM_CONFIG.nodes).map((node, index) => {
       const active = String(rawFrame.system_status || '').toLowerCase() !== 'no_nodes' && index < nodeCount;
-      const position = this._roomToScenePosition(node.x, node.y, 0.08);
+      const position = this._roomToScenePosition(node.x, node.y, NODE_ELEVATION_M);
       return {
         id: node.id,
         node_id: node.id,
@@ -1542,12 +1616,7 @@ class Observatory {
     if (!data) return data;
     const inputPersons = Array.isArray(data.persons) ? data.persons.slice(0, MAX_SCENE_PERSONS) : [];
     let persons = inputPersons.map((person, index) => {
-      const layoutPosition = String(person?.position_source || '').toLowerCase() === 'observatory_layout'
-        ? this._parseVector3(person.position)
-        : null;
-      const position = layoutPosition
-        || this._positionOf(person)
-        || null;
+      const position = this._personScenePosition(person);
       if (!position) return null;
       return this._presencePerson({
         ...person,
